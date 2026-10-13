@@ -31,6 +31,13 @@ describe('envForPowerShell', () => {
     expect(envForPowerShell(inherited)).toEqual({ Path: 'C:\\Windows', USERPROFILE: 'C:\\Users\\me' });
     expect(envForPowerShell({ PSMODULEPATH: 'x', HOME: '/h' })).toEqual({ HOME: '/h' });
   });
+
+  it("drops the execution policy the session ccx runs in set for itself, so the reading is a new window's", () => {
+    // `powershell -ExecutionPolicy Bypass`, as the VS Code PowerShell extension
+    // starts its terminal, hands its children this variable.
+    expect(envForPowerShell({ PSExecutionPolicyPreference: 'Bypass', HOME: '/h' })).toEqual({ HOME: '/h' });
+    expect(envForPowerShell({ PSEXECUTIONPOLICYPREFERENCE: 'Bypass', HOME: '/h' })).toEqual({ HOME: '/h' });
+  });
 });
 
 const b64 = (text: string) => Buffer.from(text, 'utf8').toString('base64');
@@ -115,6 +122,18 @@ describe.runIf(onWindowsCi)('queryPowerShell, asking the real PowerShells', () =
         new RegExp(`\\\\${folder}\\\\Microsoft\\.PowerShell_profile\\.ps1$`),
       );
       expect(facts?.policy, why).toMatch(/^(Restricted|AllSigned|RemoteSigned|Unrestricted|Bypass|Undefined)$/);
+    }, 120_000);
+
+    it(`reads ${exe}'s policy as a new window gets it, whatever the session ccx runs in set`, () => {
+      const fresh = queryPowerShell(exe)?.policy;
+      const before = process.env.PSExecutionPolicyPreference;
+      process.env.PSExecutionPolicyPreference = fresh === 'AllSigned' ? 'Bypass' : 'AllSigned';
+      try {
+        expect(queryPowerShell(exe)?.policy).toBe(fresh);
+      } finally {
+        if (before === undefined) delete process.env.PSExecutionPolicyPreference;
+        else process.env.PSExecutionPolicyPreference = before;
+      }
     }, 120_000);
   }
 

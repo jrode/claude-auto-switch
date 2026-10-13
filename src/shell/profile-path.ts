@@ -66,13 +66,18 @@ export function parsePowerShellFacts(out: string): PowerShellFacts | null {
 }
 
 /**
- * The environment to start a PowerShell with: this one without PSModulePath.
- * Started from PowerShell 7, ccx inherits its module path, and Windows
- * PowerShell then tries to load PowerShell 7's modules and fails, even for
- * its own Get-ExecutionPolicy. Without it, each edition builds its own.
+ * What a PowerShell inherits from the session ccx runs in, and must not:
+ * - PSModulePath: started from PowerShell 7, Windows PowerShell tries to load
+ *   PowerShell 7's modules from it and fails, even for its own
+ *   Get-ExecutionPolicy. Without it, each edition builds its own.
+ * - PSExecutionPolicyPreference: the policy a session set for itself, as
+ *   `-ExecutionPolicy Bypass` does. The reading must be a new window's.
  */
+const SESSION_ONLY = new Set(['PSMODULEPATH', 'PSEXECUTIONPOLICYPREFERENCE']);
+
+/** The environment to start a PowerShell with: this one, less what is the session's own. */
 export function envForPowerShell(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(env).filter(([name]) => name.toUpperCase() !== 'PSMODULEPATH'));
+  return Object.fromEntries(Object.entries(env).filter(([name]) => !SESSION_ONLY.has(name.toUpperCase())));
 }
 
 /**
