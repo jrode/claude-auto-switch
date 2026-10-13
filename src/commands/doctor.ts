@@ -16,7 +16,7 @@ import { detectEditors } from '../editor/settings.js';
 import { readEditorEnvVar } from '../editor/install.js';
 import { editorTargetAccount } from '../editor/junction.js';
 import { isShimInstalled, shimHasFallback, shimIsCurrent } from '../shell/install-shim.js';
-import { defaultPowerShellProfile, defaultPosixProfile } from '../shell/profile-path.js';
+import { shellPlans, type ShellPlan } from '../shell/shells.js';
 import { isLink, readTarget } from '../daemon/junction.js';
 import { hasWorkingLogin } from '../accounts/account-login.js';
 import { defaultClaudeRoot } from '../session/shared-root.js';
@@ -37,6 +37,10 @@ import { routingOn } from '../artifacts/route.js';
 
 export interface DoctorCheck {
   name: string;
+  /** For a shell's check: which shell, by its ccx name (`zsh`, `pwsh`, `cmd`). */
+  shell?: string;
+  /** Shown instead of the name's label: a shell's own name. */
+  label?: string;
   ok: boolean;
   detail: string;
   /** Commands that would resolve this, shown together at the end. */
@@ -58,8 +62,8 @@ export interface DoctorDeps {
   readCrontab?: () => Promise<string | null>;
   /** The node and ccx keepalive should be running; injected in tests. */
   keepalive?: KeepaliveDeps;
-  /** Shell-profile resolver for the shim check; injected in tests. */
-  resolveShimProfile?: () => string | null;
+  /** The shells and their files; injected in tests, worked out from the machine otherwise. */
+  shellPlans?: ShellPlan[];
   /** Skip checks that need the network (used by tests and offline runs). */
   skipNetwork?: boolean;
   /** Injected in tests for the identity check. */
@@ -172,52 +176,97 @@ function defaultTrackedFiles(): string[] {
   }
 }
 
-function defaultShimProfile(context: CliContext): string | null {
+/**
+ * Each shell, and whether typing `claude` in it goes through ccx. Read from
+ * the files each shell loads at startup, never by starting the shell, which
+ * would run whatever else those files do. Changes nothing, the execution
+ * policy included: that is for the person to decide.
+ */
+export function auditShells(context: CliContext, deps: DoctorDeps = {}): DoctorCheck[] {
+  let plans: ShellPlan[];
   try {
-    const platform = context.ctx.platform ?? process.platform;
-    return platform === 'win32'
-      ? defaultPowerShellProfile(context.ctx)
-      : defaultPosixProfile(context.ctx);
+    plans = deps.shellPlans ?? shellPlans(context.ctx);
   } catch {
-    return null;
+    return [{ name: 'terminal-shim', ok: true, detail: 'could not work out your shells (skipped)' }];
   }
-}
-
-/** The transparent `claude` shim: installed, and safe to uninstall ccx under? */
-export function auditShim(context: CliContext, deps: DoctorDeps = {}): DoctorCheck {
-  const profile = (deps.resolveShimProfile ?? (() => defaultShimProfile(context)))();
-  if (!profile) {
-    return { name: 'terminal-shim', ok: true, detail: 'could not resolve a shell profile (skipped)' };
-  }
-  if (!isShimInstalled(profile)) {
-    return {
+  const has = (file: string): boolean => {
+    try {
+      return isShimInstalled(file);
+    } catch {
+      return false;
+    }
+  };
+  const onSomewhere = plans.some((p) => [...p.files, ...p.retired].some(has));
+  const checks = plans.filter((p) => p.state !== 'absent').map((plan) => auditShell(plan, has, onSomewhere));
+  if ((context.ctx.platform ?? process.platform) === 'win32') {
+    checks.push({
       name: 'terminal-shim',
+      shell: 'cmd',
+      label: 'cmd',
       ok: true,
       note: true,
-      detail: 'not installed; `claude` runs on its own',
-      fix: ['ccx on'],
+      detail: 'not covered: cmd has no profile to put `claude` in, so there it runs on its own (use ccx run, or PowerShell)',
+    });
+  }
+  return checks;
+}
+
+function auditShell(plan: ShellPlan, has: (file: string) => boolean, onSomewhere: boolean): DoctorCheck {
+  const base = { name: 'terminal-shim', shell: plan.id, label: plan.label };
+  if (plan.state === 'unused') {
+    return { ...base, ok: true, note: true, detail: `left alone, ${plan.why} (ccx on --shell ${plan.id} adds it)` };
+  }
+  if (plan.blocked) {
+    // A note, not a failure: the policy is the machine's, often chosen, and
+    // plenty of people never open this shell. It also stops npm's ccx command.
+    return {
+      ...base,
+      ok: true,
+      note: true,
+      detail: `\`claude\` skips ccx here: ${plan.blocked.detail}`,
+      ...(plan.blocked.fix ? { fix: [plan.blocked.fix] } : {}),
     };
   }
-  if (!shimHasFallback(profile)) {
+  const missing = plan.files.filter((f) => !has(f));
+  if (missing.length === plan.files.length) {
+    return onSomewhere
+      ? {
+          ...base,
+          ok: false,
+          detail: `\`claude\` skips ccx here, while other shells have it: no shim in ${missing.join(', ')}`,
+          fix: ['ccx on'],
+        }
+      : { ...base, ok: true, note: true, detail: '`claude` runs on its own here', fix: ['ccx on'] };
+  }
+  if (missing.length > 0) {
     return {
-      name: 'terminal-shim',
+      ...base,
       ok: false,
-      detail: 'an old shim is installed; removing ccx would break `claude`',
+      detail: `\`claude\` skips ccx in some ${plan.label} windows: no shim in ${missing.join(', ')}`,
       fix: ['ccx on'],
     };
   }
-  // By the profile, not the platform: `ccx on --shell powershell` puts the
-  // PowerShell shim into a pwsh profile on macOS and Linux too.
-  const shell = /\.ps1$/i.test(profile) ? 'powershell' : 'posix';
-  if (!shimIsCurrent(profile, shell)) {
+  if (plan.files.some((f) => !shimHasFallback(f))) {
+    return { ...base, ok: false, detail: 'an old shim is installed; removing ccx would break `claude`', fix: ['ccx on'] };
+  }
+  if (plan.files.some((f) => !shimIsCurrent(f, plan.kind))) {
     return {
-      name: 'terminal-shim',
+      ...base,
       ok: false,
       detail: 'the shim is from an older ccx (in PowerShell, `claude --version` and `claude --help` reached ccx)',
       fix: ['ccx on'],
     };
   }
-  return { name: 'terminal-shim', ok: true, detail: 'typing `claude` runs through ccx' };
+  const extra = plan.retired.filter(has);
+  if (extra.length > 0) {
+    return {
+      ...base,
+      ok: false,
+      detail: `${plan.label} also loads an older copy from ${extra.join(', ')}`,
+      fix: ['ccx on'],
+    };
+  }
+  return { ...base, ok: true, detail: `\`claude\` goes through ccx (${plan.files.join(', ')})` };
 }
 
 /**
@@ -577,7 +626,7 @@ export async function runDoctor(
   const trackedFiles = (deps.gitTrackedFiles ?? defaultTrackedFiles)();
   const checks = [
     auditConfig(context),
-    auditShim(context, deps),
+    ...auditShells(context, deps),
     auditStatusline(context),
     auditSharedHistory(context),
     auditSessionAccount({
@@ -629,7 +678,7 @@ export async function doctorCommand(context: CliContext, deps: DoctorDeps = {}):
     return ok ? 0 : 1;
   }
 
-  const labelFor = (check: DoctorCheck): string => LABELS[check.name] ?? check.name;
+  const labelFor = (check: DoctorCheck): string => check.label ?? LABELS[check.name] ?? check.name;
   const width = Math.max(...checks.map((c) => labelFor(c).length));
 
   context.out('');
