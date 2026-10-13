@@ -58,10 +58,12 @@ create files for it, and `ccx on --shell <name>` (`zsh`, `bash`, `powershell` or
 A Windows execution policy of `Restricted` or `AllSigned` stops PowerShell
 running any profile, and npm's `ccx` command with it. ccx writes no profile
 there, since PowerShell would show an error in every window it opens.
-`ccx doctor` names the policy and gives the command that allows local scripts
-for you alone, but never runs it:
+`ccx doctor` names the policy. When it is your own or the machine's setting,
+doctor gives the command that allows local scripts for you alone, but never
+runs it:
 `powershell -NoProfile -Command Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
-(`pwsh` for PowerShell 7). Then run `ccx on` again.
+(`pwsh` for PowerShell 7). Then run `ccx on` again. When Group Policy sets it,
+that command changes nothing, so doctor says to ask an administrator instead.
 
 ## How it works
 

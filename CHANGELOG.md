@@ -39,8 +39,9 @@ semantic versioning.
   it would also load. Where a Windows execution policy (`Restricted` or
   `AllSigned`) stops PowerShell running its profile and npm's `ccx` command,
   it says so and gives the command that allows local scripts for you alone,
-  without running it; under that policy `ccx on` writes no profile, which
-  would put an error in every window. cmd has no profile, and doctor says it
+  without running it, or, when Group Policy sets the policy, that only an
+  administrator can change it. Under that policy `ccx on` writes no profile,
+  which would put an error in every window. cmd has no profile, and doctor says it
   is not covered.
 
 ## [2.6.0]

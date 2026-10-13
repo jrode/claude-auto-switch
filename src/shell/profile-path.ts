@@ -16,13 +16,22 @@ export interface PowerShellFacts {
 export type PowerShellExe = 'pwsh' | 'powershell';
 
 /**
+ * A PowerShell expression printing the string `expr` as Base64 of its UTF-8
+ * bytes. PowerShell writes to a pipe in the console's code page, which turns a
+ * path with a name like José into a different path; Base64 is ASCII in any.
+ */
+export function utf8Base64(expr: string): string {
+  return `[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string](${expr})))`;
+}
+
+/**
  * Asked of each edition in one start. No double quotes, so it reaches
  * PowerShell intact however Windows splits the command line, and no
  * -EncodedCommand, which security software treats as a warning sign.
  */
 const FACTS_SCRIPT = [
-  '$PROFILE.CurrentUserAllHosts',
-  '$PROFILE.CurrentUserCurrentHost',
+  utf8Base64('$PROFILE.CurrentUserAllHosts'),
+  utf8Base64('$PROFILE.CurrentUserCurrentHost'),
   '[string](Get-ExecutionPolicy)',
   '[string](Get-ExecutionPolicy -Scope MachinePolicy)',
   '[string](Get-ExecutionPolicy -Scope UserPolicy)',
@@ -30,7 +39,9 @@ const FACTS_SCRIPT = [
 
 /** Read the answer to FACTS_SCRIPT; null when it is not one. */
 export function parsePowerShellFacts(out: string): PowerShellFacts | null {
-  const [allHosts, currentHost, policy, machine, user] = out.split(/\r?\n/).map((l) => l.trim());
+  const lines = out.split(/\r?\n/).map((l) => l.trim());
+  const [policy, machine, user] = lines.slice(2);
+  const [allHosts, currentHost] = lines.slice(0, 2).map((l) => Buffer.from(l, 'base64').toString('utf8'));
   const isProfile = (p: string | undefined): p is string => !!p && p.toLowerCase().endsWith('.ps1');
   if (!isProfile(allHosts) || !isProfile(currentHost)) return null;
   return {
