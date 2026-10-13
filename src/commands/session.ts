@@ -1322,7 +1322,16 @@ export async function runInteractiveHotSwap(
       const limited = await askAccountAboutCap(renderedText);
       if (limited) {
         capConfirmedAt = Date.now();
-        await renewForRelief();
+        // Only a help to the move: a failure here must not unsay the limit,
+        // since a check that throws is read as one that found none.
+        try {
+          await renewForRelief();
+        } catch (error) {
+          logEvent(`could not prepare this session's move after a limit: ${thrownReason(error)}`, {
+            kind: 'renewal',
+            data: { for: 'limit', ok: false },
+          });
+        }
       }
       return limited;
     } finally {
@@ -2021,7 +2030,16 @@ export async function runInteractiveHotSwap(
         // login's attribution afresh, but this limit was met before it.
         const unregistered = capUnregisteredEmail;
         if (opts.relieve && limitedModel === undefined && !relaunchForPrompt) {
-          const next = reliefPlan(capName, token !== null, false);
+          let next: ReturnType<typeof reliefPlan> = null;
+          try {
+            next = reliefPlan(capName, token !== null, false);
+          } catch (error) {
+            // Relaunched instead, as when there is nowhere to move it in place.
+            logEvent(`could not work out where to move this session in place: ${thrownReason(error)}`, {
+              kind: 'cap-relief-failed',
+              data: { from: capName },
+            });
+          }
           if (next) {
             try {
               activate(next.account); // seamless swap under the live child; updates `current`
