@@ -15,7 +15,9 @@ import { offCommand, onCommand } from './onoff.js';
  */
 function sandbox(files: Record<string, string> = {}, env: NodeJS.ProcessEnv = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'cas-onoff-'));
-  const at = (name: string) => path.join(root, name);
+  // Joined as the Mac-shaped plans join them, so the paths ccx reports match
+  // these on a Windows host too, which takes either separator.
+  const at = (name: string) => path.posix.join(root, name);
   for (const [name, text] of Object.entries(files)) {
     mkdirSync(path.dirname(at(name)), { recursive: true });
     writeFileSync(at(name), text, 'utf8');
@@ -119,9 +121,9 @@ function powershellPlan(dir: string, over: Partial<ShellPlan> = {}): ShellPlan {
     label: 'Windows PowerShell',
     kind: 'powershell',
     state: 'use',
-    files: [path.join(dir, 'profile.ps1')],
-    retired: [path.join(dir, 'Microsoft.PowerShell_profile.ps1')],
-    sweep: [path.join(dir, 'profile.ps1'), path.join(dir, 'Microsoft.PowerShell_profile.ps1')],
+    files: [path.posix.join(dir, 'profile.ps1')],
+    retired: [path.posix.join(dir, 'Microsoft.PowerShell_profile.ps1')],
+    sweep: [path.posix.join(dir, 'profile.ps1'), path.posix.join(dir, 'Microsoft.PowerShell_profile.ps1')],
     ...over,
   };
 }
