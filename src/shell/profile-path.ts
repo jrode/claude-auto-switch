@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import type { PathCtx } from '../config/paths.js';
 
 /** What one PowerShell edition says about itself. */
@@ -25,30 +25,42 @@ export function utf8Base64(expr: string): string {
 }
 
 /**
- * Asked of each edition in one start. No double quotes, so it reaches
- * PowerShell intact however Windows splits the command line, and no
- * -EncodedCommand, which security software treats as a warning sign.
+ * Asked of each edition in one start, each value on a line of its own named
+ * after it, so a warning or a statement that fails cannot put one value in
+ * another's place. No double quotes, so it reaches PowerShell intact however
+ * Windows splits the command line, and no -EncodedCommand, which security
+ * software treats as a warning sign.
  */
 const FACTS_SCRIPT = [
-  utf8Base64('$PROFILE.CurrentUserAllHosts'),
-  utf8Base64('$PROFILE.CurrentUserCurrentHost'),
-  '[string](Get-ExecutionPolicy)',
-  '[string](Get-ExecutionPolicy -Scope MachinePolicy)',
-  '[string](Get-ExecutionPolicy -Scope UserPolicy)',
+  `'allHosts=' + ${utf8Base64('$PROFILE.CurrentUserAllHosts')}`,
+  `'currentHost=' + ${utf8Base64('$PROFILE.CurrentUserCurrentHost')}`,
+  "'policy=' + [string](Get-ExecutionPolicy)",
+  "'machinePolicy=' + [string](Get-ExecutionPolicy -Scope MachinePolicy)",
+  "'userPolicy=' + [string](Get-ExecutionPolicy -Scope UserPolicy)",
 ].join('; ');
 
-/** Read the answer to FACTS_SCRIPT; null when it is not one. */
+/** How each edition is started to answer FACTS_SCRIPT: no profile of its own runs. */
+export const FACTS_ARGS = ['-NoProfile', '-NoLogo', '-NonInteractive', '-Command', FACTS_SCRIPT];
+
+/** Read the answer to FACTS_SCRIPT; null when it does not name two profiles. */
 export function parsePowerShellFacts(out: string): PowerShellFacts | null {
-  const lines = out.split(/\r?\n/).map((l) => l.trim());
-  const [policy, machine, user] = lines.slice(2);
-  const [allHosts, currentHost] = lines.slice(0, 2).map((l) => Buffer.from(l, 'base64').toString('utf8'));
-  const isProfile = (p: string | undefined): p is string => !!p && p.toLowerCase().endsWith('.ps1');
+  const values = new Map<string, string>();
+  for (const line of out.split(/\r?\n/)) {
+    const named = /^(\w+)=(.*)$/.exec(line.trim());
+    if (named) values.set(named[1] as string, named[2] as string);
+  }
+  const path = (key: string) => Buffer.from(values.get(key) ?? '', 'base64').toString('utf8');
+  const [allHosts, currentHost] = [path('allHosts'), path('currentHost')];
+  const isProfile = (p: string) => p.toLowerCase().endsWith('.ps1');
   if (!isProfile(allHosts) || !isProfile(currentHost)) return null;
   return {
     allHosts,
     currentHost,
-    policy: policy || 'Unknown',
-    policyFromGroupPolicy: [machine, user].some((p) => !!p && p !== 'Undefined'),
+    policy: values.get('policy') || 'Unknown',
+    policyFromGroupPolicy: ['machinePolicy', 'userPolicy'].some((k) => {
+      const set = values.get(k);
+      return !!set && set !== 'Undefined';
+    }),
   };
 }
 
@@ -59,17 +71,15 @@ export function parsePowerShellFacts(out: string): PowerShellFacts | null {
  * installed or did not answer in time.
  */
 export function queryPowerShell(exe: PowerShellExe): PowerShellFacts | null {
-  try {
-    const out = execFileSync(exe, ['-NoProfile', '-NoLogo', '-NonInteractive', '-Command', FACTS_SCRIPT], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 8000,
-      windowsHide: true,
-    });
-    return parsePowerShellFacts(out);
-  } catch {
-    return null;
-  }
+  // Judged by what it printed rather than by its exit code: the paths are
+  // what ccx uses, and they either parse or they do not.
+  const r = spawnSync(exe, FACTS_ARGS, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: 8000,
+    windowsHide: true,
+  });
+  return typeof r.stdout === 'string' ? parsePowerShellFacts(r.stdout) : null;
 }
 
 /**
