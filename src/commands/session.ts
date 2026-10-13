@@ -1536,6 +1536,22 @@ export async function runInteractiveHotSwap(
     return guess && account ? { account, anyway: guess.message } : null;
   };
 
+  /**
+   * The active account, which the account choice prefers. None for a worker,
+   * which is not the session others start from and starts where it was told
+   * or where the pick order says. None as well when the file naming it cannot
+   * be read: it only says which account to prefer, and failing on it ended
+   * the session.
+   */
+  const activeToStartOn = (): string | null => {
+    if (worker) return null;
+    try {
+      return getActive(context.ctx);
+    } catch {
+      return null;
+    }
+  };
+
   /** Accounts whose stored login the token endpoint has refused, which no wait repairs. */
   const deadLogins = (): string[] =>
     accounts.filter((a) => hasLogin(a.dir) && !hasWorkingLogin(a.dir, context.ctx)).map((a) => a.name);
@@ -1558,9 +1574,7 @@ export async function runInteractiveHotSwap(
             (inPlace?.(a) ?? true),
         )
         .map((a) => ({ name: a.name, dir: a.dir })),
-      // A worker is not the session others start from, so the account they
-      // start on is no reason for it to land there.
-      active: worker ? null : getActive(context.ctx),
+      active: activeToStartOn(),
       // A move in place answers a limit on the whole account, so "only one
       // model is out" is not what happened.
       modelOnly: inPlace ? null : modelOnlyLimit(loadLedger(context.ctx), Date.now()),
@@ -1639,9 +1653,7 @@ export async function runInteractiveHotSwap(
     refreshSettings();
     const capped = cappedNames(loadLedger(context.ctx), Date.now());
     // An account this run was told to start on outranks the active one.
-    // A worker is not "the" session: it starts where it was told, or where
-    // the pick order says, never on the account others start on by default.
-    const pinned = options.account ?? (worker ? null : getActive(context.ctx));
+    const pinned = options.account ?? activeToStartOn();
     // Ordered by the operator's policy: `most-room` reaches for the least-used
     // account first (the one with the most headroom), `priority` keeps the
     // classic order. Same comparator the `select`/`rotate`/dashboard paths use,

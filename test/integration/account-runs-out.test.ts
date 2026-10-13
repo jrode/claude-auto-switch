@@ -475,6 +475,49 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
     );
 
     it(
+      'starts when the file naming the active account cannot be read',
+      { timeout: 60_000 },
+      async () => {
+        // Account choice treats it as naming no account, rather than failing.
+        const { home, runsLog, context } = await twoAccounts('cas-active-unreadable-');
+        writeFileSync(path.join(home, 'active.json'), '{not json', 'utf8');
+        Object.assign(process.env, { ...TYPEABLE, FAKE_CLAUDE_RUNS_LOG: runsLog, FAKE_CLAUDE_IDLE_MS: '600' });
+
+        expect(await runCommand(context, [])).toBe(0);
+        expect(launches(readLog(runsLog))).toHaveLength(1);
+      },
+    );
+
+    it(
+      'still guesses in place when the file naming the active account cannot be read',
+      { timeout: 60_000 },
+      async () => {
+        const { home, runsLog, context } = await twoAccounts('cas-in-place-anyway-unreadable-');
+        recordedOut(home, ['B']);
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '20000',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '4000',
+          FAKE_CLAUDE_EXIT_AFTER_PROMPTS: '1',
+        });
+
+        const running = runCommand(context, []);
+        await waitFor('the launch', () => launches(readLog(runsLog)), (l) => l.length === 1);
+        // After the start, which writes the file, and well before the limit.
+        writeFileSync(path.join(home, 'active.json'), '{not json', 'utf8');
+
+        expect(await running).toBe(0);
+        const log = readLog(runsLog);
+        expect(launches(log)).toHaveLength(1);
+        expect(prompts(log)).toEqual([
+          expect.objectContaining({ text: IN_PLACE_PROMPT, marker: 'B', refused: false }),
+        ]);
+      },
+    );
+
+    it(
       'never guesses its way back onto an account it has seen run out',
       { timeout: 60_000 },
       async () => {

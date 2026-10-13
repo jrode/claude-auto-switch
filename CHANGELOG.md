@@ -40,6 +40,14 @@ semantic versioning.
   a renewal of a login already being renewed now waits for that one and gets
   its result. Found while adding the renewals above; not seen happen.
 
+### Fixed
+
+- **A session no longer fails when the file naming the active account cannot
+  be read.** Choosing an account read `active.json` and stopped with an
+  error when it was malformed, which ended a session at its start, or when
+  its account ran out. That file only says which account to prefer, so the
+  choice now goes on as if it named none.
+
 ## [2.6.0]
 
 ### Added
