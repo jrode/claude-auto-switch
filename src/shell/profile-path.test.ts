@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import {
   FACTS_ARGS,
+  envForPowerShell,
   parsePowerShellFacts,
   queryPowerShell,
   shouldAskPowerShell,
@@ -15,6 +16,20 @@ describe('shouldAskPowerShell', () => {
     expect(shouldAskPowerShell({ env: { USERPROFILE: 'C:\\tmp' } }, 'win32')).toBe(false);
     expect(shouldAskPowerShell({ platform: 'win32' }, 'win32')).toBe(false);
     expect(shouldAskPowerShell({}, 'linux')).toBe(false);
+  });
+});
+
+describe('envForPowerShell', () => {
+  it("drops the module path a parent PowerShell set, whatever its case, so each edition uses its own", () => {
+    // Started from PowerShell 7, ccx inherits its PSModulePath, and Windows
+    // PowerShell then fails to load its own Get-ExecutionPolicy from it.
+    const inherited = {
+      PSModulePath: 'C:\\Program Files\\PowerShell\\7\\Modules',
+      Path: 'C:\\Windows',
+      USERPROFILE: 'C:\\Users\\me',
+    };
+    expect(envForPowerShell(inherited)).toEqual({ Path: 'C:\\Windows', USERPROFILE: 'C:\\Users\\me' });
+    expect(envForPowerShell({ PSMODULEPATH: 'x', HOME: '/h' })).toEqual({ HOME: '/h' });
   });
 });
 
@@ -70,7 +85,12 @@ describe.runIf(onWindowsCi)('queryPowerShell, asking the real PowerShells', () =
   /** What PowerShell itself said, stderr included, for when the answer did not parse. */
   const said = (exe: string): string => {
     const started = Date.now();
-    const r = spawnSync(exe, FACTS_ARGS, { encoding: 'utf8', timeout: 60_000, windowsHide: true });
+    const r = spawnSync(exe, FACTS_ARGS, {
+      encoding: 'utf8',
+      timeout: 60_000,
+      windowsHide: true,
+      env: envForPowerShell(process.env),
+    });
     return JSON.stringify({
       ms: Date.now() - started,
       status: r.status,

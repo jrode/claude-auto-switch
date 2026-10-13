@@ -34,8 +34,7 @@ export function utf8Base64(expr: string): string {
 const FACTS_SCRIPT = [
   `'allHosts=' + ${utf8Base64('$PROFILE.CurrentUserAllHosts')}`,
   `'currentHost=' + ${utf8Base64('$PROFILE.CurrentUserCurrentHost')}`,
-  // Named with its module: otherwise Windows PowerShell looks through every
-  // installed module for the command, which took over 8 seconds on CI.
+  // Named with its module, which is loaded directly rather than searched for.
   "'policy=' + [string](Microsoft.PowerShell.Security\\Get-ExecutionPolicy)",
   "'machinePolicy=' + [string](Microsoft.PowerShell.Security\\Get-ExecutionPolicy -Scope MachinePolicy)",
   "'userPolicy=' + [string](Microsoft.PowerShell.Security\\Get-ExecutionPolicy -Scope UserPolicy)",
@@ -67,6 +66,16 @@ export function parsePowerShellFacts(out: string): PowerShellFacts | null {
 }
 
 /**
+ * The environment to start a PowerShell with: this one without PSModulePath.
+ * Started from PowerShell 7, ccx inherits its module path, and Windows
+ * PowerShell then tries to load PowerShell 7's modules and fails, even for
+ * its own Get-ExecutionPolicy. Without it, each edition builds its own.
+ */
+export function envForPowerShell(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([name]) => name.toUpperCase() !== 'PSMODULEPATH'));
+}
+
+/**
  * Ask one edition where its profiles are and what its execution policy is.
  * Asked rather than computed: OneDrive often moves the Documents folder, and
  * only PowerShell knows where it ended up. Null when the edition is not
@@ -81,6 +90,7 @@ export function queryPowerShell(exe: PowerShellExe): PowerShellFacts | null {
     // Usually under a second; a slow start that is cut short loses the policy.
     timeout: 15_000,
     windowsHide: true,
+    env: envForPowerShell(process.env),
   });
   return typeof r.stdout === 'string' ? parsePowerShellFacts(r.stdout) : null;
 }
