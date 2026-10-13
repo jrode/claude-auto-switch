@@ -34,9 +34,11 @@ export function utf8Base64(expr: string): string {
 const FACTS_SCRIPT = [
   `'allHosts=' + ${utf8Base64('$PROFILE.CurrentUserAllHosts')}`,
   `'currentHost=' + ${utf8Base64('$PROFILE.CurrentUserCurrentHost')}`,
-  "'policy=' + [string](Get-ExecutionPolicy)",
-  "'machinePolicy=' + [string](Get-ExecutionPolicy -Scope MachinePolicy)",
-  "'userPolicy=' + [string](Get-ExecutionPolicy -Scope UserPolicy)",
+  // Named with its module: otherwise Windows PowerShell looks through every
+  // installed module for the command, which took over 8 seconds on CI.
+  "'policy=' + [string](Microsoft.PowerShell.Security\\Get-ExecutionPolicy)",
+  "'machinePolicy=' + [string](Microsoft.PowerShell.Security\\Get-ExecutionPolicy -Scope MachinePolicy)",
+  "'userPolicy=' + [string](Microsoft.PowerShell.Security\\Get-ExecutionPolicy -Scope UserPolicy)",
 ].join('; ');
 
 /** How each edition is started to answer FACTS_SCRIPT: no profile of its own runs. */
@@ -76,7 +78,8 @@ export function queryPowerShell(exe: PowerShellExe): PowerShellFacts | null {
   const r = spawnSync(exe, FACTS_ARGS, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
-    timeout: 8000,
+    // Usually under a second; a slow start that is cut short loses the policy.
+    timeout: 15_000,
     windowsHide: true,
   });
   return typeof r.stdout === 'string' ? parsePowerShellFacts(r.stdout) : null;

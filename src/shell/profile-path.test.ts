@@ -69,8 +69,15 @@ const onWindowsCi = process.platform === 'win32' && Boolean(process.env.CI);
 describe.runIf(onWindowsCi)('queryPowerShell, asking the real PowerShells', () => {
   /** What PowerShell itself said, stderr included, for when the answer did not parse. */
   const said = (exe: string): string => {
+    const started = Date.now();
     const r = spawnSync(exe, FACTS_ARGS, { encoding: 'utf8', timeout: 60_000, windowsHide: true });
-    return JSON.stringify({ status: r.status, error: r.error?.message, stdout: r.stdout, stderr: r.stderr });
+    return JSON.stringify({
+      ms: Date.now() - started,
+      status: r.status,
+      error: r.error?.message,
+      stdout: r.stdout,
+      stderr: r.stderr,
+    });
   };
   const folders: Array<[PowerShellExe, string]> = [
     ['powershell', 'WindowsPowerShell'],
@@ -79,14 +86,16 @@ describe.runIf(onWindowsCi)('queryPowerShell, asking the real PowerShells', () =
 
   for (const [exe, folder] of folders) {
     it(`gets ${exe} its own profiles and a policy`, () => {
+      const started = Date.now();
       const facts = queryPowerShell(exe);
-      const why = facts ? '' : said(exe);
+      const took = Date.now() - started;
+      const why = facts && facts.policy !== 'Unknown' ? '' : `query took ${took} ms; again: ${said(exe)}`;
       expect(facts?.allHosts, why).toMatch(new RegExp(`\\\\${folder}\\\\profile\\.ps1$`));
       expect(facts?.currentHost, why).toMatch(
         new RegExp(`\\\\${folder}\\\\Microsoft\\.PowerShell_profile\\.ps1$`),
       );
       expect(facts?.policy, why).toMatch(/^(Restricted|AllSigned|RemoteSigned|Unrestricted|Bypass|Undefined)$/);
-    }, 60_000);
+    }, 120_000);
   }
 
   it('brings back a name outside ASCII whole, from both editions', () => {
