@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { vi } from 'vitest';
 import { nodePty } from '../../src/util/native-pty.js';
 import {
   runPtySession,
@@ -133,6 +134,56 @@ export const QUICK = {
 
 export const prompts = (log: Entry[]): Entry[] => log.filter((e) => e.type === 'prompt');
 export const launches = (log: Entry[]): Entry[] => log.filter((e) => e.type === 'launch');
+
+/**
+ * Give account `name` a login that is due for renewal: it expired a minute
+ * ago. `account` stays in it, so the fake still says which account it is.
+ */
+export function dueLogin(dir: string, name: string): void {
+  writeFileSync(
+    path.join(dir, '.credentials.json'),
+    JSON.stringify({
+      account: name,
+      claudeAiOauth: { accessToken: `old-${name}`, refreshToken: `refresh-${name}`, expiresAt: Date.now() - 60_000 },
+    }),
+    'utf8',
+  );
+}
+
+/**
+ * A usage snapshot read just now, so the session's usage refresher has
+ * nothing to do and renews no idle login on its own while a test runs.
+ */
+export function freshUsage(home: string, names: string[]): void {
+  const now = Date.now();
+  const entry = { fiveHour: 0.1, sevenDay: 0.1, fiveHourReset: null, sevenDayReset: null, at: now };
+  writeFileSync(
+    path.join(home, 'usage-snapshot.json'),
+    JSON.stringify({ accounts: Object.fromEntries(names.map((n) => [n, entry])) }),
+    'utf8',
+  );
+}
+
+/**
+ * Anthropic's token endpoint, answering every renewal with a new login, and
+ * nothing else on the network: any other request fails. Undone by
+ * `vi.unstubAllGlobals()`. Says how many renewals were asked for.
+ */
+export function renewingTokenEndpoint(): () => number {
+  let renewals = 0;
+  vi.stubGlobal('fetch', (input: string | URL | Request) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (!url.endsWith('/v1/oauth/token')) return Promise.reject(new Error(`no network in tests: ${url}`));
+    renewals += 1;
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({ access_token: `renewed-${renewals}`, refresh_token: `next-${renewals}`, expires_in: 28_800 }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+  });
+  return () => renewals;
+}
 
 /** A stand-in for the person's keyboard: what `press` is given reaches Claude as typed. */
 function keyboard(): { input: TerminalInput; press: (text: string) => void } {

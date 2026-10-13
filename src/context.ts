@@ -40,6 +40,12 @@ export interface CliContext {
    * newer ccx or a switch it cannot make in place. Production waits 20 s.
    */
   idleBeforeRestartMs?: number;
+  /**
+   * Injected in tests: how long a refused turn goes unchecked after a check
+   * that did not confirm a limit, or after a move in place. Production waits
+   * 20 s (launcher/pty-session).
+   */
+  refuteBackoffMs?: number;
   /** Injected in tests: overrides the API lookup of who a stored login belongs to. */
   lookupOwner?: (dir: string) => Promise<string | null>;
   /** Injected in tests: a newer ccx installed under this one (update/newer-install). */

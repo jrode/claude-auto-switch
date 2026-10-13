@@ -61,15 +61,23 @@ Claude, so its subagents, background commands and scheduled loops keep running,
 then types a short carry-on prompt into it once Claude is back at its prompt
 with nothing typed in the input box (set the prompt with `ccx resume-prompt`, or
 `resume` in the config). A subagent's refused turn starts the same move, before
-the main thread meets the limit. ccx relaunches Claude with
+the main thread meets the limit. When the next account's login is due for
+renewal, ccx renews it first and then moves in place, unless another session or
+your editor may be using that login, since renewing it would sign them out.
+When every account looks out of room, ccx moves the session in place to the
+account a relaunch would have started it on anyway, and says so, because that
+judgement is cached and can be wrong. It never guesses its way onto an account
+the session itself has seen run out while that limit lasts; when that leaves
+nothing to try, the relaunch takes over, as before. ccx relaunches Claude with
 `--resume <conversation>` and the prompt instead when the limit is one model's,
-when the next account's login has to be renewed first or is only a long-lived
-token, when the session was started with a long-lived token, or when the
-session has stopped and the prompt cannot be typed safely: something is typed
-in the input box, a dialog stays open, or Claude does not say what it is doing.
-A switch you make yourself (`ccx use`, `/ccx`) happens in place, by the same
-rule; when it needs a restart instead, ccx waits until Claude has been idle for
-20 seconds (`--now` restarts at once).
+when the next account has only a long-lived token, when the session was started
+with a long-lived token, when the next account's login is due for renewal and
+cannot be renewed here, or when the session has stopped and the prompt cannot
+be typed safely: something is typed in the input box, a dialog stays open, or
+Claude does not say what it is doing. A switch you make yourself (`ccx use`,
+`/ccx`) happens in place, by the same rule, renewing a login that is due first;
+when it needs a restart instead, ccx waits until Claude has been idle for 20
+seconds (`--now` restarts at once).
 
 **One session at a time.** Each session moves on its own: a refused turn moves
 that session and no other. A switch you make from the dashboard or with

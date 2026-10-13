@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.1]
+
+### Changed
+
+- **A session is no longer restarted when every account looks out of room.**
+  When an account ran out and every other one was recorded as out too, ccx
+  ended Claude and started it again on an account anyway, because that
+  record is cached and can be wrong: usage credits, a limit recorded against
+  the wrong account, a window that has since reset. Ending Claude ends every
+  subagent, background command and scheduled loop it has running. ccx now
+  makes the same guess by the same rule (the active account, else the first
+  in the account list), but moves the session onto it under the running
+  Claude, types the carry-on prompt, and says in `ccx history` that every
+  account looked out of room. The guess is never the account that just ran
+  out, nor any other account the session has itself seen run out while that
+  limit lasts, so two accounts that are both out cannot pass a session back
+  and forth. When that leaves nothing to try, the session is relaunched as
+  before.
+- **A switch, or a move after a limit, no longer restarts Claude to renew the
+  next account's login.** A login that was due for renewal could not go under
+  a running Claude, so a switch onto that account (`ccx use`, `/ccx`, an
+  early move), or a move to it after a limit, restarted Claude and let the
+  start renew it. ccx now renews it first and then moves in place, as a visit
+  for an Artifact call already did. It still never renews a login another
+  session or your editor may be using, because renewing replaces the login
+  and signs them out; then the switch waits for a restart as before, and
+  `ccx history` says why. After a limit, ccx waits at most five seconds for
+  the renewal; a slower one finishes by itself, and the session moves where
+  it can without it.
+- **A session no longer renews one login twice at once.** Its usage
+  refresher, a start, a move and an Artifact visit could each renew the same
+  login at the same moment. A refresh token works once, so the second renewal would be
+  refused and read as a login that needs signing in again. Within a session,
+  a renewal of a login already being renewed now waits for that one and gets
+  its result. Found while adding the renewals above; not seen happen.
+
 ## [2.6.0]
 
 ### Added

@@ -139,8 +139,9 @@ import { spreadWorkers } from '../usage/spread.js';
 import { HEALTHY_RUN, standingOf } from '../usage/runway.js';
 import { holdBackOf } from '../dashboard/rotation-settings.js';
 import { activateWithLease, finishWithLease } from '../session/handoff.js';
-import { ensureLoginUsable, readinessMessage, swapMode } from '../session/preflight.js';
+import { ensureLoginUsable, readinessMessage } from '../session/preflight.js';
 import { renewalIsDue, refreshCredentialIfExpired } from '../usage/oauth-refresh.js';
+import { renewOneAtATime } from '../usage/renew-one-at-a-time.js';
 import { withCredentialLock, withCredentialLockIfFree, acquireLockDir } from '../claude/locks.js';
 import { logCredentialEvent } from '../accounts/credential-log.js';
 import { appendEvent, type EventDetail } from '../events/log.js';
@@ -150,6 +151,29 @@ import type { Account } from '../accounts/registry.schema.js';
 const CREDS = '.credentials.json';
 /** How long a confirmed usage limit keeps a visit to another account waiting, at most. */
 const CAP_DECIDING_MS = 60_000;
+/** How long a confirmed usage limit waits, at most, for the login it moves the session onto to be renewed. */
+const RELIEF_RENEWAL_WAIT_MS = 5_000;
+
+/** What became of renewing an account's login so a session could be moved onto it in place. */
+type MoveRenewal = { ok: true } | { ok: false; why: 'in-use' | 'editor' | 'needs-login' | 'failed'; detail: string };
+
+/** `promise`'s value, or null once `ms` have passed first or when it fails. */
+function within<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
+}
 
 /** True when at least one account can run (hot-swap is possible). */
 export function hasAnyUsableAccount(context: CliContext): boolean {
@@ -1127,6 +1151,82 @@ export async function runInteractiveHotSwap(
   let capChecks = 0;
   let capConfirmedAt: number | null = null;
 
+  /** Every renewal this session makes, of any login, one at a time per login. */
+  const renewLogin = renewOneAtATime((dir) => refreshCredentialIfExpired(dir, { ctx: context.ctx }));
+
+  /**
+   * Renew `account`'s login so this session can be moved onto it in place, by
+   * the rule for renewing a login no session here is on (renewIdleLogin):
+   * never one another session or the editor may be using, because renewing
+   * replaces it and whatever is using it is signed out.
+   */
+  const renewBeforeMove = async (account: Account): Promise<MoveRenewal> => {
+    const { refusal, renewal, lease } = await renewIdleLogin(account, accounts, context.ctx, { renew: renewLogin });
+    if (refusal !== null) return { ok: false, why: lease ? 'in-use' : 'editor', detail: refusal };
+    if (renewal.status === 'refreshed' || renewal.status === 'not-needed') return { ok: true };
+    return {
+      ok: false,
+      why: renewal.status === 'needs-login' ? 'needs-login' : 'failed',
+      detail: renewal.detail ?? 'no answer',
+    };
+  };
+
+  /** Why a renewal for a move did not happen, as the end of a sentence. */
+  const renewalWithheld = (account: Account, result: Exclude<MoveRenewal, { ok: true }>): string =>
+    result.why === 'in-use'
+      ? 'another session is using it, so ccx does not renew it from here'
+      : result.why === 'editor'
+        ? 'your editor may be using it, so ccx does not renew it from here'
+        : result.why === 'needs-login'
+          ? `it needs signing in again (ccx login ${account.name})`
+          : `it could not be renewed just now (${result.detail})`;
+
+  /**
+   * Whether the login under a running Claude can be replaced with `target`'s:
+   * 'ready' as it is, 'renew' once its login, due for renewal, has been
+   * renewed, or the reason only a relaunch can put the session there. The one
+   * rule for every move in place: the one a limit makes and the one somebody
+   * asks for (`ccx use`, `/ccx`, an early move).
+   *
+   * A replaced login is only used by a Claude that reads the one in its
+   * folder, and one started with a long-lived token (`launchedWithToken`)
+   * reads the token instead. The target has to have a login to put there: a
+   * long-lived token alone reaches Claude only through a new launch's
+   * environment, and installing nothing empties the folder under the running
+   * Claude.
+   */
+  const inPlaceReadiness = (target: Account, launchedWithToken: boolean): 'ready' | 'renew' | { restart: string } => {
+    if (launchedWithToken) {
+      return { restart: 'this session was started with a long-lived token, which Claude uses instead of the login in its folder' };
+    }
+    if (!hasUsableLogin(target.dir)) {
+      return { restart: `"${target.name}" has only a long-lived token, which reaches Claude only when it starts` };
+    }
+    return renewalIsDue(target.dir) ? 'renew' : 'ready';
+  };
+
+  /**
+   * A login being renewed so that a requested switch can go under the running
+   * Claude: whose, for which request, and how it came out once it has.
+   */
+  let switchRenewal: { account: string; requestAt: number; result: MoveRenewal | null } | null = null;
+  const startSwitchRenewal = (target: Account, requestAt: number): void => {
+    const renewing = { account: target.name, requestAt, result: null as MoveRenewal | null };
+    switchRenewal = renewing;
+    notice(`renewing the "${target.name}" login first, to move this session onto it in place`, {
+      kind: 'renewal',
+      data: { account: target.name, for: 'switch' },
+    });
+    void renewBeforeMove(target).then(
+      (result) => {
+        renewing.result = result;
+      },
+      (error: unknown) => {
+        renewing.result = { ok: false, why: 'failed', detail: thrownReason(error) };
+      },
+    );
+  };
+
   /**
    * This session on another account for one Artifact call, and back (see
    * artifacts/hop). Made with `activate`, so every rule of an in-place move
@@ -1147,22 +1247,17 @@ export async function runInteractiveHotSwap(
     readiness: (account) =>
       !hasUsableLogin(account.dir) ? 'no-login' : renewalIsDue(account.dir) ? 'renewal-due' : 'ready',
     renew: async (account) => {
-      const { refusal, renewal } = await renewIdleLogin(account, accounts, context.ctx);
-      if (refusal !== null) {
-        return {
-          ok: false,
-          reason:
-            `the "${account.name}" login is due for renewal, and something else is using it, so the call was ` +
-            'not sent. Try again in a minute',
-        };
-      }
-      if (renewal.status === 'refreshed' || renewal.status === 'not-needed') return { ok: true };
+      const result = await renewBeforeMove(account);
+      if (result.ok) return { ok: true };
       return {
         ok: false,
         reason:
-          renewal.status === 'needs-login'
-            ? `"${account.name}" needs signing in again, so the call was not sent. Ask the person to run: ccx login ${account.name}`
-            : `the "${account.name}" login could not be renewed just now (${renewal.detail ?? 'no answer'}), so the call was not sent. Try again in a minute`,
+          result.why === 'in-use' || result.why === 'editor'
+            ? `the "${account.name}" login is due for renewal, and something else is using it, so the call was ` +
+              'not sent. Try again in a minute'
+            : result.why === 'needs-login'
+              ? `"${account.name}" needs signing in again, so the call was not sent. Ask the person to run: ccx login ${account.name}`
+              : `the "${account.name}" login could not be renewed just now (${result.detail}), so the call was not sent. Try again in a minute`,
       };
     },
     // Only a move away has a call counting on Claude reading the new login at
@@ -1225,12 +1320,54 @@ export async function runInteractiveHotSwap(
     capChecks += 1;
     try {
       const limited = await askAccountAboutCap(renderedText);
-      if (limited) capConfirmedAt = Date.now();
+      if (limited) {
+        capConfirmedAt = Date.now();
+        await renewForRelief();
+      }
       return limited;
     } finally {
       capChecks -= 1;
     }
   };
+
+  /**
+   * When the account a confirmed limit would move this session onto in place
+   * has a login due for renewal, renew it now, so that the move, which is made
+   * without waiting (onCapConfirmed), can go there rather than be left to a
+   * relaunch. Done here because this check is the step a limit may wait on.
+   * Bounded: a renewal still running then finishes by itself, and the move
+   * goes wherever it can without it.
+   */
+  const renewForRelief = async (): Promise<void> => {
+    // A worker's limit ends its launch, and a limit on one model is not moved
+    // in place either (see onCapConfirmed).
+    if (worker || limitedModel !== undefined) return;
+    const capName = capOwner ?? current?.name;
+    if (!capName) return;
+    const launchedWithToken = tokenAccount !== null;
+    const plan = reliefPlan(capName, launchedWithToken, true);
+    if (!plan || inPlaceReadiness(plan.account, launchedWithToken) !== 'renew') return;
+    const to = plan.account;
+    const result = await within(renewBeforeMove(to), RELIEF_RENEWAL_WAIT_MS);
+    logEvent(
+      result?.ok
+        ? `renewed the "${to.name}" login first, to move this session onto it in place`
+        : `could not renew the "${to.name}" login to move this session onto it in place: ${
+            result ? renewalWithheld(to, result) : `it took longer than ${RELIEF_RENEWAL_WAIT_MS / 1000}s`
+          }`,
+      { kind: 'renewal', data: { account: to.name, for: 'limit', ok: result?.ok ?? false } },
+    );
+  };
+
+  /**
+   * The accounts this session has itself seen run out, each with when that
+   * limit ends (null: no end known). The rest of the ledger can be another
+   * session's record or an old reading; these are this session's own, just
+   * confirmed by the account itself.
+   */
+  const seenOut = new Map<string, number | null>();
+  const seenOutNow = (now: number): string[] =>
+    [...seenOut].filter(([, until]) => until === null || until > now).map(([name]) => name);
 
   /**
    * Write a confirmed cap to the ledger, honestly attributed.
@@ -1255,17 +1392,18 @@ export async function runInteractiveHotSwap(
       return;
     }
     refreshSettings(); // how long to skip it, as set now
-    saveLedger(
-      markCapped(loadLedger(context.ctx), {
-        account: accountName,
-        now: Date.now(),
-        resetAt: resetAt ?? limitedResetAt ?? null,
-        backoffMinutes: context.config.rotation.defaultBackoffMinutes,
-        reason,
-        ...(limitedModel ? { model: limitedModel } : {}),
-      }),
-      context.ctx,
-    );
+    const ledger = markCapped(loadLedger(context.ctx), {
+      account: accountName,
+      now: Date.now(),
+      resetAt: resetAt ?? limitedResetAt ?? null,
+      backoffMinutes: context.config.rotation.defaultBackoffMinutes,
+      reason,
+      ...(limitedModel ? { model: limitedModel } : {}),
+    });
+    saveLedger(ledger, context.ctx);
+    if (!limitedModel) {
+      seenOut.set(accountName, ledger.caps.find((c) => c.account === accountName && !c.model)?.capUntil ?? null);
+    }
     logEvent(`${accountName} hit its limit`, {
       kind: 'capped',
       data: {
@@ -1299,65 +1437,15 @@ export async function runInteractiveHotSwap(
   };
 
   /**
-   * The account to move THIS session to when its current account hits an
-   * account-wide limit, WITHOUT restarting.
+   * The first of `healthy`, which is in the pick order, with room on the model
+   * this session is running; null when none has.
    *
    * Only a candidate that serves the model the session is actually running, with
    * NO model change, qualifies: a model change needs a relaunch to pass `--model`,
    * which is the restart this is trying to avoid, so those fall back to the swap
-   * loop. Null means "no in-place move is possible; end and relaunch as before".
-   * The just-capped account is excluded both explicitly and through the ledger
-   * cap recorded a moment earlier.
+   * loop.
    */
-  /**
-   * Why the login under a running Claude cannot be replaced with `target`'s
-   * right now, or null when it can. The one rule for every move in place: the
-   * one a limit makes and the one somebody asks for (`ccx use`, `/ccx`, an
-   * early move). `launchToken` is the long-lived token that Claude was started
-   * with, if any.
-   *
-   * A replaced login is only used by a Claude that reads the one in its
-   * folder, and one started with a token reads the token instead. The target
-   * has to have a login to put there: a long-lived token alone reaches Claude
-   * only through a new launch's environment, and installing nothing empties
-   * the folder under the running Claude. And it has to be good for a while:
-   * the swap cannot renew anything first, so a login due for renewal is left
-   * to a relaunch, which renews before handing over.
-   */
-  const inPlaceRefusal = (target: Account, launchToken: string | null): string | null => {
-    if (launchToken !== null) {
-      return 'this session was started with a long-lived token, which Claude uses instead of the login in its folder';
-    }
-    if (!hasUsableLogin(target.dir)) {
-      return `"${target.name}" has only a long-lived token, which reaches Claude only when it starts`;
-    }
-    const mode = swapMode({ hasLogin: () => true, renewalDue: () => renewalIsDue(target.dir) });
-    return mode === 'restart' ? `"${target.name}" needs its login refreshed first` : null;
-  };
-
-  const reliefAccount = (capName: string, launchToken: string | null): Account | null => {
-    refreshSettings();
-    const now = Date.now();
-    const capped = cappedNames(loadLedger(context.ctx), now);
-    const healthy = accounts
-      .filter(
-        (a) =>
-          a.enabled &&
-          a.name !== capName &&
-          !capped.has(a.name) &&
-          hasWorkingLogin(a.dir, context.ctx) &&
-          // `hasWorkingLogin` says the login is not rejected; this says it can
-          // go under the running Claude now, by the rule switchWatch uses too.
-          inPlaceRefusal(a, launchToken) === null,
-      )
-      // Same account order as everywhere else, judged for the model this
-      // session is running (a model with a weekly window of its own counts it).
-      .sort(
-        orderComparator(
-          context.config.rotation.accountOrder,
-          roomOfFromSnapshot(context.ctx, now, context.config.rotation, runningModel()),
-        ),
-      );
+  const withRoomOnRunningModel = (healthy: Account[], now: number): Account | null => {
     if (healthy.length === 0) return null;
     const running = runningModel();
     // No KNOWN running model: Claude is on its own default and ccx cannot read
@@ -1384,6 +1472,92 @@ export async function runInteractiveHotSwap(
     return healthy.find((a) => a.name === plan.account) ?? null;
   };
 
+  /**
+   * Where THIS session moves, WITHOUT restarting, when `capName` hits an
+   * account-wide limit; null when only a relaunch can move it.
+   *
+   * An account with room on the model the session is running comes first. When
+   * there is none because every account looks out of room, judged by the pick
+   * the relaunch path would make (pickAccount), the session goes where that
+   * path would start it anyway (startAnyway), moved there in place, and
+   * `anyway` says so. Never onto an account this session has itself seen run
+   * out while that limit lasts: that is not a guess, and two accounts that are
+   * both out would pass the session back and forth.
+   *
+   * `renewable` counts an account whose login is due for renewal as one the
+   * session can be moved onto, its login renewed first; without it, only one
+   * whose login can go under Claude as it is.
+   */
+  const reliefPlan = (
+    capName: string,
+    launchedWithToken: boolean,
+    renewable: boolean,
+  ): { account: Account; anyway: string | null } | null => {
+    refreshSettings();
+    const now = Date.now();
+    const canTake = (a: Account): boolean => {
+      const readiness = inPlaceReadiness(a, launchedWithToken);
+      return readiness === 'ready' || (renewable && readiness === 'renew');
+    };
+    const capped = cappedNames(loadLedger(context.ctx), now);
+    const healthy = accounts
+      .filter(
+        (a) =>
+          a.enabled &&
+          a.name !== capName &&
+          !capped.has(a.name) &&
+          hasWorkingLogin(a.dir, context.ctx) &&
+          // `hasWorkingLogin` says the login is not rejected; this says it can
+          // go under the running Claude, by the rule switchWatch uses too.
+          canTake(a),
+      )
+      // Same account order as everywhere else, judged for the model this
+      // session is running (a model with a weekly window of its own counts it).
+      .sort(
+        orderComparator(
+          context.config.rotation.accountOrder,
+          roomOfFromSnapshot(context.ctx, now, context.config.rotation, runningModel()),
+        ),
+      );
+    const roomy = withRoomOnRunningModel(healthy, now);
+    if (roomy) return { account: roomy, anyway: null };
+    if (pickAccount(new Set([capName, ...deadLogins()]), { quiet: true }) !== null) return null;
+    const guess = startAnyway(new Set([capName, ...seenOutNow(now)]), canTake);
+    const account = guess ? accounts.find((a) => a.name === guess.account.name) : undefined;
+    return guess && account ? { account, anyway: guess.message } : null;
+  };
+
+  /** Accounts whose stored login the token endpoint has refused, which no wait repairs. */
+  const deadLogins = (): string[] =>
+    accounts.filter((a) => hasLogin(a.dir) && !hasWorkingLogin(a.dir, context.ctx)).map((a) => a.name);
+
+  /**
+   * Where a session goes when every account looks out of room (see
+   * session/last-resort): the relaunch path starts it there, and a limit met
+   * under a running Claude moves it there in place. From the enabled accounts
+   * with a working login that are not in `excluding`, and for a move in place
+   * only those `inPlace` says it can take.
+   */
+  const startAnyway = (excluding: Set<string>, inPlace?: (account: Account) => boolean) =>
+    lastResortStart({
+      usable: accounts
+        .filter(
+          (a) =>
+            a.enabled &&
+            !excluding.has(a.name) &&
+            hasWorkingLogin(a.dir, context.ctx) &&
+            (inPlace?.(a) ?? true),
+        )
+        .map((a) => ({ name: a.name, dir: a.dir })),
+      // A worker is not the session others start from, so the account they
+      // start on is no reason for it to land there.
+      active: worker ? null : getActive(context.ctx),
+      // A move in place answers a limit on the whole account, so "only one
+      // model is out" is not what happened.
+      modelOnly: inPlace ? null : modelOnlyLimit(loadLedger(context.ctx), Date.now()),
+      ...(inPlace ? { inPlace: true } : {}),
+    });
+
   // Claim the operator's keyboard once for the whole run; every session in the
   // swap loop borrows it, so terminal mode is never toggled mid-swap.
   const terminalInput = worker ? null : openTerminalInput(process.stdin, {
@@ -1404,7 +1578,7 @@ export async function runInteractiveHotSwap(
   // targets from hours-old numbers and idle profiles' logins quietly rotted.
   const usageWatch = startUsageRefresher(
     {
-      refresh: () => refreshUsage(listAccounts(context.ctx), context.ctx),
+      refresh: () => refreshUsage(listAccounts(context.ctx), context.ctx, { renew: renewLogin }),
       snapshotAgeMs: () => snapshotAgeMs(context.ctx),
       tryLock: () => acquireLockDir(path.join(home, 'usage-refresh.lock'), { waitMs: 0 }),
       onOutcome: (outcome, detail) => {
@@ -1445,8 +1619,14 @@ export async function runInteractiveHotSwap(
     Math.max(30, context.config.rotation.usageCheckSeconds) * 1000,
   );
 
-  /** The next account to run on, by the pick order; null when none can. */
-  const pickAccount = (excluding: Set<string>): { name: string; dir: string } | null => {
+  /**
+   * The next account to run on, by the pick order; null when none can.
+   * `quiet` only asks: nothing is said and no model change is taken up.
+   */
+  const pickAccount = (
+    excluding: Set<string>,
+    { quiet = false }: { quiet?: boolean } = {},
+  ): { name: string; dir: string } | null => {
     refreshSettings();
     const capped = cappedNames(loadLedger(context.ctx), Date.now());
     // An account this run was told to start on outranks the active one.
@@ -1471,7 +1651,7 @@ export async function runInteractiveHotSwap(
     // A run told to start on an account that cannot take it is not put
     // somewhere else in silence. Said once, at the start; moving off it later
     // is ordinary rotation and says so itself.
-    if (options.account !== undefined && !accountChoiceSettled) {
+    if (options.account !== undefined && !accountChoiceSettled && !quiet) {
       accountChoiceSettled = true;
       if (!eligible.some((a) => a.name === options.account)) {
         const asked = accounts.find((a) => a.name === options.account);
@@ -1531,7 +1711,7 @@ export async function runInteractiveHotSwap(
     // start on it, but writing it down when nothing moved would impose
     // `--model` on a session that never asked for one, overriding the
     // operator's own pin with a value ccx picked.
-    if (plan.changedModel && plan.model) {
+    if (plan.changedModel && plan.model && !quiet) {
       notice(plan.reason, { kind: 'model-change', data: { to: plan.model } });
       chosenModel = plan.model;
     }
@@ -1545,8 +1725,7 @@ export async function runInteractiveHotSwap(
     // Skipped up front rather than launched and rejected. These go into the same
     // set a runtime rejection goes into, so the closing message still says to
     // sign in instead of telling the operator to wait for a reset.
-    knownDeadAccounts: () =>
-      accounts.filter((a) => hasLogin(a.dir) && !hasWorkingLogin(a.dir, context.ctx)).map((a) => a.name),
+    knownDeadAccounts: deadLogins,
     // Never selectable, so this is only for the ending: an account nobody has
     // signed into is otherwise silently absent, and the operator gets told to
     // wait for a reset that cannot produce a login.
@@ -1575,16 +1754,7 @@ export async function runInteractiveHotSwap(
     // Never a refusal to launch: see src/session/last-resort.ts. ccx is not the
     // authority on whether the server will serve a request, and being wrong
     // here costs the operator the whole session.
-    lastResort: (excluding) =>
-      lastResortStart({
-        usable: accounts
-          .filter((a) => a.enabled && !excluding.has(a.name) && hasWorkingLogin(a.dir, context.ctx))
-          .map((a) => ({ name: a.name, dir: a.dir })),
-        // A worker is not the session others start from, so the account they
-        // start on is no reason for it to land there.
-        active: worker ? null : getActive(context.ctx),
-        modelOnly: modelOnlyLimit(loadLedger(context.ctx), Date.now()),
-      }),
+    lastResort: (excluding) => startAnyway(excluding),
     runSession: async (hotAccount, isContinue, runOptions) => {
       // A worker ended between launches starts nothing more.
       if (interruption?.exitCode != null) return { kind: 'ok', exitCode: interruption.exitCode };
@@ -1605,7 +1775,7 @@ export async function runInteractiveHotSwap(
         ensureLoginUsable({
           hasLogin: () => hasLogin(account.dir),
           renewalDue: () => renewalIsDue(account.dir),
-          renew: () => refreshCredentialIfExpired(account.dir, { ctx: context.ctx }),
+          renew: () => renewLogin(account.dir),
         });
       let readiness = await checkReadiness();
       if (readiness.state === 'needs-login') {
@@ -1753,7 +1923,23 @@ export async function runInteractiveHotSwap(
         // stays until nothing would be cut off (or is replaced by another),
         // which an early move and `/ccx`, asked in the middle of a turn, rely
         // on. `--now` is the way to restart at once.
-        const refusal = inPlaceRefusal(target, token);
+        const readiness = inPlaceReadiness(target, token !== null);
+        let refusal = typeof readiness === 'object' ? readiness.restart : null;
+        if (readiness === 'renew') {
+          // Renewed first, while this look returns at once: a later look
+          // makes the move. The request stays where it is until then, so it
+          // is acted on once, and the renewal is started once for it.
+          const renewing = switchRenewal;
+          const requestAt = request?.at ?? 0;
+          if (renewing === null || renewing.account !== target.name || renewing.requestAt !== requestAt) {
+            startSwitchRenewal(target, requestAt);
+            return null;
+          }
+          if (renewing.result === null) return null;
+          refusal =
+            `"${target.name}" needs its login renewed before it can go under a running Claude, and ` +
+            (renewing.result.ok ? 'it was still due after renewing it' : renewalWithheld(target, renewing.result));
+        }
         if (refusal !== null) {
           const blocker = restartBlocker();
           if (blocker !== null) {
@@ -1773,6 +1959,7 @@ export async function runInteractiveHotSwap(
           return target.name;
         }
         consume();
+        switchRenewal = null;
         activate(target);
         // A TARGETED switch (`ccx use --here/--session`) moves only this session:
         // it must not touch the global active account or the editor pointer, which
@@ -1793,8 +1980,10 @@ export async function runInteractiveHotSwap(
        * under the live child is swapped to a healthy one in place and the next
        * request goes there, with no restart and no lost sub-agents. Falls back to
        * 'restart' (end and relaunch, resuming the conversation) when a model-only
-       * limit is in play, when there is no healthy account, or when the only move
-       * would need a model change.
+       * limit is in play, when there is nowhere to move it in place, or when the
+       * only move would need a model change. When every account looks out of
+       * room, it is moved in place to where a relaunch would have started it
+       * anyway (see reliefPlan).
        *
        * The turn the limit refused has ended, so a moved session sits at its
        * prompt until it is told to carry on. That prompt is typed into the live
@@ -1822,18 +2011,22 @@ export async function runInteractiveHotSwap(
         // what actually happened rather than a caller's guess. Relief is possible
         // only when the caller allows it, the limit is account-wide (a model-only
         // limit leaves the account usable on other models, so the planner handles
-        // it), there is a same-model renewal-ready destination, and the swap
-        // applies cleanly (see inPlaceRefusal for what can go under it).
+        // it), there is a same-model destination whose login can go under
+        // Claude now (renewForRelief renewed it first when it was due), and the
+        // swap applies cleanly (see inPlaceReadiness for what can go under it).
         let relievedTo: Account | null = null;
+        /** What to say when the move is a guess, made because every account looked out of room. */
+        let anyway: string | null = null;
         // Whose limit this is, as the check found. A move starts the new
         // login's attribution afresh, but this limit was met before it.
         const unregistered = capUnregisteredEmail;
         if (opts.relieve && limitedModel === undefined && !relaunchForPrompt) {
-          const next = reliefAccount(capName, token);
+          const next = reliefPlan(capName, token !== null, false);
           if (next) {
             try {
-              activate(next); // seamless swap under the live child; updates `current`
-              relievedTo = next;
+              activate(next.account); // seamless swap under the live child; updates `current`
+              relievedTo = next.account;
+              anyway = next.anyway;
             } catch {
               // A swap that could not be applied must not strand the child on a
               // half-changed account: fall through to the restart path.
@@ -1885,11 +2078,20 @@ export async function runInteractiveHotSwap(
           setActive(relievedTo.name, context.ctx);
           syncEditorPointerIfEnabled(context);
         }
-        notice(`"${capName}" hit its limit; moved this session to "${relievedTo.name}" in place (no restart)`);
+        notice(
+          anyway !== null
+            ? `"${capName}" hit its limit, and ${anyway}`
+            : `"${capName}" hit its limit; moved this session to "${relievedTo.name}" in place (no restart)`,
+        );
         notifyAccountSwitch(relievedTo.name, 'switched in place');
         logEvent(`seamless cap relief: ${capName} -> ${relievedTo.name}`, {
           kind: 'cap-relief',
-          data: { from: capName, to: relievedTo.name, ...(opts.sidechain ? { metBy: 'subagent' } : {}) },
+          data: {
+            from: capName,
+            to: relievedTo.name,
+            ...(anyway !== null ? { everyAccountLookedOut: true } : {}),
+            ...(opts.sidechain ? { metBy: 'subagent' } : {}),
+          },
         });
         if (carryOn === null) return { kind: 'relieved', account: relievedTo.name };
         // Handed over even when this Claude cannot be typed into. A session
@@ -1940,6 +2142,7 @@ export async function runInteractiveHotSwap(
         ...(context.blockedWatch ? { blockedWatch: context.blockedWatch } : {}),
         ...(context.carryOn ? { carryOnTiming: context.carryOn } : {}),
         ...(context.idleBeforeRestartMs !== undefined ? { idleBeforeRestartMs: context.idleBeforeRestartMs } : {}),
+        ...(context.refuteBackoffMs !== undefined ? { refuteBackoffMs: context.refuteBackoffMs } : {}),
         ...(terminalInput ? { input: terminalInput } : {}),
         ...(runOptions?.ignoreLimits ? { ignoreLimits: true } : {}),
         ...(debugLog ? { debugLog } : {}),

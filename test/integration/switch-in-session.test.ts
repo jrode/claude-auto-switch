@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   mkdtempSync,
   mkdirSync,
@@ -21,6 +21,7 @@ import { loadConfig } from '../../src/config/config.js';
 import { liveLeases, leasePath } from '../../src/session/lease.js';
 import { saveToken } from '../../src/daemon/token-store.js';
 import type { CliContext } from '../../src/context.js';
+import { dueLogin, freshUsage, renewingTokenEndpoint } from './typeable-claude.js';
 
 const fakeClaude = fileURLToPath(new URL('../fake-claude/fake-claude.mjs', import.meta.url));
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -182,6 +183,7 @@ function conversationOf(args: string[] | undefined): string | null {
 
 describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a running session (against fake-claude)', () => {
   afterEach(() => {
+    vi.unstubAllGlobals();
     delete process.env.FAKE_CLAUDE_IDLE_MS;
     delete process.env.FAKE_CLAUDE_RUNS_LOG;
     delete process.env.FAKE_CLAUDE_EMIT_CAP;
@@ -598,6 +600,65 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a runnin
     // (the simulated ~30s re-read at run's end sees B), with no restart.
     const lastReread = runs.filter((r) => r.type === 'reread').pop();
     expect(lastReread?.marker).toBe('B');
+  });
+
+  /**
+   * A switch to B, whose login is due for renewal. Claude stays busy for the
+   * whole run, so a switch that needs a restart waits and is never made: only
+   * a move in place can put the session on B.
+   */
+  async function switchToDueLogin(options: { bInUseElsewhere?: boolean } = {}): Promise<{
+    runs: RunEntry[];
+    home: string;
+    renewals: number;
+  }> {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-switch-renew-'));
+    const runsLog = path.join(home, 'runs.jsonl');
+    Object.assign(process.env, {
+      FAKE_CLAUDE_RUNS_LOG: runsLog,
+      // Long enough for a slow runner to renew and move well before the end.
+      FAKE_CLAUDE_IDLE_MS: '8000',
+      FAKE_CLAUDE_SESSION_RECORD: '1',
+      FAKE_CLAUDE_STATUS: 'busy',
+    });
+    const context = makeContext(home);
+    await loginAccount(context, home, 'A');
+    await loginAccount(context, home, 'B');
+    dueLogin(path.join(home, 'profiles', 'B'), 'B');
+    freshUsage(home, ['A', 'B']);
+    if (options.bInUseElsewhere) {
+      // Another session, in a process that is running, announces it is on B.
+      mkdirSync(path.join(home, 'sessions-live'), { recursive: true });
+      writeFileSync(
+        path.join(home, 'sessions-live', `B__${process.ppid}.json`),
+        JSON.stringify({ account: 'B', pid: process.ppid, configDir: path.join(home, 'elsewhere'), at: Date.now() }),
+        'utf8',
+      );
+    }
+    const renewals = renewingTokenEndpoint();
+    setActive('A', context.ctx);
+
+    const running = runCommand(context, []);
+    await firstLaunch(runsLog);
+    writeSwitchRequest('B', Date.now(), 'seamless', context.ctx, process.pid);
+    expect(await running).toBe(0);
+    return { runs: readRuns(runsLog), home, renewals: renewals() };
+  }
+
+  it('renews a login that is due, then switches onto it in place rather than restarting Claude', async () => {
+    const { runs, renewals } = await switchToDueLogin();
+    expect(runs.filter((r) => r.type === 'launch')).toHaveLength(1);
+    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('B');
+    expect(renewals).toBe(1);
+  });
+
+  it('never renews a login another session is using to switch onto it', async () => {
+    // Renewing replaces the login, and the session using it would be signed
+    // out. So the switch waits for a restart, as before, and says why.
+    const { runs, home, renewals } = await switchToDueLogin({ bInUseElsewhere: true });
+    expect(renewals).toBe(0);
+    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('A');
+    expect(readFileSync(path.join(home, 'events.jsonl'), 'utf8')).toContain('another session is using it');
   });
 
   it('a TARGETED seamless switch moves this session but leaves the global active account alone', async () => {

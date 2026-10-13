@@ -34,6 +34,8 @@ export interface LastResortInput {
   active?: string | null;
   /** Set only when every active limit is about ONE model. */
   modelOnly?: { model: string; resetsAt: number | null } | null;
+  /** The running session is moved onto the account under the live Claude, rather than started on it. */
+  inPlace?: boolean;
   /** Injected so the message is stable in tests. */
   formatTime?: (epochMs: number) => string;
 }
@@ -64,11 +66,14 @@ export function lastResortStart(input: LastResortInput): LastResortStart | null 
     };
   }
 
+  const how = input.inPlace
+    ? `Moving this session to "${account.name}" in place anyway (no restart)`
+    : `Starting on "${account.name}" anyway`;
   return {
     account,
     message:
       'every account looks out of room, but that is a cached judgement and it can be wrong ' +
       '(usage credits, a limit recorded against the wrong account, a window that has since ' +
-      `reset). Starting on "${account.name}" anyway and letting the server decide.`,
+      `reset). ${how} and letting the server decide.`,
   };
 }

@@ -40,6 +40,14 @@ describe('starting when everything looks spent', () => {
     expect(start!.message).toContain('/model');
   });
 
+  it('says a session is moved in place when it is, by the same rule and order', () => {
+    const start = lastResortStart({ usable: pool(['a', 'b', 'c']), active: 'b', inPlace: true });
+    expect(start!.account.name).toBe('b');
+    expect(start!.message).toContain('every account looks out of room');
+    expect(start!.message).toContain('Moving this session to "b" in place anyway (no restart)');
+    expect(start!.message).not.toContain('Starting on');
+  });
+
   it('refuses ONLY when there is no account with a login to start', () => {
     // The one honest refusal: nothing to launch. The caller's ending explains
     // which accounts need signing in.
