@@ -36,16 +36,19 @@ semantic versioning.
   after 20 seconds while the switch waits; one that found the login being
   renewed elsewhere at that moment, after 2 seconds. A login whose lock folder
   cannot be created (a profile folder ccx may not write in) is not renewed
-  from a session, and a switch onto it restarts as before, saying so. With
-  the editor following the active account (`ccx editor on`), a switch that
-  moves a session onto a login due for renewal leaves the editor where it is
-  until that session has renewed it and moved: an editor pointed there first
-  may be using the login. A command that moves no session points the editor
-  at once, as before, and leaves the login to whoever uses it first; no
-  command that ends when it has printed renews anything. After a limit, ccx
-  waits at most five seconds for the renewal, and less when the check that
-  found the limit was slow; a slower renewal finishes by itself, and the
-  session moves where it can without it.
+  from a session, and a switch onto it restarts as before, saying so. The
+  editor (`ccx editor on`) is pointed at the new account at once, as before,
+  and its login may now be renewed by a session moving onto it: Claude, the
+  editor's included, renews a login under the same lock ccx takes, in that
+  profile's folder, reads it again under the lock, and sends nothing when it
+  has changed (read from Claude Code 2.1.294 to 2.1.299). A profile that
+  shares its login with the one the editor is on has a lock of its own, so
+  it is still not renewed while the editor may be using it. No command that
+  ends when it has printed renews anything. After a limit, ccx waits at most
+  five seconds for the renewal, and less when the check that found the limit
+  was slow, trying again every 0.2 seconds while something else is renewing
+  that login; a slower renewal finishes by itself, and the session moves
+  where it can without it.
 - **A login is never renewed twice at once.** A refresh token works once, so
   a second renewal of the same login is refused, and reads as a login that
   needs signing in again. Within one process, a renewal of a login already
@@ -66,6 +69,10 @@ semantic versioning.
   error when it was malformed, which ended a session at its start, or when
   its account ran out. That file only says which account to prefer, so the
   choice now goes on as if it named none.
+- **A session told to stay put no longer moves anyway.** `ccx use B` asks a
+  session to move; `ccx use A` before it has moved said nothing to a session
+  already on A, so the first request still moved it to B. It is now taken
+  back.
 
 ## [2.6.1]
 

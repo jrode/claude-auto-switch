@@ -201,9 +201,12 @@ describe('refreshUsage', () => {
       );
     }
 
-    it('is NOT renewed while it could still be in use', async () => {
-      // The editor reads the login directly, so ccx cannot see its session. This
-      // is the same failure as the terminal case: renewing signs the editor out.
+    it('IS renewed while the editor may be using it, since Claude renews it under the same lock', async () => {
+      // The editor's Claude reads this profile's login through the pointer and
+      // renews it under <config dir>/.oauth_refresh.lock, the lock ccx takes in
+      // this same folder, reading it again there and sending nothing when it
+      // changed (Claude Code 2.1.294 to 2.1.299). So a renewal by ccx is one
+      // the editor picks up rather than one that signs it out.
       const { c, accounts } = setup(['ide', 'other']);
       const home = c.env.CLAUDE_AUTO_SWITCH_HOME as string;
       expiredLogin(accounts[0]!.dir, 'ide', 1);
@@ -219,9 +222,9 @@ describe('refreshUsage', () => {
         },
       });
 
-      expect(renewed.some((d) => d.includes('ide'))).toBe(false);
-      expect(renewed.some((d) => d.includes('other'))).toBe(true); // not pointed at
-      expect(readCredentialEvents(10, c).some((e) => e.detail?.includes('editor'))).toBe(true);
+      expect(renewed.some((d) => d.includes('ide'))).toBe(true);
+      expect(renewed.some((d) => d.includes('other'))).toBe(true);
+      expect(readCredentialEvents(10, c).some((e) => e.detail?.includes('editor'))).toBe(false);
     });
 
     it('IS renewed once its login has been dead too long for anything to hold it', async () => {
@@ -526,11 +529,11 @@ describe('a shared login where only the OTHER profile is busy', () => {
     expect(renewed).toEqual([]);
   });
 
-  it('does not renew when the EDITOR is pointed at the profile that shares this login', async () => {
-    // The editor reads a login directly, so ccx cannot see its session. Renewing
-    // a sibling rotates the token the editor is using, and then carries it into
-    // the editor's own file mid-session. Before shared logins could be renewed
-    // at all, any sibling caused a refusal and this could not happen.
+  it('does not renew a profile that shares its login with the one the EDITOR is on', async () => {
+    // Renewing a sibling rotates the token the editor is using, under the
+    // sibling's own lock, which the editor's Claude does not take, and then
+    // carries it into the editor's own file mid-session. The profile the
+    // editor is on is renewed under the lock the editor's Claude takes too.
     const { c, accounts } = setup(['other', 'editor-one']);
     shareLogin([accounts[0]!.dir, accounts[1]!.dir], 'refresh-shared');
     const home = c.env.CLAUDE_AUTO_SWITCH_HOME as string;
@@ -551,7 +554,7 @@ describe('a shared login where only the OTHER profile is busy', () => {
 
     // Processing the NON-editor profile first is the case that used to slip
     // through: it is not the editor account itself, so nothing stopped it.
-    expect(renewed).toEqual([]);
+    expect(renewed).toEqual([accounts[1]!.dir]);
   });
 });
 

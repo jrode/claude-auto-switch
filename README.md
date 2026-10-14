@@ -98,8 +98,10 @@ then types a short carry-on prompt into it once Claude is back at its prompt
 with nothing typed in the input box (set the prompt with `ccx resume-prompt`, or
 `resume` in the config). A subagent's refused turn starts the same move, before
 the main thread meets the limit. When the next account's login is due for
-renewal, ccx renews it first and then moves in place, unless another session or
-your editor may be using that login, since renewing it would sign them out.
+renewal, ccx renews it first and then moves in place, unless another session may
+be using that login, since renewing it would sign that session out. Your editor
+being on it does not stop this: Claude renews a login under the same lock ccx
+takes, and reads it again under it.
 When every account looks out of room, ccx moves the session in place to the
 account a relaunch would have started it on anyway, and says so, because that
 judgement is cached and can be wrong. It never guesses its way onto an account

@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { addCommand } from '../../src/commands/add.js';
@@ -12,6 +12,7 @@ import { loadConfig } from '../../src/config/config.js';
 import { liveLeases } from '../../src/session/lease.js';
 import { saveToken } from '../../src/daemon/token-store.js';
 import { IN_PLACE_PROMPT } from '../../src/session/resume-prompt.js';
+import { CREDENTIALS_LOCK_DIR } from '../../src/claude/locks.js';
 import type { CliContext } from '../../src/context.js';
 import {
   FAKE_ENV,
@@ -620,6 +621,40 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
         ]);
         expect(renewals()).toBe(1);
         expect(eventsIn(home).filter((e) => e.kind === 'cap-relief')).toHaveLength(1);
+      },
+    );
+
+    it(
+      'waits briefly for a login another process is renewing, rather than relaunch',
+      { timeout: 60_000 },
+      async () => {
+        // A runs out while another process holds B's lock, as a second session
+        // on A renewing B does, and lets it go within a second.
+        const { home, runsLog, context } = await twoAccounts('cas-limit-lock-busy-');
+        const dirB = path.join(home, 'profiles', 'B');
+        dueLogin(dirB, 'B');
+        freshUsage(home, ['A', 'B']);
+        const lock = path.join(dirB, CREDENTIALS_LOCK_DIR);
+        mkdirSync(lock);
+        const renewals = renewingTokenEndpoint();
+        context.config.resume.auto = false;
+        context.verifyCap = () => {
+          setTimeout(() => rmSync(lock, { recursive: true, force: true }), 600);
+          return Promise.resolve<Verdict>('limited');
+        };
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '6000',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1500',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        const log = readLog(runsLog);
+        expect(launches(log)).toHaveLength(1);
+        expect(log.filter((e) => e.type === 'reread').pop()?.marker).toBe('B');
+        expect(renewals()).toBe(1);
       },
     );
 

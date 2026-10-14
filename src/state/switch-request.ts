@@ -79,6 +79,9 @@ export function requestMoves<T extends { pid: number; account: string }>(
 ): T[] {
   const moving = sessions.filter((s) => s.account !== account);
   for (const s of moving) writeSwitchRequest(account, at, mode, c, s.pid);
+  // One already there stays, so a move it was asked for earlier and has not
+  // made yet is taken back, or it would still be made.
+  for (const s of sessions) if (s.account === account) clearSwitchRequest(c, s.pid);
   return moving;
 }
 
@@ -131,24 +134,6 @@ export function sweepDeadSwitchRequests(c: PathCtx, isAlive: (pid: number) => bo
     }
   }
   return removed;
-}
-
-/**
- * Whether a running session has a request waiting to move onto `account`,
- * its own or the one every session reads.
- */
-export function sessionAskedToMoveTo(account: string, c: PathCtx, isAlive: (pid: number) => boolean): boolean {
-  if (readSwitchRequest(c)?.account === account) return true;
-  let names: string[];
-  try {
-    names = readdirSync(path.join(configHome(c), PER_SESSION_DIR));
-  } catch {
-    return false;
-  }
-  return names.some((name) => {
-    const pid = /^(\d+)\.json$/.exec(name)?.[1];
-    return pid !== undefined && isAlive(Number(pid)) && readSwitchRequest(c, Number(pid))?.account === account;
-  });
 }
 
 export interface SwitchDecision {

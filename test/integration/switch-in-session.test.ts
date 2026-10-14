@@ -620,8 +620,6 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a runnin
       editorOnA?: boolean;
       /** Asked as `ccx use B` does, rather than by a request written for this session. */
       byCcxUse?: boolean;
-      /** With `--all`, so the session is asked though another one is running. */
-      useAll?: boolean;
       /** Run once the switch has been asked for. */
       afterAsking?: (home: string, context: CliContext) => Promise<void>;
       /** How long a renewal that did not happen waits before it is tried again. */
@@ -669,66 +667,55 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a runnin
 
     const running = runCommand(context, []);
     await firstLaunch(runsLog);
-    if (options.byCcxUse) expect(useCommand(context, 'B', options.useAll ? { all: true } : {})).toBe(0);
+    if (options.byCcxUse) expect(useCommand(context, 'B')).toBe(0);
     else writeSwitchRequest('B', Date.now(), 'seamless', context.ctx, process.pid);
     await options.afterAsking?.(home, context);
     expect(await running).toBe(0);
-    // The editor is pointed one step after whatever asked for it (see
-    // syncEditorPointerIfEnabled), which the process waits for before it exits.
-    await new Promise((resolve) => setImmediate(resolve));
     return { runs: readRuns(runsLog), home, renewals: renewals(), context };
   }
 
-  it('renews the login before the editor is pointed at it, so `ccx use` still moves the session in place', async () => {
-    // `ccx use B` points the editor at B too. Pointed there first, the editor
-    // may be using B's login, so the session left it alone and restarted.
+  it('points the editor at once on `ccx use`, and the session still renews the login in place', async () => {
+    // `ccx use B` points the editor at B. Claude, the editor's included, renews
+    // a login under the lock ccx takes (<config dir>/.oauth_refresh.lock, in
+    // B's folder through the pointer) and reads it again there, so the session
+    // may renew B with the editor on it, and need not restart to have it renewed.
     const { runs, renewals, context } = await switchToDueLogin({
       editorOnA: true,
       byCcxUse: true,
       afterAsking: async (_home, ctx) => {
-        // Once the session is on B, and long before it ends.
-        await waitFor(
-          'the session to move to B',
-          () => liveLeases(ctx.ctx).map((l) => l.account),
-          (names) => names.join() === 'B',
-        );
-        await waitFor(
-          'the editor to follow',
-          () => editorPointerAccount(listAccounts(ctx.ctx), ctx.ctx),
-          (on) => on === 'B',
-          2_000,
-        );
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(editorPointerAccount(listAccounts(ctx.ctx), ctx.ctx)).toBe('B');
       },
     });
     expect(runs.filter((r) => r.type === 'launch')).toHaveLength(1);
     expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('B');
     expect(renewals).toBe(1);
-    // And the editor follows, once the login is renewed.
     expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('B');
   });
 
-  it('points the editor at the account all the same when the session never moves there', async () => {
-    // `ccx use B` left the editor for this session to point once it had renewed
-    // B's login, but another session is using it, so this one waits for a
-    // restart that never comes before it ends. The editor must not stay behind.
-    const { runs, renewals, context } = await switchToDueLogin({
-      editorOnA: true,
-      byCcxUse: true,
-      useAll: true,
-      bInUseElsewhere: true,
-      afterAsking: async (home, ctx) => {
-        await waitFor(
-          'the renewal to be refused',
-          () => (existsSync(path.join(home, 'events.jsonl')) ? readFileSync(path.join(home, 'events.jsonl'), 'utf8') : ''),
-          (events) => events.includes('another session is using it'),
-        );
-        // Left where it was while this session was going to renew the login.
-        expect(editorPointerAccount(listAccounts(ctx.ctx), ctx.ctx)).toBe('A');
-      },
-    });
-    expect(renewals).toBe(0);
-    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('A');
-    expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('B');
+  it('moves a session asked by name though the file naming the active account cannot be read', async () => {
+    // `ccx use --here`, `--session` and `/ccx` move one session and leave the
+    // active account and the editor alone. With the editor on, the move went
+    // on to read active.json, which threw inside the poll and ended ccx after
+    // the login had been swapped.
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-targeted-unreadable-'));
+    const runsLog = path.join(home, 'runs.jsonl');
+    process.env.FAKE_CLAUDE_IDLE_MS = '3000';
+    process.env.FAKE_CLAUDE_RUNS_LOG = runsLog;
+    const context = makeContext(home);
+    await loginAccount(context, home, 'A');
+    await loginAccount(context, home, 'B');
+    setActive('A', context.ctx);
+    setTarget(editorLinkPath(context.ctx), path.join(home, 'profiles', 'A'));
+
+    const running = runCommand(context, []);
+    await firstLaunch(runsLog);
+    writeFileSync(path.join(home, 'active.json'), '{not json', 'utf8');
+    writeSwitchRequest('B', Date.now(), 'seamless', context.ctx, process.pid);
+    expect(await running).toBe(0);
+    const runs = readRuns(runsLog);
+    expect(runs.filter((r) => r.type === 'launch')).toHaveLength(1);
+    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('B');
   });
 
   it("keeps Claude's terminal flowing while another process holds the login's lock", async () => {

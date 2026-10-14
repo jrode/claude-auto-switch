@@ -98,6 +98,15 @@ describe('requestMoves', () => {
     expect(readSwitchRequest(c, 12)).toBeNull();
     expect(readSwitchRequest(c)).toBeNull();
   });
+
+  it('takes back a move still waiting for a session that is already where it is now asked to be', () => {
+    // `ccx use b` asks the session on a to move; before it has, `ccx use a`
+    // says to stay. Left in place, the first request would still move it to b.
+    const c = ctx();
+    requestMoves('b', [{ pid: 11, account: 'a' }], 'seamless', c, 5);
+    requestMoves('a', [{ pid: 11, account: 'a' }], 'seamless', c, 6);
+    expect(readSwitchRequest(c, 11)).toBeNull();
+  });
 });
 
 describe('requests left for sessions that are gone', () => {

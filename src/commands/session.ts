@@ -158,6 +158,8 @@ const RELIEF_RENEWAL_WAIT_MS = 5_000;
  * exited, past which the limit is dropped and the session ends.
  */
 const CHECK_BUDGET_MS = 10_000;
+/** How soon a renewal that found its login being renewed elsewhere tries again, after a limit. */
+const BUSY_RETRY_MS = 200;
 
 /** What became of renewing an account's login so a session could be moved onto it in place. */
 type MoveRenewal =
@@ -1188,8 +1190,9 @@ export async function runInteractiveHotSwap(
   /**
    * Renew `account`'s login so this session can be moved onto it in place, by
    * the rule for renewing a login no session here is on (renewIdleLogin):
-   * never one another session or the editor may be using, because renewing
-   * replaces it and whatever is using it is signed out.
+   * never one another session may be using, nor one that shares its token
+   * with the profile the editor is on, because renewing replaces it and
+   * whatever is using it is signed out.
    */
   const renewBeforeMove = async (account: Account): Promise<MoveRenewal> => {
     const { refusal, renewal, lease } = await renewIdleLogin(account, accounts, context.ctx, { renew: renewLogin });
@@ -1202,12 +1205,28 @@ export async function runInteractiveHotSwap(
     };
   };
 
+  /**
+   * `renewBeforeMove`, tried again every BUSY_RETRY_MS while something else is
+   * renewing the login right now, until `deadline`: a second session that met
+   * the same limit is often renewing it, and is done within a second. Each try
+   * only tries the lock, so nothing here stops the terminal.
+   */
+  const renewWhileBusy = async (account: Account, deadline: number): Promise<MoveRenewal> => {
+    for (;;) {
+      const result = await renewBeforeMove(account).catch(
+        (error: unknown): MoveRenewal => ({ ok: false, why: 'failed', detail: thrownReason(error) }),
+      );
+      if (result.ok || result.why !== 'busy' || Date.now() + BUSY_RETRY_MS >= deadline) return result;
+      await new Promise((resolve) => setTimeout(resolve, BUSY_RETRY_MS));
+    }
+  };
+
   /** Why a renewal for a move did not happen, as the end of a sentence. */
   const renewalWithheld = (account: Account, result: Exclude<MoveRenewal, { ok: true }>): string =>
     result.why === 'in-use'
       ? 'another session is using it, so ccx does not renew it from here'
       : result.why === 'editor'
-        ? 'your editor may be using it, so ccx does not renew it from here'
+        ? 'it shares its login with the profile your editor is on, so ccx does not renew it from here'
         : result.why === 'needs-login'
           ? `it needs signing in again (ccx login ${account.name})`
           : result.why === 'busy'
@@ -1413,18 +1432,7 @@ export async function runInteractiveHotSwap(
     if (!plan || inPlaceReadiness(plan.account, launchedWithToken) !== 'renew') return;
     const to = plan.account;
     const waitMs = Math.min(RELIEF_RENEWAL_WAIT_MS, leftMs);
-    const result =
-      waitMs > 0
-        ? await within(
-            () =>
-              renewBeforeMove(to).catch((error: unknown): MoveRenewal => ({
-                ok: false,
-                why: 'failed',
-                detail: thrownReason(error),
-              })),
-            waitMs,
-          )
-        : null;
+    const result = waitMs > 0 ? await within(() => renewWhileBusy(to, Date.now() + waitMs), waitMs) : null;
     logEvent(
       result?.ok
         ? `renewed the "${to.name}" login first, to move this session onto it in place`
@@ -1938,14 +1946,12 @@ export async function runInteractiveHotSwap(
       if (interruption?.exitCode != null) return { kind: 'ok', exitCode: interruption.exitCode };
       activate(account);
       // Track the account we are actually on so the editor pointer follows it.
-      // Not for a session started by a TARGETED restart switch: that move was
-      // aimed at this one session and leaves the global active account where it
-      // was. Consumed once, so the next ordinary start updates it again. The
-      // editor follows the active account either way, which is this one when
-      // the command that asked for the move made it active and left the editor
-      // for this session to point, its login being due (syncEditorPointerIfEnabled).
-      if (!worker) {
-        if (!nextStartTargeted) setActive(account.name, context.ctx);
+      // Skipped for a session started by a TARGETED restart switch: that move was
+      // aimed at this one session and must leave the global active account and the
+      // editor pointer where they were. Consumed once, so the next ordinary start
+      // updates them again.
+      if (!nextStartTargeted && !worker) {
+        setActive(account.name, context.ctx);
         syncEditorPointerIfEnabled(context);
       }
       nextStartTargeted = false;
@@ -2070,14 +2076,12 @@ export async function runInteractiveHotSwap(
         switchRenewal = null;
         activate(target);
         // A TARGETED switch (`ccx use --here/--session`) moves only this session:
-        // it must not touch the global active account, which belongs to the
-        // default session. A broadcast switch is the old behaviour and still sets
-        // it. `activate` above swaps the login under THIS session either way. The
-        // editor follows the active account, and is pointed now in case the
-        // command that asked for this move made it active and left the editor for
-        // this session to point once the login was renewed (syncEditorPointerIfEnabled).
-        if (!worker) {
-          if (!targeted) setActive(target.name, context.ctx);
+        // it must not touch the global active account or the editor pointer, which
+        // belong to the default session. A broadcast switch is the old behaviour
+        // and still sets both. `activate` above swaps the login under THIS session
+        // either way; only the global surfaces are gated.
+        if (!targeted && !worker) {
+          setActive(target.name, context.ctx);
           syncEditorPointerIfEnabled(context);
         }
         notice(`switching to "${target.name}" (no restart; takes effect within ~30s)`);
@@ -2535,15 +2539,6 @@ export async function runInteractiveHotSwap(
   // run and be read by a later session that reuses this pid. Startup clears it
   // too; this just keeps the folder from collecting files between runs.
   clearSwitchRequest(context.ctx, process.pid);
-  // A move left for this session that it never made must not leave the editor
-  // where it was: with the request gone, it follows the active account again.
-  if (!worker) {
-    try {
-      syncEditorPointerIfEnabled(context);
-    } catch {
-      /* the next switch points it */
-    }
-  }
   if (worker) releaseClaim(context.ctx);
   terminalInput?.close();
   // Claude has stopped: what it changed in this session's settings and state

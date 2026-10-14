@@ -58,9 +58,9 @@ export type UsageSnapshot = z.infer<typeof SnapshotSchema>;
 const FILENAME = 'usage-snapshot.json';
 export const USAGE_TTL_MS = 5 * 60_000;
 /**
- * How long a login must have been expired before ccx will renew one the editor is
- * pointed at. A running Claude refreshes within minutes, so half an hour of
- * nothing means nothing is holding it.
+ * How long a login must have been expired before ccx will renew one that shares
+ * its token with the profile the editor is pointed at. A running Claude
+ * refreshes within minutes, so half an hour of nothing means nothing is holding it.
  */
 const EDITOR_IDLE_GRACE_MS = 30 * 60_000;
 
@@ -219,17 +219,23 @@ export async function renewIdleLogin(
   // expired, their usage became unreadable, and the rotation policy went
   // blind on exactly the accounts it was meant to choose between. The
   // renewal is carried across to them instead.
-  // The editor has to be protected through the WHOLE cohort, not just when
-  // it points at this account. Profiles sharing a login share its fate, so
-  // renewing a sibling rotates the token the editor is using and then
-  // carries it into the editor's own file mid-session. Before this change
-  // any sibling caused a refusal, so that could not happen; now it can, and
-  // the grace period is measured against the EDITOR's copy, which is the one
-  // that says whether anything is still using it.
+  // The profile the editor is pointed at may be renewed here. The editor's
+  // Claude reads its login through the pointer from that profile's own folder,
+  // and renews it under <config dir>/.oauth_refresh.lock in that same folder,
+  // the lock this renewal takes, reading it again under the lock and sending
+  // nothing when it changed meanwhile (read from Claude Code 2.1.294 to
+  // 2.1.299). So it takes up a renewal made here instead of being signed out by
+  // it. A profile that SHARES that login is another matter: it has a lock of
+  // its own, so renewing it spends the token the editor holds with nothing to
+  // keep the two apart, and then carries the result into the editor's folder
+  // mid-session. That is still refused while the editor may be using it, the
+  // grace period measured against the EDITOR's copy, which is the one that
+  // says whether anything still is.
   const editor = accounts.find((a) => a.name === editorAccount);
   const editorMayBeUsingIt =
     editor !== undefined &&
-    [account.name, ...siblings].includes(editor.name) &&
+    editor.name !== account.name &&
+    siblings.includes(editor.name) &&
     !expiredLongerThan(editor.dir, EDITOR_IDLE_GRACE_MS);
   // Read FRESH, at the moment of the decision, rather than from the map
   // built before the loop. This loop makes a network call per account and
@@ -256,7 +262,7 @@ export async function renewIdleLogin(
     inSessionNow.length > 0
       ? `not renewed: a session is using ${inSessionNow.join(', ')}; renewing would sign it out`
       : editorMayBeUsingIt
-        ? 'not renewed: your editor is pointed at this account and may be using it'
+        ? 'not renewed: your editor is pointed at a profile that shares this login and may be using it'
         : null;
   const mayRenew = refusal === null;
   if (refusal && renewalIsDue(account.dir)) {

@@ -1,12 +1,9 @@
 import path from 'node:path';
 import { getActive } from '../state/active.js';
 import { getAccount, listAccounts } from '../accounts/registry.js';
-import { sessionAskedToMoveTo } from '../state/switch-request.js';
-import { processIsAlive } from '../session/lease.js';
 import { setTarget, removeTarget, isLink, readTarget } from '../daemon/junction.js';
 import { ensureEditorReady } from '../commands/editor-ready.js';
 import { hasWorkingLogin } from '../accounts/account-login.js';
-import { renewalIsDue } from '../usage/oauth-refresh.js';
 import { configHome, type PathCtx } from '../config/paths.js';
 import type { CliContext } from '../context.js';
 
@@ -73,6 +70,10 @@ export function syncEditorJunctionToActive(context: CliContext): boolean {
   const account = getAccount(active, context.ctx);
   if (!account) return false;
   ensureEditorReady(account.dir, context.ctx);
+  // Already there: left alone. Rewriting removes the link and makes it again,
+  // and two sessions moving at once would meet each other's half-made one.
+  const now = readTarget(editorJunctionPath(context));
+  if (now !== null && path.resolve(now) === path.resolve(account.dir)) return true;
   setTarget(editorJunctionPath(context), account.dir, { platform: context.ctx.platform });
   return true;
 }
@@ -80,40 +81,20 @@ export function syncEditorJunctionToActive(context: CliContext): boolean {
 /**
  * Repoint the editor pointer at the active account, but ONLY if the editor is
  * actually set up (the pointer already exists). Safe to call from any switch
- * site; it is a no-op when the editor integration is off. Never renews a login.
+ * site; it is a no-op when the editor integration is off.
  *
- * Except while a running session is about to move onto that account and its
- * login is due for renewal: the session renews it in place and points the
- * editor there once it has moved (see session.ts). Pointed there first, the
- * editor may be using the login, so the session could not renew it and would
- * restart to have it renewed. Whether a session is asked is decided once the
- * calling command has written its requests, which every caller does straight
- * after this, in the same step; when none is, the editor is pointed at once,
- * and the login is left to whoever uses it first.
+ * At once, whatever the account's login: one due for renewal may still be
+ * renewed by a session moving onto it, since the editor's Claude renews it
+ * under the same lock and reads it again there (see renewIdleLogin).
  */
 export function syncEditorPointerIfEnabled(context: CliContext): void {
-  if (!isLink(editorJunctionPath(context))) return;
-  const active = getActive(context.ctx);
-  const account = active ? getAccount(active, context.ctx) : undefined;
-  if (!account || !renewalIsDue(account.dir)) {
-    syncEditorJunctionToActive(context);
-    return;
+  // Never throws: it is called from a running session's poll, where nothing
+  // would catch it, and the editor following is not worth ending a session.
+  try {
+    if (isLink(editorJunctionPath(context))) syncEditorJunctionToActive(context);
+  } catch {
+    /* the pointer stays as it was until the next switch points it */
   }
-  setImmediate(() => {
-    try {
-      if (!sessionAskedToMoveTo(account.name, context.ctx, processIsAlive)) pointEditorAtActive(context);
-    } catch {
-      /* the editor stays where it is until the next switch points it */
-    }
-  });
-}
-
-/**
- * Point the editor at the active account now, when it follows one, whatever
- * that account's login. For a session that will not renew it after all.
- */
-export function pointEditorAtActive(context: CliContext): void {
-  if (isLink(editorJunctionPath(context))) syncEditorJunctionToActive(context);
 }
 
 /** Remove the editor pointer (used by `ccx editor off`). */
