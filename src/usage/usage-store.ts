@@ -11,7 +11,7 @@ import { liveLeases, type LeaseOptions, type SessionLease } from '../session/lea
 import { probeUsage, type LimitProbeResult } from './limit-probe.js';
 import { learnWindowCost } from './runway.js';
 import { refreshCredentialIfExpired, renewalIsDue, expiredLongerThan, type RefreshOutcome } from './oauth-refresh.js';
-import { editorPointerAccount } from '../editor/pointer.js';
+import { editorPointerAccount } from '../editor/junction.js';
 
 /**
  * Cached per-account subscription usage (5h/7d utilization + resets), fetched

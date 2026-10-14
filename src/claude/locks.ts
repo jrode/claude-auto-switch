@@ -46,6 +46,11 @@ export interface LockOptions {
 export interface LockHandle {
   /** True when we actually hold the lock (false = proceeding without it). */
   held: boolean;
+  /**
+   * Set when the lock folder could not be created at all (its error code, as
+   * EACCES), so nobody can hold it: not the same as somebody holding it now.
+   */
+  unusable?: string;
   release(): void;
 }
 
@@ -76,13 +81,18 @@ export function acquireLockDir(lockDir: string, options: LockOptions = {}): Lock
   const deadline = now() + waitMs;
 
   let held = false;
+  let unusable: string | undefined;
   for (;;) {
     try {
       mkdirSync(lockDir, { recursive: false });
       held = true;
       break;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') break; // unusable path: proceed
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') {
+        unusable = code ?? 'unknown error';
+        break; // unusable path: proceed
+      }
       const age = mtimeMs(lockDir);
       if (age !== null && now() - age > staleMs) {
         // Abandoned by a dead process: take it over rather than waiting forever.
@@ -98,7 +108,7 @@ export function acquireLockDir(lockDir: string, options: LockOptions = {}): Lock
     }
   }
 
-  if (!held) return { held: false, release: () => {} };
+  if (!held) return { held: false, ...(unusable ? { unusable } : {}), release: () => {} };
 
   // Keep the lock looking alive while we hold it. Unref'd so this timer can
   // never keep the CLI process running (a hang we have been bitten by before).

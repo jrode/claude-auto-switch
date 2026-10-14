@@ -104,6 +104,13 @@ export interface HotSwapDeps {
    */
   knownCappedAccounts?: () => string[];
   /**
+   * Handed, once, a way to ask which accounts the loop sets aside right now:
+   * those that ran out in this run, were found signed out, or are held off for
+   * a while. Asked at the moment of a decision, so a hold that has lifted no
+   * longer counts.
+   */
+  setAsideNow?: (read: () => Set<string>) => void;
+  /**
    * The last word, said when there is nothing left to run on and ccx is about
    * to exit.
    *
@@ -169,6 +176,7 @@ export async function runHotSwapSession(deps: HotSwapDeps): Promise<number> {
    * there was no second attempt and the run ended by refusing to start at all.
    */
   const lastResortsTried = new Set<string>();
+  deps.setAsideNow?.(() => new Set([...capped, ...needsLogin, ...activeHolds(Date.now())]));
 
   for (;;) {
     const account: HotSwapAccount | null =

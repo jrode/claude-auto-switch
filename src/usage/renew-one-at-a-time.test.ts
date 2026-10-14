@@ -2,80 +2,62 @@ import { describe, it, expect } from 'vitest';
 import { renewOneAtATime } from './renew-one-at-a-time.js';
 import type { RefreshOutcome } from './oauth-refresh.js';
 
-/** A renewal that finishes when told to, counting how often it was started per folder. */
-function controlledRenewal(): {
-  renew: (dir: string, options: unknown) => Promise<RefreshOutcome>;
+/** Renewals that finish when told to, counting how often each was started. */
+function controlledRenewals(): {
+  renewal: (name: string) => () => Promise<RefreshOutcome>;
   started: Map<string, number>;
-  finish: (dir: string, outcome: RefreshOutcome) => void;
-  fail: (dir: string, error: Error) => void;
+  finish: (name: string, outcome: RefreshOutcome) => void;
+  fail: (name: string, error: Error) => void;
 } {
   const started = new Map<string, number>();
   const pending = new Map<string, { resolve: (o: RefreshOutcome) => void; reject: (e: Error) => void }>();
   return {
     started,
-    renew: (dir) => {
-      started.set(dir, (started.get(dir) ?? 0) + 1);
-      return new Promise((resolve, reject) => pending.set(dir, { resolve, reject }));
+    renewal: (name) => () => {
+      started.set(name, (started.get(name) ?? 0) + 1);
+      return new Promise((resolve, reject) => pending.set(name, { resolve, reject }));
     },
-    finish: (dir, outcome) => pending.get(dir)?.resolve(outcome),
-    fail: (dir, error) => pending.get(dir)?.reject(error),
+    finish: (name, outcome) => pending.get(name)?.resolve(outcome),
+    fail: (name, error) => pending.get(name)?.reject(error),
   };
 }
 
-/** Each folder holds a login of its own, named after it. */
-const ownLogin = (dir: string): string => `login of ${dir}`;
-
 describe('renewing a login one at a time', () => {
   it('hands a second caller the renewal already under way, not a second one', async () => {
-    const r = controlledRenewal();
-    const renew = renewOneAtATime(r.renew, ownLogin);
-    const first = renew('/p/B', {});
-    const second = renew('/p/B', {});
-    r.finish('/p/B', { status: 'refreshed' });
+    const r = controlledRenewals();
+    const renew = renewOneAtATime();
+    const first = renew('login B', r.renewal('first'));
+    const second = renew('login B', r.renewal('second'));
+    r.finish('first', { status: 'refreshed' });
     expect(await first).toEqual({ status: 'refreshed' });
     // Marked, so the second caller does not report the same renewal again.
     expect(await second).toEqual({ status: 'refreshed', alreadyKnown: true });
-    expect(r.started.get('/p/B')).toBe(1);
-  });
-
-  it('renews one login once when two profile folders hold it', async () => {
-    const r = controlledRenewal();
-    const renew = renewOneAtATime(r.renew, () => 'the same login');
-    const first = renew('/p/B', {});
-    const second = renew('/p/B-copy', {});
-    r.finish('/p/B', { status: 'refreshed' });
-    await Promise.all([first, second]);
-    expect([...r.started]).toEqual([['/p/B', 1]]);
+    expect([...r.started]).toEqual([['first', 1]]);
   });
 
   it('renews different logins side by side', () => {
-    const r = controlledRenewal();
-    const renew = renewOneAtATime(r.renew, ownLogin);
-    void renew('/p/B', {});
-    void renew('/p/C', {});
+    const r = controlledRenewals();
+    const renew = renewOneAtATime();
+    void renew('login B', r.renewal('B'));
+    void renew('login C', r.renewal('C'));
     expect([...r.started]).toEqual([
-      ['/p/B', 1],
-      ['/p/C', 1],
+      ['B', 1],
+      ['C', 1],
     ]);
   });
 
-  it('keys a folder with no readable login by the folder', () => {
-    const r = controlledRenewal();
-    const renew = renewOneAtATime(r.renew, () => null);
-    void renew('/p/B', {});
-    void renew('/p/C', {});
-    expect(r.started.size).toBe(2);
-  });
-
   it('renews again once the last renewal is over, whether it worked or not', async () => {
-    const r = controlledRenewal();
-    const renew = renewOneAtATime(r.renew, ownLogin);
-    const first = renew('/p/B', {});
-    r.fail('/p/B', new Error('offline'));
+    const r = controlledRenewals();
+    const renew = renewOneAtATime();
+    const first = renew('login B', r.renewal('first'));
+    r.fail('first', new Error('offline'));
     await expect(first).rejects.toThrow('offline');
-    const again = renew('/p/B', {});
-    r.finish('/p/B', { status: 'not-needed' });
+    const again = renew('login B', r.renewal('again'));
+    r.finish('again', { status: 'not-needed' });
     expect(await again).toEqual({ status: 'not-needed' });
-    expect(r.started.get('/p/B')).toBe(2);
+    expect([...r.started]).toEqual([
+      ['first', 1],
+      ['again', 1],
+    ]);
   });
 });

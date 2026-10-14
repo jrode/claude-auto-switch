@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -360,6 +360,25 @@ describe('renewing a login something else may be renewing', () => {
     ]);
     expect(endpoint.calls()).toBe(1);
   });
+
+  // Folder permissions are what make the lock impossible here; Windows has none of these.
+  it.skipIf(process.platform === 'win32')(
+    'reports a lock it cannot create as a failure, not as something else renewing',
+    async () => {
+      // A profile folder it cannot write into, as one `sudo ccx` made leaves.
+      const dir = account({ accessToken: 'old', refreshToken: 'r-locked-out', expiresAt: now() - HOUR });
+      chmodSync(dir, 0o500);
+      try {
+        const endpoint = counting();
+        const outcome = await refreshCredentialIfExpired(dir, { now, fetchImpl: endpoint.fetchImpl, lockWaitMs: 0 });
+        expect(endpoint.calls()).toBe(0);
+        expect(outcome.status).toBe('unavailable');
+        expect(outcome.detail).toContain('lock');
+      } finally {
+        chmodSync(dir, 0o700);
+      }
+    },
+  );
 
   it('gives up on a token request that does not answer, and lets the lock go', async () => {
     const dir = account({ accessToken: 'old', refreshToken: 'r-slow', expiresAt: now() - HOUR });

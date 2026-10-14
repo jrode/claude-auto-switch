@@ -11,6 +11,18 @@ function deps(over: Partial<Parameters<typeof ensureLoginUsable>[0]> = {}) {
 }
 
 describe('ensureLoginUsable', () => {
+  it('does not count a renewal another caller made as one of its own', async () => {
+    // Joined while that renewal was under way: it was written down by the
+    // caller that made it, and must not be logged again here.
+    const r = await ensureLoginUsable(
+      deps({
+        renewalDue: () => true,
+        renew: () => Promise.resolve({ status: 'refreshed', alreadyKnown: true }),
+      }),
+    );
+    expect(r.state).toBe('ready');
+  });
+
   it('does nothing when the login is fine', async () => {
     let renewed = false;
     const r = await ensureLoginUsable(

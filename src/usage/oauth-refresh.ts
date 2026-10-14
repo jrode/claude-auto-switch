@@ -2,7 +2,7 @@ import { readCredential } from '../accounts/credential-storage.js';
 import path from 'node:path';
 import { acquireLockDir, CREDENTIALS_LOCK_DIR } from '../claude/locks.js';
 import { writeCredential, copyCredential } from '../accounts/credential-storage.js';
-import { credentialPath, credentialFingerprint, previousCredentialPath, isUsableCredential } from '../accounts/credential-vault.js';
+import { credentialPath, previousCredentialPath, isUsableCredential } from '../accounts/credential-vault.js';
 import { renewOneAtATime } from './renew-one-at-a-time.js';
 import { sha256Fingerprint } from '../util/fingerprint.js';
 import { alreadyRefused, refusalReason, rememberRefused } from './dead-login-memo.js';
@@ -64,7 +64,7 @@ export interface RefreshOptions {
    * unintended, which is why nothing here defaults to the real config home.
    */
   ctx?: PathCtx;
-  /** How long to wait for the login's lock (default two seconds). */
+  /** How long to wait for the login's lock (default two seconds; 0 only tries it). */
   lockWaitMs?: number;
   /** How long the token request may take (default REQUEST_TIMEOUT_MS). */
   requestTimeoutMs?: number;
@@ -125,14 +125,18 @@ export function expiredLongerThan(
  * that renewal's outcome (marked `alreadyKnown`) instead of sending the same
  * refresh token again. Other processes are kept apart by Claude's lock.
  */
-export function refreshCredentialIfExpired(accountDir: string, options: RefreshOptions = {}): Promise<RefreshOutcome> {
-  return renewEachLoginOnce(accountDir, options);
+export async function refreshCredentialIfExpired(
+  accountDir: string,
+  options: RefreshOptions = {},
+): Promise<RefreshOutcome> {
+  const now = options.now ?? (() => Date.now());
+  // Looked at first without the lock, so a login with nothing to do never waits for it.
+  const before = assess(credentialPath(accountDir), now, options.ctx);
+  if (!before.renew) return before.outcome;
+  return oneRenewalPerLogin(sha256Fingerprint(before.refreshToken), () => renewUnderLock(accountDir, options));
 }
 
-const renewEachLoginOnce = renewOneAtATime(
-  (accountDir: string, options: RefreshOptions) => renewIfExpired(accountDir, options),
-  (accountDir) => credentialFingerprint(accountDir),
-);
+const oneRenewalPerLogin = renewOneAtATime();
 
 /** What a stored login says about renewing it: stop with an answer, or renew it. */
 type Assessment =
@@ -189,14 +193,11 @@ function assess(file: string, now: () => number, ctx: PathCtx | undefined): Asse
   return { renew: true, raw, auth: oauth, refreshToken: oauth.refreshToken, identity };
 }
 
-async function renewIfExpired(accountDir: string, options: RefreshOptions): Promise<RefreshOutcome> {
+/** Renew a login found due for renewal: under its lock, having read it again there. */
+async function renewUnderLock(accountDir: string, options: RefreshOptions): Promise<RefreshOutcome> {
   const now = options.now ?? (() => Date.now());
   const file = credentialPath(accountDir);
   const ctx = options.ctx;
-
-  // Looked at first without the lock, so a login with nothing to do never waits for it.
-  const before = assess(file, now, ctx);
-  if (!before.renew) return before.outcome;
 
   // Renewing rotates the token: the one Claude may be holding stops working the
   // moment ours is issued. Claude coordinates its own renewals through this
@@ -206,11 +207,15 @@ async function renewIfExpired(accountDir: string, options: RefreshOptions): Prom
   // holding a token the server has already retired, which is a sign-in prompt
   // out of nowhere.
   //
-  // Never without it: a renewal that cannot get the lock is told something else
-  // is renewing this login right now, and sends nothing.
+  // Never without it: a renewal that cannot get the lock sends nothing. Either
+  // something else is renewing this login right now, or the lock folder cannot
+  // be made at all (a profile folder ccx may not write in), which no wait cures.
   const lock = acquireLockDir(path.join(accountDir, CREDENTIALS_LOCK_DIR), {
     ...(options.lockWaitMs !== undefined ? { waitMs: options.lockWaitMs } : {}),
   });
+  if (lock.unusable) {
+    return { status: 'unavailable', detail: `its lock folder could not be created (${lock.unusable})` };
+  }
   if (!lock.held) return { status: 'busy', detail: 'something else is renewing this login' };
   try {
     // Read again now the lock is held: whoever held it before may have renewed

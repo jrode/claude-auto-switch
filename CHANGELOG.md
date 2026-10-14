@@ -26,18 +26,26 @@ semantic versioning.
   next account's login.** A login that was due for renewal could not go under
   a running Claude, so a switch onto that account (`ccx use`, `/ccx`, an
   early move), or a move to it after a limit, restarted Claude and let the
-  start renew it. ccx now renews it first and then moves in place, as a visit
-  for an Artifact call already did. It still never renews a login another
-  session or your editor may be using, because renewing replaces the login
-  and signs them out; then the switch waits for a restart as before, and
-  `ccx history` says why. A renewal that could not be made, because another
-  session was using the login or the renewal failed, is tried again after 20
-  seconds while the switch waits. With the editor following the active
-  account (`ccx editor on`), a switch renews a due login before it points
-  the editor there: an editor pointed at it first may be using it. After a
-  limit, ccx waits at most five seconds for the renewal, and less when the
-  check that found the limit was slow; a slower renewal finishes by itself,
-  and the session moves where it can without it.
+  start renew it. The session now renews it first and then moves in place, as
+  a visit for an Artifact call already did. It still never renews a login
+  another session or your editor may be using, because renewing replaces the
+  login and signs them out; then the switch waits for a restart as before, and
+  `ccx history` says why. The restart's start still renews it without that
+  check, as it always has (#128). A renewal that could not be made, because
+  another session was using the login or the renewal failed, is tried again
+  after 20 seconds while the switch waits; one that found the login being
+  renewed elsewhere at that moment, after 2 seconds. A login whose lock folder
+  cannot be created (a profile folder ccx may not write in) is not renewed
+  from a session, and a switch onto it restarts as before, saying so. With
+  the editor following the active account (`ccx editor on`), a switch that
+  moves a session onto a login due for renewal leaves the editor where it is
+  until that session has renewed it and moved: an editor pointed there first
+  may be using the login. A command that moves no session points the editor
+  at once, as before, and leaves the login to whoever uses it first; no
+  command that ends when it has printed renews anything. After a limit, ccx
+  waits at most five seconds for the renewal, and less when the check that
+  found the limit was slow; a slower renewal finishes by itself, and the
+  session moves where it can without it.
 - **A login is never renewed twice at once.** A refresh token works once, so
   a second renewal of the same login is refused, and reads as a login that
   needs signing in again. Within one process, a renewal of a login already
@@ -45,9 +53,11 @@ semantic versioning.
   now gets that renewal's result. Between processes, ccx took Claude's lock
   but read the token before taking it, and went ahead without the lock after
   two seconds; it now reads the login again once it holds the lock, and
-  sends nothing when it cannot get it. A token request that gets no answer
-  is given up after 30 seconds rather than holding the lock. Found while
-  adding the renewals above; not seen happen.
+  sends nothing when it cannot get it. A running session only tries the lock
+  and never waits for it, since waiting would stop Claude's output and keys.
+  A token request that gets no answer is given up after 30 seconds rather
+  than holding the lock. Found while adding the renewals above; not seen
+  happen.
 
 ### Fixed
 

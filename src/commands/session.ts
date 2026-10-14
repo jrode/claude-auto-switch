@@ -164,12 +164,15 @@ type MoveRenewal =
   | { ok: true }
   | { ok: false; why: 'in-use' | 'editor' | 'needs-login' | 'busy' | 'failed'; detail: string };
 
-/** `promise`'s value, or null once `ms` have passed first or when it fails. */
-function within<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+/**
+ * What `start` comes to, or null once `ms` have passed first or when it fails.
+ * Timed from before `start` runs, so the part of it that runs at once counts.
+ */
+function within<T>(start: () => Promise<T>, ms: number): Promise<T | null> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), ms);
     timer.unref?.();
-    promise.then(
+    start().then(
       (value) => {
         clearTimeout(timer);
         resolve(value);
@@ -1172,8 +1175,15 @@ export async function runInteractiveHotSwap(
   const limitBeingDecided = (): boolean =>
     capChecks > 0 || (capConfirmedAt !== null && Date.now() - capConfirmedAt < CAP_DECIDING_MS);
 
-  /** Every renewal this session makes, of any login; one at a time per login (see oauth-refresh). */
-  const renewLogin = (dir: string) => refreshCredentialIfExpired(dir, { ctx: context.ctx });
+  /**
+   * A renewal this session makes while Claude runs: a move, a visit for an
+   * Artifact call, the usage refresher. It only tries the login's lock and
+   * never waits for it, because the wait is synchronous and Claude's output and
+   * keys are relayed on this same thread; a login something else is renewing
+   * comes back `busy`, and is tried again later. One at a time per login (see
+   * oauth-refresh).
+   */
+  const renewLogin = (dir: string) => refreshCredentialIfExpired(dir, { ctx: context.ctx, lockWaitMs: 0 });
 
   /**
    * Renew `account`'s login so this session can be moved onto it in place, by
@@ -1406,11 +1416,12 @@ export async function runInteractiveHotSwap(
     const result =
       waitMs > 0
         ? await within(
-            renewBeforeMove(to).catch((error: unknown): MoveRenewal => ({
-              ok: false,
-              why: 'failed',
-              detail: thrownReason(error),
-            })),
+            () =>
+              renewBeforeMove(to).catch((error: unknown): MoveRenewal => ({
+                ok: false,
+                why: 'failed',
+                detail: thrownReason(error),
+              })),
             waitMs,
           )
         : null;
@@ -1544,7 +1555,7 @@ export async function runInteractiveHotSwap(
    * An account with room on the model the session is running comes first. When
    * there is none because every account looks out of room, judged by the pick
    * the relaunch path would make (pickAccount, leaving out what the swap loop
-   * set aside when it last picked), the session goes where that path would
+   * sets aside at that moment), the session goes where that path would
    * start it anyway (startAnyway), moved there in place, and `anyway` says so.
    * Never onto an account this session has itself seen run out while that
    * limit lasts: that is not a guess, and two accounts that are both out would
@@ -1587,6 +1598,7 @@ export async function runInteractiveHotSwap(
       );
     const roomy = withRoomOnRunningModel(healthy, now);
     if (roomy) return { account: roomy, anyway: null };
+    const setAside = setAsideNow();
     if (pickAccount(new Set([capName, ...setAside, ...deadLogins()]), { quiet: true }) !== null) return null;
     const guess = startAnyway(new Set([capName, ...setAside, ...seenOutNow(now)]), canTake);
     const account = guess ? accounts.find((a) => a.name === guess.account.name) : undefined;
@@ -1609,11 +1621,8 @@ export async function runInteractiveHotSwap(
     }
   };
 
-  /**
-   * What the swap loop set aside when it last asked for an account: those that
-   * ran out in this run, were found signed out, or are held off a while.
-   */
-  let setAside = new Set<string>();
+  /** What the swap loop sets aside at this moment (see HotSwapDeps.setAsideNow); none until it says. */
+  let setAsideNow: () => Set<string> = () => new Set();
 
   /** Accounts whose stored login the token endpoint has refused, which no wait repairs. */
   const deadLogins = (): string[] =>
@@ -1818,8 +1827,10 @@ export async function runInteractiveHotSwap(
     // A worker picks and says so in one step, so workers started together see
     // each other's picks and spread out, rather than each reading the leases
     // before any has written one and all picking the same account.
+    setAsideNow: (read) => {
+      setAsideNow = read;
+    },
     nextAccount: (excluding) => {
-      setAside = new Set(excluding);
       // An ended worker picks and claims nothing more: the start that follows
       // ends the run, whatever account it is handed.
       if (interruption?.exitCode != null) return { name: current?.name ?? '', dir: current?.dir ?? '' };
@@ -1862,7 +1873,8 @@ export async function runInteractiveHotSwap(
         ensureLoginUsable({
           hasLogin: () => hasLogin(account.dir),
           renewalDue: () => renewalIsDue(account.dir),
-          renew: () => renewLogin(account.dir),
+          // Before Claude starts, nothing is relayed, so this one may wait for the lock.
+          renew: () => refreshCredentialIfExpired(account.dir, { ctx: context.ctx }),
         });
       let readiness = await checkReadiness();
       if (readiness.state === 'needs-login') {
@@ -1926,12 +1938,14 @@ export async function runInteractiveHotSwap(
       if (interruption?.exitCode != null) return { kind: 'ok', exitCode: interruption.exitCode };
       activate(account);
       // Track the account we are actually on so the editor pointer follows it.
-      // Skipped for a session started by a TARGETED restart switch: that move was
-      // aimed at this one session and must leave the global active account and the
-      // editor pointer where they were. Consumed once, so the next ordinary start
-      // updates them again.
-      if (!nextStartTargeted && !worker) {
-        setActive(account.name, context.ctx);
+      // Not for a session started by a TARGETED restart switch: that move was
+      // aimed at this one session and leaves the global active account where it
+      // was. Consumed once, so the next ordinary start updates it again. The
+      // editor follows the active account either way, which is this one when
+      // the command that asked for the move made it active and left the editor
+      // for this session to point, its login being due (syncEditorPointerIfEnabled).
+      if (!worker) {
+        if (!nextStartTargeted) setActive(account.name, context.ctx);
         syncEditorPointerIfEnabled(context);
       }
       nextStartTargeted = false;
@@ -2056,12 +2070,14 @@ export async function runInteractiveHotSwap(
         switchRenewal = null;
         activate(target);
         // A TARGETED switch (`ccx use --here/--session`) moves only this session:
-        // it must not touch the global active account or the editor pointer, which
-        // belong to the default session. A broadcast switch is the old behaviour
-        // and still sets both. `activate` above swaps the login under THIS session
-        // either way; only the global surfaces are gated.
-        if (!targeted && !worker) {
-          setActive(target.name, context.ctx);
+        // it must not touch the global active account, which belongs to the
+        // default session. A broadcast switch is the old behaviour and still sets
+        // it. `activate` above swaps the login under THIS session either way. The
+        // editor follows the active account, and is pointed now in case the
+        // command that asked for this move made it active and left the editor for
+        // this session to point once the login was renewed (syncEditorPointerIfEnabled).
+        if (!worker) {
+          if (!targeted) setActive(target.name, context.ctx);
           syncEditorPointerIfEnabled(context);
         }
         notice(`switching to "${target.name}" (no restart; takes effect within ~30s)`);
@@ -2519,6 +2535,15 @@ export async function runInteractiveHotSwap(
   // run and be read by a later session that reuses this pid. Startup clears it
   // too; this just keeps the folder from collecting files between runs.
   clearSwitchRequest(context.ctx, process.pid);
+  // A move left for this session that it never made must not leave the editor
+  // where it was: with the request gone, it follows the active account again.
+  if (!worker) {
+    try {
+      syncEditorPointerIfEnabled(context);
+    } catch {
+      /* the next switch points it */
+    }
+  }
   if (worker) releaseClaim(context.ctx);
   terminalInput?.close();
   // Claude has stopped: what it changed in this session's settings and state

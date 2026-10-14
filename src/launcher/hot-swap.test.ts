@@ -685,4 +685,34 @@ describe('an unproven hold, which is a nudge rather than a verdict', () => {
     expect(await runHotSwapSession(deps)).toBe(0);
     expect(seen).toEqual(['a', 'b']); // moved on, did not come straight back
   });
+
+  it('says what it sets aside at the moment it is asked, so a hold that has lifted no longer counts', async () => {
+    const accounts = pool(['a', 'b']);
+    let setAside: (() => Set<string>) | null = null;
+    const seen: Array<string[]> = [];
+    const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+    const deps: HotSwapDeps = {
+      nextAccount: (ex) => accounts.find((a) => !ex.has(a.name)) ?? null,
+      resolveAccount: (name) => accounts.find((a) => a.name === name) ?? null,
+      setAsideNow: (read) => {
+        setAside = read;
+      },
+      runSession: async (account) => {
+        if (account.name === 'a') {
+          // Held off for a moment only: nothing confirmed a limit.
+          return { kind: 'capped', exitCode: 1, unproven: true, resetAt: Date.now() + 100 } as SessionOutcome;
+        }
+        seen.push([...(setAside?.() ?? [])]);
+        await sleep(200);
+        seen.push([...(setAside?.() ?? [])]);
+        return { kind: 'ok', exitCode: 0 } as SessionOutcome;
+      },
+      markCapped: () => {},
+      notify: () => {},
+      report: () => {},
+    };
+
+    expect(await runHotSwapSession(deps)).toBe(0);
+    expect(seen).toEqual([['a'], []]);
+  });
 });

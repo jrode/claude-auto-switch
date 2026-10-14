@@ -54,11 +54,9 @@ describe('refreshUsage', () => {
 
   it('writes one renewal down once, when two callers share it', async () => {
     const { c, accounts } = setup(['a']);
-    const renewal = renewOneAtATime(
-      () => new Promise<{ status: 'refreshed' }>((resolve) => setTimeout(() => resolve({ status: 'refreshed' }), 20)),
-      () => 'the one login',
-    );
-    const renew = (dir: string) => renewal(dir, {});
+    const oneAtATime = renewOneAtATime();
+    const renew = () =>
+      oneAtATime('the one login', () => new Promise((resolve) => setTimeout(() => resolve({ status: 'refreshed' }), 20)));
     await Promise.all([
       renewIdleLogin(accounts[0]!, accounts, c, { renew, editorAccount: null }),
       renewIdleLogin(accounts[0]!, accounts, c, { renew, editorAccount: null }),
