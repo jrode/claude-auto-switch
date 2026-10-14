@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.3]
+
+### Changed
+
+- **A shorter message after an in-place account move.** The prompt typed into a
+  session moved to another account without a restart no longer names ccx, and
+  says the same in fewer words: "This session switched accounts after a usage
+  limit. Nothing was restarted, so running agents and tasks are still going.
+  Continue where you stopped and retry anything the limit cut off. If nothing
+  was cut off, say so in one line and wait." A prompt you set yourself is still
+  typed as written.
+
 ## [2.6.2]
 
 ### Changed

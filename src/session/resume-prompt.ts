@@ -33,7 +33,7 @@ export const RESUME_PROMPT_FILE = 'resume-prompt.txt';
  * again the agents and commands that are in fact still running.
  */
 export const IN_PLACE_PROMPT =
-  'ccx moved this session to another account because the one it was on ran out of usage. Nothing was restarted: agents and background tasks that were running still are. Carry on exactly where you stopped, and run again anything a usage limit error ended. If nothing was cut short, say so in one line and wait.';
+  'This session switched accounts after a usage limit. Nothing was restarted, so running agents and tasks are still going. Continue where you stopped and retry anything the limit cut off. If nothing was cut off, say so in one line and wait.';
 
 /** Long enough for a real instruction, short enough to stay a sane argument. */
 export const RESUME_PROMPT_MAX_CHARS = 2000;
