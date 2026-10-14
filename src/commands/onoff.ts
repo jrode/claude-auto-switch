@@ -1,5 +1,5 @@
-import { installShim, uninstallShim, type ShellKind } from '../shell/install-shim.js';
-import { defaultPowerShellProfile, defaultPosixProfile } from '../shell/profile-path.js';
+import { installShim, isShimInstalled, uninstallShim, type ShellKind } from '../shell/install-shim.js';
+import { selectShells, shellPlans, type ShellPlan } from '../shell/shells.js';
 import { detectEditors } from '../editor/settings.js';
 import { enableEditor, disableEditor } from './editor.js';
 import { installStatusline, removeStatusline } from '../statusline/settings-install.js';
@@ -11,8 +11,13 @@ import { routingOn } from '../artifacts/route.js';
 import type { CliContext } from '../context.js';
 
 export interface ShimOptions {
+  /** One file to use instead of every shell's own (--profile). */
   profile?: string;
-  /** 'powershell' or 'posix'; defaults to the platform. */
+  /**
+   * One shell to set up, even where nothing shows it is used: zsh, bash,
+   * powershell or pwsh. With --profile, the shim's flavour: posix or
+   * powershell (by default the platform's).
+   */
   shell?: string;
   /** Set false to skip setting up installed editors (--no-editor). */
   editor?: boolean;
@@ -20,38 +25,109 @@ export interface ShimOptions {
   statusline?: boolean;
 }
 
-function resolveTarget(
-  context: CliContext,
-  options: ShimOptions,
-): { shell: ShellKind; profilePath: string } {
-  const platform = context.ctx.platform ?? process.platform;
-  const shell: ShellKind =
-    options.shell === 'powershell' || options.shell === 'posix'
-      ? options.shell
-      : platform === 'win32'
-        ? 'powershell'
-        : 'posix';
-  const profilePath =
-    options.profile ??
-    (shell === 'powershell' ? defaultPowerShellProfile(context.ctx) : defaultPosixProfile(context.ctx));
-  return { shell, profilePath };
+export interface ShimDeps {
+  /** The shells and their files; worked out from the machine when absent. */
+  plans?: ShellPlan[];
+}
+
+/** The shim's flavour for a --profile file. */
+function profileKind(context: CliContext, shell: string | undefined): ShellKind {
+  if (shell === 'powershell' || shell === 'pwsh') return 'powershell';
+  if (shell === 'posix' || shell === 'zsh' || shell === 'bash') return 'posix';
+  return (context.ctx.platform ?? process.platform) === 'win32' ? 'powershell' : 'posix';
 }
 
 /**
- * One-command setup: install the transparent `claude` shim in the shell AND, for
- * any editor you have installed, point it at your active ccx account. Pass
+ * Put the shim in every file each chosen shell reads, and take any copy out of
+ * the files that would load it a second time. `refused` when the shell named
+ * is not one ccx knows, before anything is touched.
+ */
+function installShells(context: CliContext, options: ShimOptions, deps: ShimDeps): 'ok' | 'failed' | 'refused' {
+  if (options.profile) {
+    const result = installShim(options.profile, profileKind(context, options.shell));
+    context.out(
+      result === 'installed'
+        ? `terminal: transparent \`claude\` installed in ${options.profile}`
+        : `terminal: shim already present in ${options.profile}`,
+    );
+    return 'ok';
+  }
+
+  const plans = deps.plans ?? shellPlans(context.ctx);
+  const selection = selectShells(plans, options.shell);
+  if (!selection.ok) {
+    context.out(`terminal: ${selection.reason}`);
+    return 'refused';
+  }
+
+  let ok = true;
+  let changedAny = false;
+  for (const plan of selection.chosen) {
+    if (plan.blocked) {
+      context.out(`terminal: ${plan.label} not set up: ${plan.blocked.detail}`);
+      if (plan.blocked.fix) context.out(`  run: ${plan.blocked.fix}, then ccx on`);
+      continue;
+    }
+    const installed: string[] = [];
+    const removed: string[] = [];
+    let file = '';
+    try {
+      for (file of plan.files) {
+        if (installShim(file, plan.kind) === 'installed') installed.push(file);
+      }
+      for (file of plan.retired) {
+        if (isShimInstalled(file) && uninstallShim(file) === 'removed') removed.push(file);
+      }
+      context.out(
+        installed.length > 0
+          ? `terminal: \`claude\` goes through ccx in ${plan.label} now (${plan.files.join(', ')})`
+          : `terminal: ${plan.label} already set up (${plan.files.join(', ')})`,
+      );
+      for (const f of removed) context.out(`  removed the older copy in ${f}, so ${plan.label} loads it once`);
+      changedAny ||= installed.length + removed.length > 0;
+    } catch (err) {
+      ok = false;
+      context.out(`terminal: ${plan.label} not set up: could not write ${file}: ${thrownReason(err)}`);
+    }
+  }
+  if (options.shell === undefined) {
+    for (const plan of plans.filter((p) => p.state === 'unused')) {
+      context.out(`terminal: ${plan.label} left alone, ${plan.why} (ccx on --shell ${plan.id} adds it)`);
+    }
+  }
+  if (changedAny) context.out('  open a new terminal to use it');
+  return ok ? 'ok' : 'failed';
+}
+
+/** Take the shim out of every file it could be in, or of the one shell or file named. False when refused. */
+function removeShells(context: CliContext, options: ShimOptions, deps: ShimDeps): boolean {
+  let files: string[];
+  if (options.profile) {
+    files = [options.profile];
+  } else {
+    const plans = deps.plans ?? shellPlans(context.ctx);
+    const named = options.shell === undefined ? null : selectShells(plans, options.shell);
+    if (named && !named.ok) {
+      context.out(`terminal: ${named.reason}`);
+      return false;
+    }
+    const chosen = named ? named.chosen : plans;
+    files = [...new Set(chosen.flatMap((p) => p.sweep))];
+  }
+  const removed = files.filter((f) => uninstallShim(f) === 'removed');
+  for (const f of removed) context.out(`terminal: shim removed from ${f}`);
+  if (removed.length === 0) context.out('terminal: no shim found');
+  return true;
+}
+
+/**
+ * One-command setup: install the transparent `claude` shim in every shell AND,
+ * for any editor you have installed, point it at your active ccx account. Pass
  * `editor: false` (--no-editor) to set up the terminal only.
  */
-export function onCommand(context: CliContext, options: ShimOptions = {}): number {
-  const { shell, profilePath } = resolveTarget(context, options);
-  if (installShim(profilePath, shell) === 'installed') {
-    context.out(`terminal: transparent \`claude\` installed in ${profilePath}`);
-    context.out(
-      shell === 'powershell' ? '  reload your shell (or run: . $PROFILE)' : '  reload your shell',
-    );
-  } else {
-    context.out(`terminal: shim already present in ${profilePath}`);
-  }
+export function onCommand(context: CliContext, options: ShimOptions = {}, deps: ShimDeps = {}): number {
+  const shells = installShells(context, options, deps);
+  if (shells === 'refused') return 1;
 
   if (options.statusline !== false) {
     context.out(statuslineMessage(installStatusline(context.ctx)));
@@ -99,7 +175,7 @@ export function onCommand(context: CliContext, options: ShimOptions = {}): numbe
       }
     }
   }
-  return editorFailed ? 1 : 0;
+  return editorFailed || shells === 'failed' ? 1 : 0;
 }
 
 /**
@@ -157,10 +233,8 @@ function removalMessage(result: ReturnType<typeof removeStatusline>): string {
 }
 
 /** Remove the shim from the shell, and ccx from any installed editors. */
-export function offCommand(context: CliContext, options: ShimOptions = {}): number {
-  const { profilePath } = resolveTarget(context, options);
-  const result = uninstallShim(profilePath);
-  context.out(result === 'removed' ? `terminal: shim removed from ${profilePath}` : `terminal: no shim found`);
+export function offCommand(context: CliContext, options: ShimOptions = {}, deps: ShimDeps = {}): number {
+  if (!removeShells(context, options, deps)) return 1;
 
   if (options.statusline !== false) {
     context.out(removalMessage(removeStatusline(context.ctx)));

@@ -1,6 +1,5 @@
 import { listAccounts } from '../accounts/registry.js';
-import { isShimInstalled } from '../shell/install-shim.js';
-import { defaultPowerShellProfile, defaultPosixProfile } from '../shell/profile-path.js';
+import { shellCoverage, shellPlans } from '../shell/shells.js';
 import type { CliContext } from '../context.js';
 
 /**
@@ -40,11 +39,7 @@ export function setupGuidance(accountCount: number, shimInstalled: boolean): str
 /** `ccx setup`: print the tailored next step for the current state. */
 export function setupCommand(context: CliContext): number {
   const count = listAccounts(context.ctx).length;
-  const platform = context.ctx.platform ?? process.platform;
-  const profile =
-    platform === 'win32'
-      ? defaultPowerShellProfile(context.ctx)
-      : defaultPosixProfile(context.ctx);
-  context.out(setupGuidance(count, isShimInstalled(profile)));
+  // Every shell, so someone whose bash still skips ccx is pointed at ccx on.
+  context.out(setupGuidance(count, shellCoverage(shellPlans(context.ctx)) === 'all'));
   return 0;
 }

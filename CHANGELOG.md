@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
-## [2.6.1]
+## [2.6.2]
 
 ### Changed
 
@@ -47,6 +47,47 @@ semantic versioning.
   error when it was malformed, which ended a session at its start, or when
   its account ran out. That file only says which account to prefer, so the
   choice now goes on as if it named none.
+
+## [2.6.1]
+
+### Fixed
+
+- **`claude` went through ccx in one shell only.** `ccx on` put the `claude`
+  function into a single file: on Windows the console profile of whichever
+  PowerShell answered first, elsewhere `.zshrc` or `.bashrc` by your login
+  shell. Every other shell ran Claude directly, with no switching, so ccx
+  worked in one window and not in the next one opened in the same folder:
+  in Cursor's terminal and not in a Windows PowerShell window, or in zsh and
+  not in bash. Running `ccx on` from the other shell changed nothing, and
+  `ccx doctor` checked only that one file. Now `ccx on` covers every shell in
+  use:
+  - Windows PowerShell always, PowerShell 7 when installed, each in its
+    `profile.ps1`, which every host reads (Windows Terminal, a standalone
+    window, an editor's terminal, the PowerShell extension's terminal, the
+    ISE). The copy an older ccx put in the console-only profile is removed,
+    because that profile is read later and its copy would run instead.
+  - Git Bash, when it is installed and has been used.
+  - zsh in `.zshrc` (under `ZDOTDIR` when it is set), and bash in `.bashrc`
+    and in the login file bash reads instead (`.bash_profile`, `.bash_login`
+    or `.profile`) unless that file loads `.bashrc`, so a login shell, which
+    is what a Mac terminal starts, gets it once.
+
+  zsh, bash and Git Bash count as in use when the shell is the login shell,
+  has a startup file or a history file, or already has the function; the
+  others are left alone, and `ccx on --shell <name>` sets one up anyway.
+  `ccx off` removes the function from every file ccx could have written.
+  **After updating, run `ccx on` once** to add the shells an older ccx left
+  out; nothing does that on its own. Unless ccx has shown its `ccx on` tip
+  before, the first session to end with a shell still missing says so, once.
+- **`ccx doctor` lists each shell** and whether typing `claude` goes through
+  ccx there, a shell that has it in only some of its files, or a second copy
+  it would also load. Where a Windows execution policy (`Restricted` or
+  `AllSigned`) stops PowerShell running its profile and npm's `ccx` command,
+  it says so and gives the command that allows local scripts for you alone,
+  without running it, or, when Group Policy sets the policy, that only an
+  administrator can change it. Under that policy `ccx on` writes no profile,
+  which would put an error in every window. cmd has no profile, and doctor says it
+  is not covered.
 
 ## [2.6.0]
 

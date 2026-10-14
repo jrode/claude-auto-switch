@@ -326,9 +326,9 @@ program
 
 program
   .command('on')
-  .description('set up ccx everywhere: transparent `claude` in the shell + your editors')
-  .option('--profile <path>', 'profile path (defaults to your $PROFILE / rc file)')
-  .option('--shell <shell>', 'powershell or posix (defaults to your platform)')
+  .description('set up ccx everywhere: transparent `claude` in every shell you use + your editors')
+  .option('--profile <path>', 'put the shim in this one file instead of every shell')
+  .option('--shell <shell>', 'set up only this shell, even if unused: zsh, bash, powershell or pwsh')
   .option('--no-editor', 'set up the terminal only, not editors')
   .option('--no-statusline', "leave Claude's status line alone")
   .action((opts: { profile?: string; shell?: string; editor?: boolean }) => {
@@ -337,9 +337,9 @@ program
 
 program
   .command('off')
-  .description('remove ccx from your shell and editors')
-  .option('--profile <path>', 'profile path (defaults to your $PROFILE / rc file)')
-  .option('--shell <shell>', 'powershell or posix (defaults to your platform)')
+  .description('remove ccx from every shell and your editors')
+  .option('--profile <path>', 'remove the shim from this one file only')
+  .option('--shell <shell>', 'remove it from this shell only: zsh, bash, powershell or pwsh')
   .option('--no-editor', 'remove from the terminal only')
   .option('--no-statusline', "leave Claude's status line alone")
   .action((opts: { profile?: string; shell?: string; editor?: boolean }) => {
@@ -356,7 +356,7 @@ program
 
 program
   .command('doctor')
-  .description('verify config, git-safety, claude resolution, and browser port')
+  .description('check the setup: each shell, accounts, logins, editors and more')
   .action(async () => {
     process.exitCode = await doctorCommand(context());
   });

@@ -41,8 +41,13 @@ export function shimBlock(shell: ShellKind): string {
   return [MARKER_START, ...fn, MARKER_END].join('\n');
 }
 
+/** Whether a profile's text holds a ccx shim block, current or not. */
+export function hasShimBlock(text: string): boolean {
+  return text.includes(MARKER_START);
+}
+
 export function isShimInstalled(profilePath: string): boolean {
-  return existsSync(profilePath) && readFileSync(profilePath, 'utf8').includes(MARKER_START);
+  return existsSync(profilePath) && hasShimBlock(readFileSync(profilePath, 'utf8'));
 }
 
 /** True when the installed shim has the falls-back-to-real-claude safety net. */

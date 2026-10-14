@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   auditGitSafety,
-  auditShim,
+  auditShells,
   auditSharedHistory,
   auditSharedLogins,
   auditCaps,
@@ -13,6 +13,7 @@ import {
 import { settingsPath } from '../statusline/settings-install.js';
 import { addAccount } from '../accounts/registry.js';
 import { installShim } from '../shell/install-shim.js';
+import type { ShellPlan } from '../shell/shells.js';
 import { loadConfig } from '../config/config.js';
 import { credentialFileFingerprint } from '../accounts/credential-vault.js';
 import { loadLedger, markCapped, saveLedger } from '../ledger/ledger.js';
@@ -57,45 +58,158 @@ describe('auditGitSafety', () => {
   });
 });
 
-describe('auditShim', () => {
-  const profileIn = (dir: string): string => path.join(dir, 'profile.ps1');
+describe('auditShells', () => {
+  /** A plan whose files live in a fresh temporary folder, so no real profile is read. */
+  function planIn(id: ShellPlan['id'], names: string[], over: Partial<ShellPlan> = {}): ShellPlan {
+    const dir = mkdtempSync(path.join(tmpdir(), 'cas-docshim-'));
+    const files = names.map((n) => path.join(dir, n));
+    return {
+      id,
+      label: id,
+      kind: names[0]?.endsWith('.ps1') ? 'powershell' : 'posix',
+      state: 'use',
+      files,
+      retired: [],
+      sweep: files,
+      ...over,
+    };
+  }
+  /** Not Windows, so the list holds only the shells given, on any host. */
+  const posix = (lines?: string[]): CliContext => {
+    const c = context(lines);
+    c.ctx.platform = 'linux';
+    return c;
+  };
+  const quietDeps = {
+    gitTrackedFiles: () => ['src/cli.ts'],
+    resolveClaude: () => ({ bin: '/real/claude' }),
+    checkBrowserPort: () => Promise.resolve(true),
+    skipNetwork: true,
+  };
+  const shellCheck = (checks: ReturnType<typeof auditShells>, shell: string) => {
+    const found = checks.find((c) => c.shell === shell);
+    if (!found) throw new Error(`no check for ${shell}`);
+    return found;
+  };
 
-  it('reports ok when the current (fallback) shim is installed', () => {
-    const p = profileIn(mkdtempSync(path.join(tmpdir(), 'cas-docshim-')));
-    installShim(p, 'powershell');
-    const r = auditShim(context(), { resolveShimProfile: () => p });
-    expect(r.ok).toBe(true);
-    expect(r.detail).toContain('runs through ccx');
+  it('says, shell by shell, that `claude` goes through ccx', () => {
+    const zsh = planIn('zsh', ['.zshrc']);
+    const ps = planIn('powershell', ['profile.ps1'], { label: 'Windows PowerShell' });
+    installShim(zsh.files[0] as string, 'posix');
+    installShim(ps.files[0] as string, 'powershell');
+    const checks = auditShells(posix(), { shellPlans: [zsh, ps] });
+    expect(checks.map((c) => [c.label, c.ok, c.note ?? false])).toEqual([
+      ['zsh', true, false],
+      ['Windows PowerShell', true, false],
+    ]);
+    expect(shellCheck(checks, 'zsh').detail).toContain('goes through ccx');
   });
 
-  it('FAILS on an outdated shim without the uninstall fallback', () => {
-    const p = profileIn(mkdtempSync(path.join(tmpdir(), 'cas-docshim-')));
+  it('FAILS a shell that skips ccx while another has it: one window works and the next does not', () => {
+    const zsh = planIn('zsh', ['.zshrc']);
+    const bash = planIn('bash', ['.bashrc']);
+    installShim(zsh.files[0] as string, 'posix');
+    const r = shellCheck(auditShells(posix(), { shellPlans: [zsh, bash] }), 'bash');
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain(bash.files[0]);
+    expect(r.fix).toEqual(['ccx on']);
+  });
+
+  it('only suggests ccx on while no shell has it at all', () => {
+    const checks = auditShells(posix(), { shellPlans: [planIn('zsh', ['.zshrc']), planIn('bash', ['.bashrc'])] });
+    for (const c of checks) {
+      expect(c.ok).toBe(true);
+      expect(c.note).toBe(true);
+      expect(c.detail).toContain('runs on its own');
+      expect(c.fix).toEqual(['ccx on']);
+    }
+  });
+
+  it('FAILS a shell set up in only some of the files it reads', () => {
+    const bash = planIn('bash', ['.bashrc', '.bash_profile']);
+    installShim(bash.files[0] as string, 'posix');
+    const r = shellCheck(auditShells(posix(), { shellPlans: [bash] }), 'bash');
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain(bash.files[1]);
+    expect(r.detail).not.toContain(bash.files[0]);
+  });
+
+  it('FAILS an outdated shim without the uninstall fallback, and ccx on upgrades it', () => {
+    const ps = planIn('powershell', ['profile.ps1']);
     writeFileSync(
-      p,
+      ps.files[0] as string,
       '# >>> claude-auto-switch shim >>>\nfunction claude {\n    ccx run -- @args\n}\n# <<< claude-auto-switch shim <<<\n',
       'utf8',
     );
-    expect(auditShim(context(), { resolveShimProfile: () => p }).ok).toBe(false);
-    // And `ccx on` upgrades it in place.
-    expect(installShim(p, 'powershell')).toBe('installed');
-    expect(auditShim(context(), { resolveShimProfile: () => p }).ok).toBe(true);
+    expect(shellCheck(auditShells(posix(), { shellPlans: [ps] }), 'powershell').ok).toBe(false);
+    expect(installShim(ps.files[0] as string, 'powershell')).toBe('installed');
+    expect(shellCheck(auditShells(posix(), { shellPlans: [ps] }), 'powershell').ok).toBe(true);
   });
 
-  it('judges a shim by the shell its profile is for, on any platform', () => {
-    const dir = mkdtempSync(path.join(tmpdir(), 'cas-docshim-'));
-    const bashrc = path.join(dir, '.bashrc');
-    installShim(bashrc, 'posix');
-    expect(auditShim(context(), { resolveShimProfile: () => bashrc }).ok).toBe(true);
-    const ps1 = profileIn(dir);
-    installShim(ps1, 'powershell');
-    expect(auditShim(context(), { resolveShimProfile: () => ps1 }).ok).toBe(true);
+  it('FAILS a shell that also loads a copy from a file it should not be in', () => {
+    const ps = planIn('powershell', ['profile.ps1']);
+    const consoleOnly = path.join(path.dirname(ps.files[0] as string), 'Microsoft.PowerShell_profile.ps1');
+    installShim(ps.files[0] as string, 'powershell');
+    installShim(consoleOnly, 'powershell');
+    const r = shellCheck(auditShells(posix(), { shellPlans: [{ ...ps, retired: [consoleOnly] }] }), 'powershell');
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain(consoleOnly);
+    expect(r.fix).toEqual(['ccx on']);
   });
 
-  it('treats a missing shim as informational, not a failure', () => {
-    const p = profileIn(mkdtempSync(path.join(tmpdir(), 'cas-docshim-')));
-    const r = auditShim(context(), { resolveShimProfile: () => p });
+  it('names an execution policy that stops a shell, gives the command, and changes nothing', () => {
+    const fix = 'powershell -NoProfile -Command Set-ExecutionPolicy -Scope CurrentUser RemoteSigned';
+    const ps = planIn('powershell', ['profile.ps1'], {
+      blocked: { detail: 'its execution policy is Restricted, so it runs neither its profile nor npm\'s ccx command', fix },
+    });
+    const r = shellCheck(auditShells(posix(), { shellPlans: [ps] }), 'powershell');
+    expect(r.detail).toContain('Restricted');
+    expect(r.fix).toEqual([fix]);
+    expect(existsSync(ps.files[0] as string)).toBe(false);
+  });
+
+  it('gives no command where only an administrator can change the policy', () => {
+    const ps = planIn('powershell', ['profile.ps1'], {
+      blocked: { detail: 'its execution policy is Restricted; Group Policy sets it' },
+    });
+    const r = shellCheck(auditShells(posix(), { shellPlans: [ps] }), 'powershell');
+    expect(r.detail).toContain('Group Policy');
+    expect(r.fix).toBeUndefined();
+  });
+
+  it('lists a shell nobody uses as left alone, with the command that adds it', () => {
+    const bash = planIn('bash', ['.bashrc'], { state: 'unused', why: 'nothing shows bash is used here' });
+    const r = shellCheck(auditShells(posix(), { shellPlans: [bash] }), 'bash');
     expect(r.ok).toBe(true);
-    expect(r.detail).toContain('not installed');
+    expect(r.detail).toContain('ccx on --shell bash');
+    expect(r.fix).toBeUndefined();
+  });
+
+  it('leaves out a shell that is not installed', () => {
+    expect(auditShells(posix(), { shellPlans: [planIn('pwsh', ['profile.ps1'], { state: 'absent' })] })).toEqual([]);
+  });
+
+  it('says cmd is not covered on Windows, since it has no profile', () => {
+    const c = context();
+    c.ctx.platform = 'win32';
+    const r = shellCheck(auditShells(c, { shellPlans: [] }), 'cmd');
+    expect(r.ok).toBe(true);
+    expect(r.note).toBe(true);
+    expect(r.detail).toContain('not covered');
+    expect(auditShells(posix(), { shellPlans: [] })).toEqual([]);
+  });
+
+  it('prints each shell on its own line', async () => {
+    const lines: string[] = [];
+    const c = posix(lines);
+    wireStatusline(c);
+    const zsh = planIn('zsh', ['.zshrc']);
+    installShim(zsh.files[0] as string, 'posix');
+    const bash = planIn('bash', ['.bashrc'], { label: 'Git Bash' });
+    await doctorCommand(c, { ...quietDeps, shellPlans: [zsh, bash] });
+    const out = lines.join('\n');
+    expect(out).toMatch(/zsh +`claude` goes through ccx/);
+    expect(out).toMatch(/Git Bash +`claude` skips ccx/);
   });
 });
 
@@ -216,7 +330,7 @@ describe('doctorCommand', () => {
     gitTrackedFiles: () => ['src/cli.ts'],
     resolveClaude: () => ({ bin: '/real/claude' }),
     checkBrowserPort: () => Promise.resolve(true),
-    resolveShimProfile: () => null,
+    shellPlans: [],
   };
 
   it('passes with a clean tracked-file list and a resolvable claude', async () => {
@@ -349,7 +463,7 @@ describe('doctor on a machine nobody is at', () => {
     gitTrackedFiles: () => ['src/cli.ts'],
     resolveClaude: () => ({ bin: '/real/claude' }),
     checkBrowserPort: () => Promise.resolve(false),
-    resolveShimProfile: () => null,
+    shellPlans: [],
     headless: true,
   };
 

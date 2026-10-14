@@ -20,14 +20,50 @@ claude              # use Claude as usual
 
 `ccx on` sets up four things, and `ccx off` removes them:
 
-- a `claude` function in your shell profile that runs Claude through ccx
+- a `claude` function that runs Claude through ccx, in every shell you use
+  (see [which shells](#which-shells))
 - the Claude Code extension in Cursor and VS Code
 - ccx's part of Claude's status line (an existing status line is kept, wrapped)
 - the `/ccx` command inside Claude
 
-`ccx doctor` checks the whole setup, including which account each profile is
-really signed in as. Two profiles holding one account would end each other's
-logins on renewal, so ccx refuses such a sign-in and keeps the previous login.
+`ccx doctor` checks the whole setup: shell by shell, whether typing `claude`
+goes through ccx there, and which account each profile is really signed in as.
+Two profiles holding one account would end each other's logins on renewal, so
+ccx refuses such a sign-in and keeps the previous login.
+
+### Which shells
+
+Each shell reads its own startup files, so `ccx on` puts the `claude` function
+in every file a shell reads when it starts, once per shell:
+
+- **Windows**: Windows PowerShell always, since it comes with Windows and is
+  what the Start menu opens, and PowerShell 7 when it is installed. Each has its
+  own `profile.ps1`, the profile every host reads: Windows Terminal, a
+  standalone window, the terminal in Cursor or VS Code, and the PowerShell
+  extension's terminal alike. Git Bash too, when it is installed and has been
+  used. cmd has no profile, so `claude` there runs on its own; use `ccx run` in
+  cmd, or PowerShell.
+- **macOS and Linux**: zsh in `.zshrc`, and bash in `.bashrc` and in the login
+  file bash reads instead of it (`.bash_profile`, `.bash_login` or `.profile`),
+  unless that file loads `.bashrc` already. A Mac terminal starts bash as a
+  login shell, which reads only the login file.
+
+zsh, bash and Git Bash are set up when the shell is your login shell, has a
+startup file or a history file, or already has the function. One with none of
+those has never been set up or opened here, so ccx leaves it alone rather than
+create files for it, and `ccx on --shell <name>` (`zsh`, `bash`, `powershell` or
+`pwsh`) sets it up anyway. After updating from an older ccx, which set up only one shell, run
+`ccx on` once to add the others.
+
+A Windows execution policy of `Restricted` or `AllSigned` stops PowerShell
+running any profile, and npm's `ccx` command with it. ccx writes no profile
+there, since PowerShell would show an error in every window it opens.
+`ccx doctor` names the policy. When it is your own or the machine's setting,
+doctor gives the command that allows local scripts for you alone, but never
+runs it:
+`powershell -NoProfile -Command Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+(`pwsh` for PowerShell 7). Then run `ccx on` again. When Group Policy sets it,
+that command changes nothing, so doctor says to ask an administrator instead.
 
 ## How it works
 
@@ -351,7 +387,7 @@ are already in `~/.claude/settings.json`.
 | `ccx worker [brief...]`                  | one task headless on an account, for an orchestrator (`--agent`, `--account`, `--cwd`, `--timeout`; see docs/workers.md) |
 | `ccx artifacts`                          | the pages ccx has recorded, and the account that owns each (`scan`: ask each account for its pages, best effort)         |
 | `ccx add <name>`                         | add an account and sign it in through the browser                                                                        |
-| `ccx on` / `ccx off`                     | set up / remove ccx in your shell, editors, status line and `/ccx`                                                       |
+| `ccx on` / `ccx off`                     | set up / remove ccx in every shell you use, editors, status line and `/ccx` (`--shell <name>`: one shell)                |
 | `ccx`                                    | status at a glance (a setup guide when nothing is set up)                                                                |
 | `ccx dashboard`                          | live view with keys (alias `watch`)                                                                                      |
 | `ccx usage`                              | every window on every account                                                                                            |
@@ -373,7 +409,7 @@ are already in `~/.claude/settings.json`.
 | `ccx login --host <host> [name]`         | sign in a server's accounts from here, over SSH (`--all`, `--remote-ccx <path>`)                                         |
 | `ccx keepalive on\|off\|status`          | renew idle logins every four hours with cron, for a machine nobody uses                                                  |
 | `ccx list` / `status [name]`             | account health: email, plan, signed in, capped until                                                                     |
-| `ccx doctor`                             | check the setup and who each profile really is                                                                           |
+| `ccx doctor`                             | check the setup, shell by shell, and who each profile really is                                                          |
 | `ccx history`                            | what ccx did to logins, sessions and your settings                                                                       |
 | `ccx state`                              | everything ccx knows, as JSON                                                                                            |
 | `ccx cap <name>`                         | mark an account out by hand (`--clear`)                                                                                  |
@@ -428,7 +464,7 @@ usage check, as `ccx config <key>` says.
 | `~/.claude/settings.json`                | the `statusLine` key; the Desktop hooks and the Artifact hooks when enabled; session changes |
 | `~/.claude.json`                         | session changes to your preferences, MCP servers and folder trust                            |
 | `~/.claude/skills/ccx/`                  | the `/ccx` command                                                                           |
-| your shell profile                       | the `claude` function                                                                        |
+| each shell's startup files               | the `claude` function (`.zshrc`, `.bashrc`, bash's login file, PowerShell's `profile.ps1`)   |
 | Cursor / VS Code settings                | `claudeCode.environmentVariables`                                                            |
 | your crontab                             | one line marked `# ccx keepalive`, only after `ccx keepalive on`                             |
 
