@@ -3,13 +3,18 @@ import path from 'node:path';
 
 const MARKER = '.shim-hinted';
 
-/** Offer the transparent shim only when it is not installed and not yet hinted. */
-export function shouldHintShim(shimInstalled: boolean, alreadyHinted: boolean): boolean {
-  return !shimInstalled && !alreadyHinted;
+/** Offer the transparent shim only while some shell lacks it, and only once. */
+export function shouldHintShim(
+  coverage: 'none' | 'some' | 'all',
+  alreadyHinted: boolean,
+): coverage is 'none' | 'some' {
+  return coverage !== 'all' && !alreadyHinted;
 }
 
-export function shimHintText(): string {
-  return 'tip: run `ccx on` to type `claude` directly and auto-switch without `ccx run`. (shown once)';
+export function shimHintText(coverage: 'none' | 'some' = 'none'): string {
+  return coverage === 'some'
+    ? 'tip: `claude` does not go through ccx in your other shells yet; run `ccx on` once to add them. (shown once)'
+    : 'tip: run `ccx on` to type `claude` directly and auto-switch without `ccx run`. (shown once)';
 }
 
 export function wasHinted(configHome: string): boolean {

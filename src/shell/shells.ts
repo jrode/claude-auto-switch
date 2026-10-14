@@ -302,6 +302,8 @@ export function shellCoverage(plans: ShellPlan[], fs: ShellFs = realFs): 'none' 
   const has = (f: string) => hasShimBlock(fs.read(f) ?? '');
   if (!plans.some((p) => [...p.files, ...p.retired].some(has))) return 'none';
   const wanted = plans.filter((p) => p.state === 'use' && !p.blocked);
+  // A shim only where nothing can run it routes nothing through ccx.
+  if (wanted.length === 0) return 'none';
   return wanted.every((p) => p.files.every(has)) ? 'all' : 'some';
 }
 

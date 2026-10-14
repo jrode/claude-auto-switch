@@ -22,12 +22,12 @@ function maybeHintShim(context: CliContext): void {
   // Cheap check first: once hinted, skip entirely (finding the PowerShell
   // profiles starts both PowerShells, far too costly for an every-run no-op).
   if (wasHinted(home)) return;
-  const installed = shellCoverage(shellPlans(context.ctx)) !== 'none';
-  if (shouldHintShim(installed, false)) {
-    (context.err ?? ((m: string) => process.stderr.write(`${m}\n`)))(shimHintText());
+  const coverage = shellCoverage(shellPlans(context.ctx));
+  if (shouldHintShim(coverage, false)) {
+    (context.err ?? ((m: string) => process.stderr.write(`${m}\n`)))(shimHintText(coverage));
   }
-  // Marked either way: with the shim in place the tip has nothing to offer,
-  // and asking again after every session would start those shells each time.
+  // Marked either way, so it is shown at most once: asking again after every
+  // session would start both PowerShells each time.
   markHinted(home);
 }
 

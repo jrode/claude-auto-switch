@@ -434,4 +434,16 @@ describe('shellCoverage', () => {
     );
     expect(shellCoverage(plans, memFs(files))).toBe('all');
   });
+
+  it('is none when the only shim is in a shell whose execution policy will not run it', () => {
+    const profile = 'C:\\Users\\me\\Documents\\WindowsPowerShell\\profile.ps1';
+    const files = { [profile]: shimBlock('powershell') };
+    const plans = planShells(
+      windows(
+        { powershell: { powershell: facts('C:\\Users\\me\\Documents\\WindowsPowerShell', 'Restricted'), pwsh: null } },
+        files,
+      ),
+    );
+    expect(shellCoverage(plans, memFs(files))).toBe('none');
+  });
 });

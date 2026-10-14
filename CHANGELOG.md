@@ -33,7 +33,8 @@ semantic versioning.
   others are left alone, and `ccx on --shell <name>` sets one up anyway.
   `ccx off` removes the function from every file ccx could have written.
   **After updating, run `ccx on` once** to add the shells an older ccx left
-  out; nothing does that on its own.
+  out; nothing does that on its own. Unless ccx has shown its `ccx on` tip
+  before, the first session to end with a shell still missing says so, once.
 - **`ccx doctor` lists each shell** and whether typing `claude` goes through
   ccx there, a shell that has it in only some of its files, or a second copy
   it would also load. Where a Windows execution policy (`Restricted` or
