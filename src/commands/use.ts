@@ -6,6 +6,7 @@ import { liveLeases, type SessionLease } from '../session/lease.js';
 import { resolveTarget } from '../session/session-target.js';
 import { numberSessions } from '../dashboard/session-choice.js';
 import type { CliContext } from '../context.js';
+import { takeBackMoves } from '../state/switch-request.js';
 
 export interface UseOptions {
   /** Instant switch by restarting the session (--continue) instead of the seamless swap. */
@@ -78,6 +79,8 @@ export function useCommand(
     context.out(`${running.length} sessions are running, so none was moved:`);
     for (const s of running) context.out(`  ${s.pid}  ${s.where} (on ${s.account})`);
     context.out(`move one with: ccx use ${name} --session <pid>   (or --here in its folder, or --all)`);
+    // None moves, and one already on it stays rather than make a move asked earlier.
+    takeBackMoves(name, running, context.ctx);
     return 0;
   }
   for (const s of requestMoves(name, running, mode, context.ctx)) {

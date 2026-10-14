@@ -37,13 +37,19 @@ semantic versioning.
   renewed elsewhere at that moment, after 2 seconds. A login whose lock folder
   cannot be created (a profile folder ccx may not write in) is not renewed
   from a session, and a switch onto it restarts as before, saying so. The
-  editor (`ccx editor on`) is pointed at the new account at once, as before,
-  and its login may now be renewed by a session moving onto it: Claude, the
-  editor's included, renews a login under the same lock ccx takes, in that
-  profile's folder, reads it again under the lock, and sends nothing when it
-  has changed (read from Claude Code 2.1.294 to 2.1.299). A profile that
-  shares its login with the one the editor is on has a lock of its own, so
-  it is still not renewed while the editor may be using it. No command that
+  editor (`ccx editor on`) is pointed at the new account as before, and its
+  login may now be renewed by a session moving onto it: Claude, the editor's
+  included, renews a login under the same lock ccx takes, in that profile's
+  folder, reads it again under the lock, and sends nothing when it has
+  changed (read from Claude Code 2.1.294 to 2.1.299). The editor's Claude
+  reads that profile's login file through the pointer, except on macOS once
+  it has saved a login of its own in the Keychain, after which it no longer
+  follows the pointer (#129). Because it takes and lets go of that lock
+  through the pointer, the pointer is not moved while the lock in the
+  account it is on is in use: it waits, up to ten seconds, without holding
+  anything up. A profile that shares its login with the one the editor is on
+  has a lock of its own, so it is still not renewed while the editor may be
+  using it. No command that
   ends when it has printed renews anything. After a limit, ccx waits at most
   five seconds for the renewal, and less when the check that found the limit
   was slow, trying again every 0.2 seconds while something else is renewing
@@ -72,7 +78,9 @@ semantic versioning.
 - **A session told to stay put no longer moves anyway.** `ccx use B` asks a
   session to move; `ccx use A` before it has moved said nothing to a session
   already on A, so the first request still moved it to B. It is now taken
-  back.
+  back, by `ccx use` with one session, with `--all`, or with several and
+  none moved, and by the dashboard for every session on that account,
+  chosen or not.
 
 ## [2.6.1]
 

@@ -141,7 +141,13 @@ import { holdBackOf } from '../dashboard/rotation-settings.js';
 import { activateWithLease, finishWithLease } from '../session/handoff.js';
 import { ensureLoginUsable, readinessMessage } from '../session/preflight.js';
 import { renewalIsDue, refreshCredentialIfExpired } from '../usage/oauth-refresh.js';
-import { withCredentialLock, withCredentialLockIfFree, acquireLockDir } from '../claude/locks.js';
+import {
+  withCredentialLock,
+  withCredentialLockIfFree,
+  acquireLockDir,
+  lockDirHeld,
+  CREDENTIALS_LOCK_DIR,
+} from '../claude/locks.js';
 import { logCredentialEvent } from '../accounts/credential-log.js';
 import { appendEvent, type EventDetail } from '../events/log.js';
 import { getClaude, type CliContext } from '../context.js';
@@ -1206,18 +1212,24 @@ export async function runInteractiveHotSwap(
   };
 
   /**
-   * `renewBeforeMove`, tried again every BUSY_RETRY_MS while something else is
-   * renewing the login right now, until `deadline`: a second session that met
-   * the same limit is often renewing it, and is done within a second. Each try
-   * only tries the lock, so nothing here stops the terminal.
+   * `renewBeforeMove`, tried again while something else is renewing the login
+   * right now, until `deadline`: a second session that met the same limit is
+   * often renewing it, and is done within a second. Meanwhile only the lock is
+   * looked at, every BUSY_RETRY_MS, and the whole renewal is tried again once
+   * it is let go: the whole one reads every profile's login, through a
+   * `security` process on macOS, on the thread that relays the terminal.
    */
   const renewWhileBusy = async (account: Account, deadline: number): Promise<MoveRenewal> => {
+    const lock = path.join(account.dir, CREDENTIALS_LOCK_DIR);
     for (;;) {
       const result = await renewBeforeMove(account).catch(
         (error: unknown): MoveRenewal => ({ ok: false, why: 'failed', detail: thrownReason(error) }),
       );
-      if (result.ok || result.why !== 'busy' || Date.now() + BUSY_RETRY_MS >= deadline) return result;
-      await new Promise((resolve) => setTimeout(resolve, BUSY_RETRY_MS));
+      if (result.ok || result.why !== 'busy') return result;
+      do {
+        if (Date.now() + BUSY_RETRY_MS >= deadline) return result;
+        await new Promise((resolve) => setTimeout(resolve, BUSY_RETRY_MS));
+      } while (lockDirHeld(lock));
     }
   };
 

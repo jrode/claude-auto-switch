@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { CliContext } from '../context.js';
@@ -23,6 +23,7 @@ const { addCommand } = await import('../commands/add.js');
 const { setActive } = await import('../state/active.js');
 const { listAccounts } = await import('../accounts/registry.js');
 const { loadConfig } = await import('../config/config.js');
+const { CREDENTIALS_LOCK_DIR } = await import('../claude/locks.js');
 
 async function editorOn(names: string[]): Promise<{ home: string; context: CliContext }> {
   const home = mkdtempSync(path.join(tmpdir(), 'cas-editor-sync-'));
@@ -62,6 +63,27 @@ describe('pointing the editor at the active account', () => {
     writes.count = 0;
     syncEditorPointerIfEnabled(context);
     expect(writes.count).toBe(1);
+    expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('B');
+  });
+
+  it('waits to move the pointer while a renewal through it may be running, then moves it', async () => {
+    // The editor's Claude locks <pointer>/.oauth_refresh.lock and lets go by
+    // removing that path: moved in between, it would remove the lock of the
+    // account moved to.
+    const { home, context } = await editorOn(['A', 'B']);
+    const lock = path.join(home, 'profiles', 'A', CREDENTIALS_LOCK_DIR);
+    mkdirSync(lock);
+    setActive('B', context.ctx);
+    syncEditorPointerIfEnabled(context);
+    expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('A');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('A');
+
+    rmSync(lock, { recursive: true, force: true });
+    const until = Date.now() + 3_000;
+    while (editorPointerAccount(listAccounts(context.ctx), context.ctx) !== 'B' && Date.now() < until) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('B');
   });
 

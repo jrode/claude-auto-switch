@@ -70,6 +70,16 @@ function mtimeMs(dir: string): number | null {
 }
 
 /**
+ * Whether a lock directory is held now: it exists, and was touched within
+ * `freshMs` (by default as long as acquireLockDir takes a lock to be). Only
+ * looks, so it is cheap enough to ask again and again while waiting.
+ */
+export function lockDirHeld(lockDir: string, freshMs: number = DEFAULTS.staleMs, now: number = Date.now()): boolean {
+  const touched = mtimeMs(lockDir);
+  return touched !== null && now - touched <= freshMs;
+}
+
+/**
  * Try to take the lock directory. Returns a handle that is `held: false` when
  * the wait elapsed; callers proceed either way and must always release().
  */

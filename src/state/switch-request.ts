@@ -3,6 +3,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { configHome, type PathCtx } from '../config/paths.js';
 import { readJsonFile, writeJsonFile } from '../util/fs-json.js';
+import { liveLeases } from '../session/lease.js';
 
 /**
  * A pending request for a RUNNING session to switch accounts in place. The
@@ -79,10 +80,20 @@ export function requestMoves<T extends { pid: number; account: string }>(
 ): T[] {
   const moving = sessions.filter((s) => s.account !== account);
   for (const s of moving) writeSwitchRequest(account, at, mode, c, s.pid);
-  // One already there stays, so a move it was asked for earlier and has not
-  // made yet is taken back, or it would still be made.
-  for (const s of sessions) if (s.account === account) clearSwitchRequest(c, s.pid);
+  takeBackMoves(account, sessions, c);
   return moving;
+}
+
+/**
+ * Take back a move still waiting for any session already on `account`, the
+ * account just made the one to be on: of `sessions`, and of every other
+ * session running, asked or not. Left in place, the earlier move would still
+ * be made. For whatever sets the active account for everyone, never for a
+ * session's own moves, which are not somebody saying where to be.
+ */
+export function takeBackMoves(account: string, sessions: readonly { pid: number; account: string }[], c: PathCtx = {}): void {
+  const running = liveLeases(c).map((l) => ({ pid: l.pid, account: l.account }));
+  for (const s of [...sessions, ...running]) if (s.account === account) clearSwitchRequest(c, s.pid);
 }
 
 /**

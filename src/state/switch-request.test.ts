@@ -10,6 +10,7 @@ import {
   requestMoves,
   sweepDeadSwitchRequests,
 } from './switch-request.js';
+import { takeLease } from '../session/lease.js';
 
 function ctx() {
   const home = mkdtempSync(path.join(tmpdir(), 'cas-switch-'));
@@ -106,6 +107,16 @@ describe('requestMoves', () => {
     requestMoves('b', [{ pid: 11, account: 'a' }], 'seamless', c, 5);
     requestMoves('a', [{ pid: 11, account: 'a' }], 'seamless', c, 6);
     expect(readSwitchRequest(c, 11)).toBeNull();
+  });
+
+  it('takes it back for a running session already there that was not among those asked', () => {
+    // The dashboard asks only the sessions chosen; one left out, already on
+    // the account, still had its earlier move waiting.
+    const c = ctx();
+    takeLease('a', path.join(c.env.CLAUDE_AUTO_SWITCH_HOME, 'session'), c);
+    writeSwitchRequest('b', 5, 'seamless', c, process.pid);
+    requestMoves('a', [], 'seamless', c, 6);
+    expect(readSwitchRequest(c, process.pid)).toBeNull();
   });
 });
 

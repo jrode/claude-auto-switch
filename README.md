@@ -101,7 +101,9 @@ the main thread meets the limit. When the next account's login is due for
 renewal, ccx renews it first and then moves in place, unless another session may
 be using that login, since renewing it would sign that session out. Your editor
 being on it does not stop this: Claude renews a login under the same lock ccx
-takes, and reads it again under it.
+takes, and reads it again under it. (On macOS, once the editor's Claude has
+saved a login it keeps it in a Keychain item of its own and no longer follows
+the account ccx points it at: #129.)
 When every account looks out of room, ccx moves the session in place to the
 account a relaunch would have started it on anyway, and says so, because that
 judgement is cached and can be wrong. It never guesses its way onto an account

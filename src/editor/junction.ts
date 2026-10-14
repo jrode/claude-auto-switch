@@ -4,6 +4,7 @@ import { getAccount, listAccounts } from '../accounts/registry.js';
 import { setTarget, removeTarget, isLink, readTarget } from '../daemon/junction.js';
 import { ensureEditorReady } from '../commands/editor-ready.js';
 import { hasWorkingLogin } from '../accounts/account-login.js';
+import { CREDENTIALS_LOCK_DIR, lockDirHeld } from '../claude/locks.js';
 import { configHome, type PathCtx } from '../config/paths.js';
 import type { CliContext } from '../context.js';
 
@@ -78,20 +79,47 @@ export function syncEditorJunctionToActive(context: CliContext): boolean {
   return true;
 }
 
+/** How recently a login lock must have been touched to count as in use: Claude touches its own every 5 s. */
+const LOCK_IN_USE_MS = 10_000;
+/** How long a move of the pointer waits, at most, for a renewal through it to end, and how often it looks. */
+const POINTER_WAIT_MS = 10_000;
+const POINTER_LOOK_MS = 200;
+
 /**
  * Repoint the editor pointer at the active account, but ONLY if the editor is
  * actually set up (the pointer already exists). Safe to call from any switch
  * site; it is a no-op when the editor integration is off.
  *
- * At once, whatever the account's login: one due for renewal may still be
- * renewed by a session moving onto it, since the editor's Claude renews it
- * under the same lock and reads it again there (see renewIdleLogin).
+ * Whatever the account's login: one due for renewal may still be renewed by
+ * a session moving onto it (see renewIdleLogin). But not while a renewal
+ * through the pointer may be running. The editor's Claude takes its lock as
+ * <pointer>/.oauth_refresh.lock and lets it go by removing that same path, so
+ * a pointer moved in between makes it remove the lock of the account moved
+ * to, which a session may have just taken to renew that login. So while the
+ * account the pointer is on has its login lock in use, the move waits,
+ * looking again every POINTER_LOOK_MS on a timer, never holding up whatever
+ * called this, and gives up after POINTER_WAIT_MS, leaving the pointer where
+ * it was until the next switch.
  */
 export function syncEditorPointerIfEnabled(context: CliContext): void {
+  movePointerWhenFree(context, Date.now() + POINTER_WAIT_MS);
+}
+
+function movePointerWhenFree(context: CliContext, giveUpAt: number): void {
   // Never throws: it is called from a running session's poll, where nothing
   // would catch it, and the editor following is not worth ending a session.
   try {
-    if (isLink(editorJunctionPath(context))) syncEditorJunctionToActive(context);
+    const link = editorJunctionPath(context);
+    if (!isLink(link)) return;
+    const from = readTarget(link);
+    const active = getActive(context.ctx);
+    const to = active ? getAccount(active, context.ctx) : undefined;
+    const moving = from !== null && to !== undefined && path.resolve(from) !== path.resolve(to.dir);
+    if (moving && lockDirHeld(path.join(path.resolve(from), CREDENTIALS_LOCK_DIR), LOCK_IN_USE_MS)) {
+      if (Date.now() < giveUpAt) setTimeout(() => movePointerWhenFree(context, giveUpAt), POINTER_LOOK_MS);
+      return;
+    }
+    syncEditorJunctionToActive(context);
   } catch {
     /* the pointer stays as it was until the next switch points it */
   }

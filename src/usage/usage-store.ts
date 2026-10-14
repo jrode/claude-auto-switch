@@ -220,12 +220,18 @@ export async function renewIdleLogin(
   // blind on exactly the accounts it was meant to choose between. The
   // renewal is carried across to them instead.
   // The profile the editor is pointed at may be renewed here. The editor's
-  // Claude reads its login through the pointer from that profile's own folder,
-  // and renews it under <config dir>/.oauth_refresh.lock in that same folder,
-  // the lock this renewal takes, reading it again under the lock and sending
-  // nothing when it changed meanwhile (read from Claude Code 2.1.294 to
-  // 2.1.299). So it takes up a renewal made here instead of being signed out by
-  // it. A profile that SHARES that login is another matter: it has a lock of
+  // Claude renews its login under <pointer>/.oauth_refresh.lock, which is in
+  // that profile's folder, the lock this renewal takes, and reads the login
+  // again under it, sending nothing when it changed meanwhile (read from
+  // Claude Code 2.1.294 to 2.1.299). Where it reads that login from: on
+  // Linux and Windows the profile's own .credentials.json, through the
+  // pointer, so it takes up a renewal made here. On macOS a Keychain item of
+  // its own comes first, named after the pointer's path, which ccx never
+  // writes; until it has saved a login there it reads the profile's file as
+  // elsewhere. Its first save goes into that item and deletes the profile's
+  // file, and from then on it keeps that login whatever the pointer points
+  // at, so the profile no longer holds a copy a renewal here could spend
+  // under it. A profile that SHARES that login is another matter: it has a lock of
   // its own, so renewing it spends the token the editor holds with nothing to
   // keep the two apart, and then carries the result into the editor's folder
   // mid-session. That is still refused while the editor may be using it, the
