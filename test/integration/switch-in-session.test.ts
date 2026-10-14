@@ -22,6 +22,10 @@ import { liveLeases, leasePath } from '../../src/session/lease.js';
 import { saveToken } from '../../src/daemon/token-store.js';
 import type { CliContext } from '../../src/context.js';
 import { dueLogin, freshUsage, renewingTokenEndpoint } from './typeable-claude.js';
+import { useCommand } from '../../src/commands/use.js';
+import { setTarget } from '../../src/daemon/junction.js';
+import { editorLinkPath, editorPointerAccount } from '../../src/editor/junction.js';
+import { listAccounts } from '../../src/accounts/registry.js';
 
 const fakeClaude = fileURLToPath(new URL('../fake-claude/fake-claude.mjs', import.meta.url));
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -607,10 +611,23 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a runnin
    * whole run, so a switch that needs a restart waits and is never made: only
    * a move in place can put the session on B.
    */
-  async function switchToDueLogin(options: { bInUseElsewhere?: boolean } = {}): Promise<{
+  async function switchToDueLogin(
+    options: {
+      bInUseElsewhere?: boolean;
+      /** The editor follows the active account (`ccx editor on`), and is on A. */
+      editorOnA?: boolean;
+      /** Asked as `ccx use B` does, rather than by a request written for this session. */
+      byCcxUse?: boolean;
+      /** Run once the switch has been asked for. */
+      afterAsking?: (home: string, context: CliContext) => Promise<void>;
+      /** How long a renewal that did not happen waits before it is tried again. */
+      retryMs?: number;
+    } = {},
+  ): Promise<{
     runs: RunEntry[];
     home: string;
     renewals: number;
+    context: CliContext;
   }> {
     const home = mkdtempSync(path.join(tmpdir(), 'cas-switch-renew-'));
     const runsLog = path.join(home, 'runs.jsonl');
@@ -635,15 +652,48 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a runnin
         'utf8',
       );
     }
+    if (options.retryMs !== undefined) context.moveRenewalRetryMs = options.retryMs;
     const renewals = renewingTokenEndpoint();
     setActive('A', context.ctx);
+    if (options.editorOnA) setTarget(editorLinkPath(context.ctx), path.join(home, 'profiles', 'A'));
 
     const running = runCommand(context, []);
     await firstLaunch(runsLog);
-    writeSwitchRequest('B', Date.now(), 'seamless', context.ctx, process.pid);
+    if (options.byCcxUse) expect(useCommand(context, 'B')).toBe(0);
+    else writeSwitchRequest('B', Date.now(), 'seamless', context.ctx, process.pid);
+    await options.afterAsking?.(home, context);
     expect(await running).toBe(0);
-    return { runs: readRuns(runsLog), home, renewals: renewals() };
+    return { runs: readRuns(runsLog), home, renewals: renewals(), context };
   }
+
+  it('renews the login before the editor is pointed at it, so `ccx use` still moves the session in place', async () => {
+    // `ccx use B` points the editor at B too. Pointed there first, the editor
+    // may be using B's login, so the session left it alone and restarted.
+    const { runs, renewals, context } = await switchToDueLogin({ editorOnA: true, byCcxUse: true });
+    expect(runs.filter((r) => r.type === 'launch')).toHaveLength(1);
+    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('B');
+    expect(renewals).toBe(1);
+    // And the editor follows, once the login is renewed.
+    expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('B');
+  });
+
+  it('tries the renewal again once the session that was using the login has gone', async () => {
+    const { runs, renewals } = await switchToDueLogin({
+      bInUseElsewhere: true,
+      retryMs: 300,
+      afterAsking: async (home) => {
+        await waitFor(
+          'the renewal to be refused',
+          () => (existsSync(path.join(home, 'events.jsonl')) ? readFileSync(path.join(home, 'events.jsonl'), 'utf8') : ''),
+          (events) => events.includes('another session is using it'),
+        );
+        // That session ends, and gives the login up.
+        rmSync(path.join(home, 'sessions-live', `B__${process.ppid}.json`));
+      },
+    });
+    expect(renewals).toBe(1);
+    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('B');
+  });
 
   it('renews a login that is due, then switches onto it in place rather than restarting Claude', async () => {
     const { runs, renewals } = await switchToDueLogin();

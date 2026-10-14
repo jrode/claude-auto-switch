@@ -624,6 +624,67 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
     );
 
     it(
+      'records a limit met while a switch waits on a renewal against the account that met it',
+      { timeout: 60_000 },
+      async () => {
+        // A switch to B waits on B's renewal, and A runs out meanwhile. The
+        // switch must not move the session before the limit is acted on, or the
+        // limit is put down to B, the account it was moved to.
+        const { home, runsLog, context } = await twoAccounts('cas-limit-during-switch-');
+        dueLogin(path.join(home, 'profiles', 'B'), 'B');
+        freshUsage(home, ['A', 'B']);
+        renewingTokenEndpoint({ delayMs: 3_000 });
+        context.config.resume.auto = false;
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '9000',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1500',
+        });
+
+        const running = runCommand(context, []);
+        await waitFor('the launch', () => launches(readLog(runsLog)), (l) => l.length === 1);
+        writeSwitchRequest('B', Date.now(), 'seamless', context.ctx, process.pid);
+
+        expect(await running).toBe(0);
+        expect(capsIn(home)).toEqual(['A']);
+        const log = readLog(runsLog);
+        expect(launches(log)).toHaveLength(1);
+        expect(log.filter((e) => e.type === 'reread').pop()?.marker).toBe('B');
+        // The limit moved it; the switch, waiting meanwhile, then found it there.
+        const said = eventsIn(home).map((e) => e.msg);
+        expect(said).toContainEqual(expect.stringContaining('"A" hit its limit; moved this session to "B" in place'));
+        expect(said).not.toContainEqual(expect.stringContaining('switching to "B"'));
+      },
+    );
+
+    it(
+      'acts on a limit Claude exits on, though the check also renews the next login',
+      { timeout: 60_000 },
+      async () => {
+        // Claude exits on the limit, and ccx waits at most 12 s for the check.
+        // A slow check, 8 s here, plus a renewal of up to 5 s overran that, and
+        // the limit was dropped: the session ended instead of moving on.
+        const { home, runsLog, context } = await twoAccounts('cas-limit-exit-renewal-');
+        dueLogin(path.join(home, 'profiles', 'B'), 'B');
+        freshUsage(home, ['A', 'B']);
+        renewingTokenEndpoint({ delayMs: 6_000 });
+        context.verifyCap = () => new Promise<Verdict>((resolve) => setTimeout(() => resolve('limited'), 8_000));
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '1500',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '800',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        expect(launches(readLog(runsLog)).map((l) => l.marker)).toEqual(['A', 'B']);
+        expect(capsIn(home)).toContain('A');
+      },
+    );
+
+    it(
       'records no limit against its account when the login that met it is not one ccx has',
       { timeout: 60_000 },
       async () => {

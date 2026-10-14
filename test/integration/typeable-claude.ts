@@ -167,20 +167,20 @@ export function freshUsage(home: string, names: string[]): void {
 /**
  * Anthropic's token endpoint, answering every renewal with a new login, and
  * nothing else on the network: any other request fails. Undone by
- * `vi.unstubAllGlobals()`. Says how many renewals were asked for.
+ * `vi.unstubAllGlobals()`. Says how many renewals were asked for. `delayMs`:
+ * how long each renewal takes to answer.
  */
-export function renewingTokenEndpoint(): () => number {
+export function renewingTokenEndpoint(options: { delayMs?: number } = {}): () => number {
   let renewals = 0;
   vi.stubGlobal('fetch', (input: string | URL | Request) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     if (!url.endsWith('/v1/oauth/token')) return Promise.reject(new Error(`no network in tests: ${url}`));
     renewals += 1;
-    return Promise.resolve(
-      new Response(
-        JSON.stringify({ access_token: `renewed-${renewals}`, refresh_token: `next-${renewals}`, expires_in: 28_800 }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
+    const answer = new Response(
+      JSON.stringify({ access_token: `renewed-${renewals}`, refresh_token: `next-${renewals}`, expires_in: 28_800 }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
     );
+    return new Promise((resolve) => setTimeout(() => resolve(answer), options.delayMs ?? 0));
   });
   return () => renewals;
 }

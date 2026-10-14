@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { refreshCredentialIfExpired } from './oauth-refresh.js';
+import { CREDENTIALS_LOCK_DIR } from '../claude/locks.js';
 import { forgetRefusals } from './dead-login-memo.js';
 import { credentialPath, previousCredentialPath } from '../accounts/credential-vault.js';
 
@@ -277,5 +279,99 @@ describe('refreshCredentialIfExpired', () => {
 
     const notOauth = account(null, { primaryApiKey: 'sk-ant-x' });
     expect((await refreshCredentialIfExpired(notOauth, { now })).status).toBe('unavailable');
+  });
+});
+
+/**
+ * A refresh token works once. Whatever else is renewing the same login, in
+ * this process or another, a renewal must never send a token that has
+ * already been spent.
+ */
+describe('renewing a login something else may be renewing', () => {
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  function counting(): { fetchImpl: typeof fetch; calls: () => number } {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      await sleep(50);
+      return new Response(JSON.stringify({ access_token: 'a-renewed', refresh_token: 'r-renewed', expires_in: 28800 }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+    return { fetchImpl, calls: () => calls };
+  }
+
+  it('never renews without the lock: one held by another process past the wait is reported busy', async () => {
+    const dir = account({ accessToken: 'old', refreshToken: 'r-held', expiresAt: now() - HOUR });
+    // Another process holds Claude's lock on this login, and keeps it.
+    mkdirSync(path.join(dir, CREDENTIALS_LOCK_DIR));
+    const endpoint = counting();
+    const outcome = await refreshCredentialIfExpired(dir, { now, fetchImpl: endpoint.fetchImpl, lockWaitMs: 200 });
+    expect(endpoint.calls()).toBe(0);
+    expect(outcome.status).toBe('busy');
+    expect(JSON.parse(readFileSync(credentialPath(dir), 'utf8')).claudeAiOauth.refreshToken).toBe('r-held');
+  });
+
+  it('reads the login again once it holds the lock, so a renewal made meanwhile is not repeated', async () => {
+    const dir = account({ accessToken: 'old', refreshToken: 'r-raced', expiresAt: now() - HOUR });
+    const ready = path.join(dir, 'other-process-ready');
+    // Another process: takes the lock, renews the login, then lets the lock go.
+    const other = spawn(
+      process.execPath,
+      [
+        '-e',
+        [
+          "const fs = require('node:fs');",
+          'const [lock, file, ready, expiresAt] = process.argv.slice(1);',
+          'fs.mkdirSync(lock);',
+          "fs.writeFileSync(ready, '');",
+          'setTimeout(() => {',
+          "  fs.writeFileSync(file, JSON.stringify({ claudeAiOauth: { accessToken: 'a-other', refreshToken: 'r-other', expiresAt: Number(expiresAt) } }));",
+          '  fs.rmdirSync(lock);',
+          '}, 800);',
+        ].join('\n'),
+        path.join(dir, CREDENTIALS_LOCK_DIR),
+        credentialPath(dir),
+        ready,
+        String(now() + 8 * HOUR),
+      ],
+      { stdio: 'ignore' },
+    );
+    const exited = new Promise((resolve) => other.on('exit', resolve));
+    for (let waited = 0; !existsSync(ready) && waited < 10_000; waited += 20) await sleep(20);
+    expect(existsSync(ready)).toBe(true);
+
+    const endpoint = counting();
+    const outcome = await refreshCredentialIfExpired(dir, { now, fetchImpl: endpoint.fetchImpl, lockWaitMs: 5_000 });
+    await exited;
+    expect(endpoint.calls()).toBe(0);
+    expect(outcome.status).toBe('not-needed');
+    expect(JSON.parse(readFileSync(credentialPath(dir), 'utf8')).claudeAiOauth.refreshToken).toBe('r-other');
+  });
+
+  it('renews a login once when two profiles hold it and both are renewed at the same time', async () => {
+    const first = account({ accessToken: 'old', refreshToken: 'r-shared', expiresAt: now() - HOUR });
+    const second = account({ accessToken: 'old', refreshToken: 'r-shared', expiresAt: now() - HOUR });
+    const endpoint = counting();
+    await Promise.all([
+      refreshCredentialIfExpired(first, { now, fetchImpl: endpoint.fetchImpl }),
+      refreshCredentialIfExpired(second, { now, fetchImpl: endpoint.fetchImpl }),
+    ]);
+    expect(endpoint.calls()).toBe(1);
+  });
+
+  it('gives up on a token request that does not answer, and lets the lock go', async () => {
+    const dir = account({ accessToken: 'old', refreshToken: 'r-slow', expiresAt: now() - HOUR });
+    const silent = ((_url: unknown, init?: { signal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      })) as unknown as typeof fetch;
+    const outcome = await Promise.race([
+      refreshCredentialIfExpired(dir, { now, fetchImpl: silent, requestTimeoutMs: 100 }),
+      sleep(3_000).then(() => 'still waiting' as const),
+    ]);
+    expect(outcome).toMatchObject({ status: 'unavailable' });
+    expect(existsSync(path.join(dir, CREDENTIALS_LOCK_DIR))).toBe(false);
   });
 });

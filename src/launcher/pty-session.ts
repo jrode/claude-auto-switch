@@ -953,8 +953,9 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
         // fallback hold schedules a kill 150ms later, so without this the exit
         // handler finalizes first and a probe resolving afterwards can never
         // replace the unproven two-minute hold with the confirmed window: the
-        // outcome has already resolved. Bounded, because the probe aborts at 8s
-        // and the wait below is timeboxed at 12s.
+        // outcome has already resolved. Bounded: the wait below is timeboxed at
+        // 12s, and a check that takes longer is read as no limit, so the caller
+        // keeps its checks shorter than that (ccx's session: 10 s, renewal included).
         if (switching || noConversation || (cap.isSet() && !verifying)) return finalize();
         const timeboxed = (p: Promise<boolean>): Promise<boolean> =>
           Promise.race([p, new Promise<boolean>((r) => setTimeout(() => r(false), 12_000))]);

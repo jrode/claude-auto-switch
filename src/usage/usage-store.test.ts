@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { refreshUsage, readUsageSnapshot } from './usage-store.js';
+import { refreshUsage, readUsageSnapshot, renewIdleLogin } from './usage-store.js';
+import { renewOneAtATime } from './renew-one-at-a-time.js';
 import type { LimitProbeResult } from './limit-probe.js';
 import { readCredentialEvents } from '../accounts/credential-log.js';
 import { takeLease } from '../session/lease.js';
@@ -49,6 +50,21 @@ describe('refreshUsage', () => {
     expect(snap.accounts['a']?.sevenDayReset).toBe(2_000);
     // Persisted: a fresh read sees the same data.
     expect(readUsageSnapshot(c).accounts['b']?.sevenDay).toBe(0.6);
+  });
+
+  it('writes one renewal down once, when two callers share it', async () => {
+    const { c, accounts } = setup(['a']);
+    const renewal = renewOneAtATime(
+      () => new Promise<{ status: 'refreshed' }>((resolve) => setTimeout(() => resolve({ status: 'refreshed' }), 20)),
+      () => 'the one login',
+    );
+    const renew = (dir: string) => renewal(dir, {});
+    await Promise.all([
+      renewIdleLogin(accounts[0]!, accounts, c, { renew, editorAccount: null }),
+      renewIdleLogin(accounts[0]!, accounts, c, { renew, editorAccount: null }),
+    ]);
+    // Repeats are folded into one entry with a count, so the count is what says it.
+    expect(readCredentialEvents(10, c).map((e) => [e.kind, e.count ?? 1])).toEqual([['renewed', 1]]);
   });
 
   it('records renewals in the credential log, so a lost login is explainable', async () => {

@@ -2,7 +2,8 @@ import { readCredential } from '../accounts/credential-storage.js';
 import path from 'node:path';
 import { acquireLockDir, CREDENTIALS_LOCK_DIR } from '../claude/locks.js';
 import { writeCredential, copyCredential } from '../accounts/credential-storage.js';
-import { credentialPath, previousCredentialPath, isUsableCredential } from '../accounts/credential-vault.js';
+import { credentialPath, credentialFingerprint, previousCredentialPath, isUsableCredential } from '../accounts/credential-vault.js';
+import { renewOneAtATime } from './renew-one-at-a-time.js';
 import { sha256Fingerprint } from '../util/fingerprint.js';
 import { alreadyRefused, refusalReason, rememberRefused } from './dead-login-memo.js';
 import { loginIsKnownDead, deadLoginReason, rememberDeadLogin, forgetDeadLogin } from './dead-login-store.js';
@@ -28,14 +29,19 @@ const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 /** Renew this far ahead of expiry so a session never starts on a dying token. */
 const EXPIRY_BUFFER_MS = 10 * 60_000;
 
-export type RefreshStatus = 'refreshed' | 'not-needed' | 'needs-login' | 'unavailable';
+/** The longest a token request may take before the renewal gives up. */
+const REQUEST_TIMEOUT_MS = 30_000;
+
+/** `busy`: something else holds the login's lock, so nothing was sent; try again shortly. */
+export type RefreshStatus = 'refreshed' | 'not-needed' | 'needs-login' | 'unavailable' | 'busy';
 
 export interface RefreshOutcome {
   status: RefreshStatus;
   detail?: string;
   /**
-   * True when this verdict was remembered rather than newly discovered, so a
-   * caller can report it once instead of on every check.
+   * True when this verdict was remembered rather than newly discovered, or
+   * came from a renewal another caller started, so a caller can report it once
+   * instead of on every check.
    */
   alreadyKnown?: true;
 }
@@ -58,6 +64,10 @@ export interface RefreshOptions {
    * unintended, which is why nothing here defaults to the real config home.
    */
   ctx?: PathCtx;
+  /** How long to wait for the login's lock (default two seconds). */
+  lockWaitMs?: number;
+  /** How long the token request may take (default REQUEST_TIMEOUT_MS). */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -107,29 +117,43 @@ export function expiredLongerThan(
   return expiresAt < now() - graceMs;
 }
 
-/** Renew `accountDir`'s token if it is expired (or about to be). */
-export async function refreshCredentialIfExpired(
-  accountDir: string,
-  options: RefreshOptions = {},
-): Promise<RefreshOutcome> {
-  const now = options.now ?? (() => Date.now());
-  const fetchImpl = options.fetchImpl ?? fetch;
-  const file = credentialPath(accountDir);
+/**
+ * Renew `accountDir`'s token if it is expired (or about to be).
+ *
+ * One at a time per login in this process: a call for a login already being
+ * renewed, from this folder or another profile holding the same login, gets
+ * that renewal's outcome (marked `alreadyKnown`) instead of sending the same
+ * refresh token again. Other processes are kept apart by Claude's lock.
+ */
+export function refreshCredentialIfExpired(accountDir: string, options: RefreshOptions = {}): Promise<RefreshOutcome> {
+  return renewEachLoginOnce(accountDir, options);
+}
 
+const renewEachLoginOnce = renewOneAtATime(
+  (accountDir: string, options: RefreshOptions) => renewIfExpired(accountDir, options),
+  (accountDir) => credentialFingerprint(accountDir),
+);
+
+/** What a stored login says about renewing it: stop with an answer, or renew it. */
+type Assessment =
+  | { renew: false; outcome: RefreshOutcome }
+  | { renew: true; raw: Record<string, unknown>; auth: OauthBlock; refreshToken: string; identity: string };
+
+/** Read `file` and decide whether its login wants renewing. */
+function assess(file: string, now: () => number, ctx: PathCtx | undefined): Assessment {
   let raw: Record<string, unknown>;
   let fileText: string;
   try {
     fileText = readCredential(file);
     raw = JSON.parse(fileText) as Record<string, unknown>;
   } catch {
-    return { status: 'unavailable', detail: 'no readable credential' };
+    return { renew: false, outcome: { status: 'unavailable', detail: 'no readable credential' } };
   }
   const oauth = raw.claudeAiOauth as OauthBlock | undefined;
-  if (!oauth || typeof oauth !== 'object') return { status: 'unavailable', detail: 'not an oauth login' };
-  if (!oauth.refreshToken) return { status: 'needs-login', detail: 'no refresh token stored' };
-  // Captured after the checks above so the nested renewal can rely on them.
-  const auth: OauthBlock = oauth;
-  const refreshToken: string = oauth.refreshToken;
+  if (!oauth || typeof oauth !== 'object') {
+    return { renew: false, outcome: { status: 'unavailable', detail: 'not an oauth login' } };
+  }
+  if (!oauth.refreshToken) return { renew: false, outcome: { status: 'needs-login', detail: 'no refresh token stored' } };
 
   // A dead grant stays dead until this file changes, and only signing in again
   // changes it. Asking the token endpoint a second time cannot get a different
@@ -146,22 +170,33 @@ export async function refreshCredentialIfExpired(
   // Known dead in THIS process, or recorded by an earlier one. The second half
   // is what a fresh start needs: without it every new session spends a request
   // rediscovering a refusal that is already written down.
-  const ctx = options.ctx;
   if (alreadyRefused(identity) || (ctx && loginIsKnownDead(identity, ctx))) {
     return {
-      status: 'needs-login',
-      detail:
-        refusalReason(identity) ??
-        (ctx ? deadLoginReason(identity, ctx) : undefined) ??
-        'renewal was already refused for this login',
-      alreadyKnown: true,
+      renew: false,
+      outcome: {
+        status: 'needs-login',
+        detail:
+          refusalReason(identity) ??
+          (ctx ? deadLoginReason(identity, ctx) : undefined) ??
+          'renewal was already refused for this login',
+        alreadyKnown: true,
+      },
     };
   }
 
   const expiresAt = typeof oauth.expiresAt === 'number' ? oauth.expiresAt : 0;
-  if (expiresAt > now() + EXPIRY_BUFFER_MS && oauth.accessToken) {
-    return { status: 'not-needed' };
-  }
+  if (expiresAt > now() + EXPIRY_BUFFER_MS && oauth.accessToken) return { renew: false, outcome: { status: 'not-needed' } };
+  return { renew: true, raw, auth: oauth, refreshToken: oauth.refreshToken, identity };
+}
+
+async function renewIfExpired(accountDir: string, options: RefreshOptions): Promise<RefreshOutcome> {
+  const now = options.now ?? (() => Date.now());
+  const file = credentialPath(accountDir);
+  const ctx = options.ctx;
+
+  // Looked at first without the lock, so a login with nothing to do never waits for it.
+  const before = assess(file, now, ctx);
+  if (!before.renew) return before.outcome;
 
   // Renewing rotates the token: the one Claude may be holding stops working the
   // moment ours is issued. Claude coordinates its own renewals through this
@@ -170,90 +205,131 @@ export async function refreshCredentialIfExpired(
   // the same login at the same time and whichever finishes second is left
   // holding a token the server has already retired, which is a sign-in prompt
   // out of nowhere.
-  const lock = acquireLockDir(path.join(accountDir, CREDENTIALS_LOCK_DIR));
+  //
+  // Never without it: a renewal that cannot get the lock is told something else
+  // is renewing this login right now, and sends nothing.
+  const lock = acquireLockDir(path.join(accountDir, CREDENTIALS_LOCK_DIR), {
+    ...(options.lockWaitMs !== undefined ? { waitMs: options.lockWaitMs } : {}),
+  });
+  if (!lock.held) return { status: 'busy', detail: 'something else is renewing this login' };
   try {
-    return await performRenewal();
+    // Read again now the lock is held: whoever held it before may have renewed
+    // this login meanwhile, and the token read above is then spent.
+    const underLock = assess(file, now, ctx);
+    if (!underLock.renew) return underLock.outcome;
+    return await performRenewal(accountDir, options, underLock);
   } finally {
     lock.release();
   }
+}
 
-  async function performRenewal(): Promise<RefreshOutcome> {
-  let response: Response;
+/** Ask the token endpoint to renew the login just read under the lock, and save the new one. */
+async function performRenewal(
+  accountDir: string,
+  options: RefreshOptions,
+  { raw, auth, refreshToken, identity }: Extract<Assessment, { renew: true }>,
+): Promise<RefreshOutcome> {
+  const now = options.now ?? (() => Date.now());
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const file = credentialPath(accountDir);
+  const ctx = options.ctx;
+  // Bounded, so a request that never answers cannot hold the lock, and a move
+  // waiting on it, for good. Generous, because a renewal the server made but
+  // this side gave up on is lost with the token it spent.
+  const timeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+  const controller = new AbortController();
+  const gaveUp = new Promise<never>((_resolve, reject) => {
+    controller.signal.addEventListener('abort', () =>
+      reject(new Error(`the token endpoint did not answer within ${Math.round(timeoutMs / 1000)}s`)),
+    );
+  });
+  // Handled here so that a deadline nobody is waiting on any more is not an unhandled rejection.
+  gaveUp.catch(() => undefined);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  const inTime = <T>(step: Promise<T>): Promise<T> => Promise.race([step, gaveUp]);
   try {
-    response = await fetchImpl(options.tokenUrl ?? TOKEN_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'refresh_token',
-        refresh_token: refreshToken,
-        client_id: options.clientId ?? CLIENT_ID,
-      }),
-    });
-  } catch (err) {
-    return { status: 'unavailable', detail: (err as Error).message };
-  }
-
-  if (!response.ok) {
-    let body = '';
+    let response: Response;
     try {
-      body = (await response.text()).slice(0, 200);
-    } catch {
-      /* body is optional context */
+      response = await inTime(
+        fetchImpl(options.tokenUrl ?? TOKEN_URL, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            grant_type: 'refresh_token',
+            refresh_token: refreshToken,
+            client_id: options.clientId ?? CLIENT_ID,
+          }),
+          signal: controller.signal,
+        }),
+      );
+    } catch (err) {
+      return { status: 'unavailable', detail: (err as Error).message };
     }
-    // Ask the operator to sign in again on anything that looks like a rejected
-    // login, so a real one is never silently treated as a network blip.
-    const dead = /invalid_grant|invalid_request|unauthorized/i.test(body) || response.status === 401;
-    const detail = `token endpoint ${response.status}${body ? `: ${body}` : ''}`;
-    // REMEMBERING is a stricter question than reporting, and deliberately so.
-    // Only invalid_grant means the server has rejected this refresh token
-    // itself. `invalid_request` describes a malformed request, which is our bug
-    // rather than a finished login, and a bare 401 can be a client-auth or
-    // transient failure. Recording either would outlast the moment: the note
-    // survives the process and makes the status line say "needs sign-in" until
-    // the credential file changes, so a blip would bench a working account
-    // until someone signed in again for no reason.
-    const refreshTokenRejected = /\binvalid_grant\b/i.test(body);
-    if (refreshTokenRejected) {
-      rememberRefused(identity, detail);
-      // Written down as well, so a later process knows before it acts.
-      if (ctx) rememberDeadLogin(identity, detail, ctx);
+
+    if (!response.ok) {
+      let body = '';
+      try {
+        body = (await inTime(response.text())).slice(0, 200);
+      } catch {
+        /* body is optional context */
+      }
+      // Ask the operator to sign in again on anything that looks like a rejected
+      // login, so a real one is never silently treated as a network blip.
+      const dead = /invalid_grant|invalid_request|unauthorized/i.test(body) || response.status === 401;
+      const detail = `token endpoint ${response.status}${body ? `: ${body}` : ''}`;
+      // REMEMBERING is a stricter question than reporting, and deliberately so.
+      // Only invalid_grant means the server has rejected this refresh token
+      // itself. `invalid_request` describes a malformed request, which is our bug
+      // rather than a finished login, and a bare 401 can be a client-auth or
+      // transient failure. Recording either would outlast the moment: the note
+      // survives the process and makes the status line say "needs sign-in" until
+      // the credential file changes, so a blip would bench a working account
+      // until someone signed in again for no reason.
+      const refreshTokenRejected = /\binvalid_grant\b/i.test(body);
+      if (refreshTokenRejected) {
+        rememberRefused(identity, detail);
+        // Written down as well, so a later process knows before it acts.
+        if (ctx) rememberDeadLogin(identity, detail, ctx);
+      }
+      return { status: dead ? 'needs-login' : 'unavailable', detail };
     }
-    return { status: dead ? 'needs-login' : 'unavailable', detail };
-  }
 
-  let payload: { access_token?: string; refresh_token?: string; expires_in?: number };
-  try {
-    payload = (await response.json()) as typeof payload;
-  } catch (err) {
-    return { status: 'unavailable', detail: `unreadable token response: ${(err as Error).message}` };
-  }
-  if (!payload.access_token) return { status: 'unavailable', detail: 'token response had no access token' };
-
-  // Keep the previous generation, then write the renewal atomically. The new
-  // refresh token replaces the old one, which the server has now invalidated,
-  // so losing this write would lose the account: it happens immediately.
-  if (isUsableCredential(file)) {
+    let payload: { access_token?: string; refresh_token?: string; expires_in?: number };
     try {
-      copyCredential(file, previousCredentialPath(accountDir));
-    } catch {
-      /* the cushion is best effort */
+      payload = (await inTime(response.json())) as typeof payload;
+    } catch (err) {
+      return { status: 'unavailable', detail: `unreadable token response: ${(err as Error).message}` };
     }
-  }
-  const updated: Record<string, unknown> = {
-    ...raw,
-    claudeAiOauth: {
-      ...auth,
-      accessToken: payload.access_token,
-      ...(payload.refresh_token ? { refreshToken: payload.refresh_token } : {}),
-      ...(payload.expires_in ? { expiresAt: now() + payload.expires_in * 1000 } : {}),
-    },
-  };
-  writeCredential(file, JSON.stringify(updated));
-  // A credential that just renewed is demonstrably alive, so make sure no note
-  // says otherwise. It should never be there, and that is the point: this
-  // guarantees a stale note can never hold down a login that works.
-  if (ctx) forgetDeadLogin(sha256Fingerprint(JSON.stringify(updated)), ctx);
-  return { status: 'refreshed' };
+    if (!payload.access_token) return { status: 'unavailable', detail: 'token response had no access token' };
+
+    // Keep the previous generation, then write the renewal atomically. The new
+    // refresh token replaces the old one, which the server has now invalidated,
+    // so losing this write would lose the account: it happens immediately.
+    if (isUsableCredential(file)) {
+      try {
+        copyCredential(file, previousCredentialPath(accountDir));
+      } catch {
+        /* the cushion is best effort */
+      }
+    }
+    const updated: Record<string, unknown> = {
+      ...raw,
+      claudeAiOauth: {
+        ...auth,
+        accessToken: payload.access_token,
+        ...(payload.refresh_token ? { refreshToken: payload.refresh_token } : {}),
+        ...(payload.expires_in ? { expiresAt: now() + payload.expires_in * 1000 } : {}),
+      },
+    };
+    writeCredential(file, JSON.stringify(updated));
+    // A credential that just renewed is demonstrably alive, so make sure no note
+    // says otherwise. It should never be there, and that is the point: this
+    // guarantees a stale note can never hold down a login that works.
+    if (ctx) forgetDeadLogin(sha256Fingerprint(JSON.stringify(updated)), ctx);
+    return { status: 'refreshed' };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

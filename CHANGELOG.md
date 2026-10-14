@@ -30,15 +30,24 @@ semantic versioning.
   for an Artifact call already did. It still never renews a login another
   session or your editor may be using, because renewing replaces the login
   and signs them out; then the switch waits for a restart as before, and
-  `ccx history` says why. After a limit, ccx waits at most five seconds for
-  the renewal; a slower one finishes by itself, and the session moves where
-  it can without it.
-- **A session no longer renews one login twice at once.** Its usage
-  refresher, a start, a move and an Artifact visit could each renew the same
-  login at the same moment. A refresh token works once, so the second renewal would be
-  refused and read as a login that needs signing in again. Within a session,
-  a renewal of a login already being renewed now waits for that one and gets
-  its result. Found while adding the renewals above; not seen happen.
+  `ccx history` says why. A renewal that could not be made, because another
+  session was using the login or the renewal failed, is tried again after 20
+  seconds while the switch waits. With the editor following the active
+  account (`ccx editor on`), a switch renews a due login before it points
+  the editor there: an editor pointed at it first may be using it. After a
+  limit, ccx waits at most five seconds for the renewal, and less when the
+  check that found the limit was slow; a slower renewal finishes by itself,
+  and the session moves where it can without it.
+- **A login is never renewed twice at once.** A refresh token works once, so
+  a second renewal of the same login is refused, and reads as a login that
+  needs signing in again. Within one process, a renewal of a login already
+  being renewed, from the same profile or another holding the same login,
+  now gets that renewal's result. Between processes, ccx took Claude's lock
+  but read the token before taking it, and went ahead without the lock after
+  two seconds; it now reads the login again once it holds the lock, and
+  sends nothing when it cannot get it. A token request that gets no answer
+  is given up after 30 seconds rather than holding the lock. Found while
+  adding the renewals above; not seen happen.
 
 ### Fixed
 

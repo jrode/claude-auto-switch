@@ -11,7 +11,7 @@ import { liveLeases, type LeaseOptions, type SessionLease } from '../session/lea
 import { probeUsage, type LimitProbeResult } from './limit-probe.js';
 import { learnWindowCost } from './runway.js';
 import { refreshCredentialIfExpired, renewalIsDue, expiredLongerThan, type RefreshOutcome } from './oauth-refresh.js';
-import { editorPointerAccount } from '../editor/junction.js';
+import { editorPointerAccount } from '../editor/pointer.js';
 
 /**
  * Cached per-account subscription usage (5h/7d utilization + resets), fetched
@@ -274,7 +274,8 @@ export async function renewIdleLogin(
         renew(account.dir),
       )
     : { result: { status: 'not-needed' as const }, carried: [] as string[] };
-  if (renewal.status === 'refreshed') {
+  // A renewal another caller started is logged by that caller.
+  if (renewal.status === 'refreshed' && !renewal.alreadyKnown) {
     logCredentialEvent({ account: account.name, kind: 'renewed' }, c);
     for (const name of carried) {
       logCredentialEvent(

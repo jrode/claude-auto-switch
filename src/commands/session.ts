@@ -141,7 +141,6 @@ import { holdBackOf } from '../dashboard/rotation-settings.js';
 import { activateWithLease, finishWithLease } from '../session/handoff.js';
 import { ensureLoginUsable, readinessMessage } from '../session/preflight.js';
 import { renewalIsDue, refreshCredentialIfExpired } from '../usage/oauth-refresh.js';
-import { renewOneAtATime } from '../usage/renew-one-at-a-time.js';
 import { withCredentialLock, withCredentialLockIfFree, acquireLockDir } from '../claude/locks.js';
 import { logCredentialEvent } from '../accounts/credential-log.js';
 import { appendEvent, type EventDetail } from '../events/log.js';
@@ -153,9 +152,17 @@ const CREDS = '.credentials.json';
 const CAP_DECIDING_MS = 60_000;
 /** How long a confirmed usage limit waits, at most, for the login it moves the session onto to be renewed. */
 const RELIEF_RENEWAL_WAIT_MS = 5_000;
+/**
+ * The longest a limit check may take, the renewal it may add included. Under
+ * the 12 s the pseudo-terminal session waits for a check once Claude has
+ * exited, past which the limit is dropped and the session ends.
+ */
+const CHECK_BUDGET_MS = 10_000;
 
 /** What became of renewing an account's login so a session could be moved onto it in place. */
-type MoveRenewal = { ok: true } | { ok: false; why: 'in-use' | 'editor' | 'needs-login' | 'failed'; detail: string };
+type MoveRenewal =
+  | { ok: true }
+  | { ok: false; why: 'in-use' | 'editor' | 'needs-login' | 'busy' | 'failed'; detail: string };
 
 /** `promise`'s value, or null once `ms` have passed first or when it fails. */
 function within<T>(promise: Promise<T>, ms: number): Promise<T | null> {
@@ -1150,9 +1157,23 @@ export async function runInteractiveHotSwap(
    */
   let capChecks = 0;
   let capConfirmedAt: number | null = null;
+  /**
+   * The account a confirmed limit was met on, kept until the limit has been
+   * acted on: a move made meanwhile changes `current`, and the limit must not
+   * then be put down to the account the session was moved to.
+   */
+  let limitMetOn: string | null = null;
+  /**
+   * Whether a usage limit is being checked, or has been confirmed and not yet
+   * acted on. Bounded, so a confirmed limit nothing acts on cannot hold every
+   * other move back for the rest of the run. Nothing else moves the session
+   * meanwhile: acting on the limit moves it, and must not find it moved.
+   */
+  const limitBeingDecided = (): boolean =>
+    capChecks > 0 || (capConfirmedAt !== null && Date.now() - capConfirmedAt < CAP_DECIDING_MS);
 
-  /** Every renewal this session makes, of any login, one at a time per login. */
-  const renewLogin = renewOneAtATime((dir) => refreshCredentialIfExpired(dir, { ctx: context.ctx }));
+  /** Every renewal this session makes, of any login; one at a time per login (see oauth-refresh). */
+  const renewLogin = (dir: string) => refreshCredentialIfExpired(dir, { ctx: context.ctx });
 
   /**
    * Renew `account`'s login so this session can be moved onto it in place, by
@@ -1166,7 +1187,7 @@ export async function runInteractiveHotSwap(
     if (renewal.status === 'refreshed' || renewal.status === 'not-needed') return { ok: true };
     return {
       ok: false,
-      why: renewal.status === 'needs-login' ? 'needs-login' : 'failed',
+      why: renewal.status === 'needs-login' ? 'needs-login' : renewal.status === 'busy' ? 'busy' : 'failed',
       detail: renewal.detail ?? 'no answer',
     };
   };
@@ -1179,7 +1200,9 @@ export async function runInteractiveHotSwap(
         ? 'your editor may be using it, so ccx does not renew it from here'
         : result.why === 'needs-login'
           ? `it needs signing in again (ccx login ${account.name})`
-          : `it could not be renewed just now (${result.detail})`;
+          : result.why === 'busy'
+            ? 'something else is renewing it right now'
+            : `it could not be renewed just now (${result.detail})`;
 
   /**
    * Whether the login under a running Claude can be replaced with `target`'s:
@@ -1207,23 +1230,40 @@ export async function runInteractiveHotSwap(
 
   /**
    * A login being renewed so that a requested switch can go under the running
-   * Claude: whose, for which request, and how it came out once it has.
+   * Claude: whose, for which request, how it came out once it has, and when.
    */
-  let switchRenewal: { account: string; requestAt: number; result: MoveRenewal | null } | null = null;
-  const startSwitchRenewal = (target: Account, requestAt: number): void => {
-    const renewing = { account: target.name, requestAt, result: null as MoveRenewal | null };
+  let switchRenewal: {
+    account: string;
+    requestAt: number;
+    result: MoveRenewal | null;
+    endedAt: number;
+  } | null = null;
+  /**
+   * How long a renewal that did not happen is left before the same request
+   * tries it again: a session using the login can end, an outage can pass.
+   * One that found something else renewing the login right now is tried again
+   * sooner, since that is over in seconds.
+   */
+  const moveRenewalRetryMs = (): number => context.moveRenewalRetryMs ?? 20_000;
+  const switchRenewalDue = (renewing: NonNullable<typeof switchRenewal>, now: number): boolean =>
+    renewing.result !== null &&
+    !renewing.result.ok &&
+    now - renewing.endedAt >= (renewing.result.why === 'busy' ? 2_000 : moveRenewalRetryMs());
+  const startSwitchRenewal = (target: Account, requestAt: number, again: boolean): void => {
+    const renewing = { account: target.name, requestAt, result: null as MoveRenewal | null, endedAt: 0 };
     switchRenewal = renewing;
-    notice(`renewing the "${target.name}" login first, to move this session onto it in place`, {
-      kind: 'renewal',
-      data: { account: target.name, for: 'switch' },
-    });
-    void renewBeforeMove(target).then(
-      (result) => {
-        renewing.result = result;
-      },
-      (error: unknown) => {
-        renewing.result = { ok: false, why: 'failed', detail: thrownReason(error) };
-      },
+    if (!again) {
+      notice(`renewing the "${target.name}" login first, to move this session onto it in place`, {
+        kind: 'renewal',
+        data: { account: target.name, for: 'switch' },
+      });
+    }
+    const settle = (result: MoveRenewal): void => {
+      renewing.result = result;
+      renewing.endedAt = Date.now();
+    };
+    void renewBeforeMove(target).then(settle, (error: unknown) =>
+      settle({ ok: false, why: 'failed', detail: thrownReason(error) }),
     );
   };
 
@@ -1287,9 +1327,7 @@ export async function runInteractiveHotSwap(
             'the one ccx started it on, so ccx cannot vouch for which account a call goes out as, and nothing was sent',
         };
       }
-      // Bounded, so a confirmed limit nothing acts on cannot hold visits back for the rest of the run.
-      const deciding = capConfirmedAt !== null && Date.now() - capConfirmedAt < CAP_DECIDING_MS;
-      return capChecks > 0 || deciding ? 'busy' : 'free';
+      return limitBeingDecided() ? 'busy' : 'free';
     },
     log: (message, data) =>
       logEvent(message, { kind: 'artifact-hop', data }),
@@ -1317,15 +1355,17 @@ export async function runInteractiveHotSwap(
    */
   const verifyCap = async (renderedText: string): Promise<boolean> => {
     if (hop.away()) return false;
+    const startedAt = Date.now();
     capChecks += 1;
     try {
       const limited = await askAccountAboutCap(renderedText);
       if (limited) {
         capConfirmedAt = Date.now();
+        limitMetOn = capOwner ?? current?.name ?? null;
         // Only a help to the move: a failure here must not unsay the limit,
         // since a check that throws is read as one that found none.
         try {
-          await renewForRelief();
+          await renewForRelief(CHECK_BUDGET_MS - (Date.now() - startedAt));
         } catch (error) {
           logEvent(`could not prepare this session's move after a limit: ${thrownReason(error)}`, {
             kind: 'renewal',
@@ -1344,25 +1384,37 @@ export async function runInteractiveHotSwap(
    * has a login due for renewal, renew it now, so that the move, which is made
    * without waiting (onCapConfirmed), can go there rather than be left to a
    * relaunch. Done here because this check is the step a limit may wait on.
-   * Bounded: a renewal still running then finishes by itself, and the move
-   * goes wherever it can without it.
+   * Bounded by `leftMs`, what is left of the check's time: a renewal still
+   * running then finishes by itself, and the move goes wherever it can without
+   * it.
    */
-  const renewForRelief = async (): Promise<void> => {
+  const renewForRelief = async (leftMs: number): Promise<void> => {
     // A worker's limit ends its launch, and a limit on one model is not moved
     // in place either (see onCapConfirmed).
     if (worker || limitedModel !== undefined) return;
-    const capName = capOwner ?? current?.name;
+    const capName = limitMetOn;
     if (!capName) return;
     const launchedWithToken = tokenAccount !== null;
     const plan = reliefPlan(capName, launchedWithToken, true);
     if (!plan || inPlaceReadiness(plan.account, launchedWithToken) !== 'renew') return;
     const to = plan.account;
-    const result = await within(renewBeforeMove(to), RELIEF_RENEWAL_WAIT_MS);
+    const waitMs = Math.min(RELIEF_RENEWAL_WAIT_MS, leftMs);
+    const result =
+      waitMs > 0
+        ? await within(
+            renewBeforeMove(to).catch((error: unknown): MoveRenewal => ({
+              ok: false,
+              why: 'failed',
+              detail: thrownReason(error),
+            })),
+            waitMs,
+          )
+        : null;
     logEvent(
       result?.ok
         ? `renewed the "${to.name}" login first, to move this session onto it in place`
         : `could not renew the "${to.name}" login to move this session onto it in place: ${
-            result ? renewalWithheld(to, result) : `it took longer than ${RELIEF_RENEWAL_WAIT_MS / 1000}s`
+            result ? renewalWithheld(to, result) : 'there was no time left for it'
           }`,
       { kind: 'renewal', data: { account: to.name, for: 'limit', ok: result?.ok ?? false } },
     );
@@ -1487,11 +1539,12 @@ export async function runInteractiveHotSwap(
    *
    * An account with room on the model the session is running comes first. When
    * there is none because every account looks out of room, judged by the pick
-   * the relaunch path would make (pickAccount), the session goes where that
-   * path would start it anyway (startAnyway), moved there in place, and
-   * `anyway` says so. Never onto an account this session has itself seen run
-   * out while that limit lasts: that is not a guess, and two accounts that are
-   * both out would pass the session back and forth.
+   * the relaunch path would make (pickAccount, leaving out what the swap loop
+   * set aside when it last picked), the session goes where that path would
+   * start it anyway (startAnyway), moved there in place, and `anyway` says so.
+   * Never onto an account this session has itself seen run out while that
+   * limit lasts: that is not a guess, and two accounts that are both out would
+   * pass the session back and forth.
    *
    * `renewable` counts an account whose login is due for renewal as one the
    * session can be moved onto, its login renewed first; without it, only one
@@ -1530,8 +1583,8 @@ export async function runInteractiveHotSwap(
       );
     const roomy = withRoomOnRunningModel(healthy, now);
     if (roomy) return { account: roomy, anyway: null };
-    if (pickAccount(new Set([capName, ...deadLogins()]), { quiet: true }) !== null) return null;
-    const guess = startAnyway(new Set([capName, ...seenOutNow(now)]), canTake);
+    if (pickAccount(new Set([capName, ...setAside, ...deadLogins()]), { quiet: true }) !== null) return null;
+    const guess = startAnyway(new Set([capName, ...setAside, ...seenOutNow(now)]), canTake);
     const account = guess ? accounts.find((a) => a.name === guess.account.name) : undefined;
     return guess && account ? { account, anyway: guess.message } : null;
   };
@@ -1551,6 +1604,12 @@ export async function runInteractiveHotSwap(
       return null;
     }
   };
+
+  /**
+   * What the swap loop set aside when it last asked for an account: those that
+   * ran out in this run, were found signed out, or are held off a while.
+   */
+  let setAside = new Set<string>();
 
   /** Accounts whose stored login the token endpoint has refused, which no wait repairs. */
   const deadLogins = (): string[] =>
@@ -1756,6 +1815,7 @@ export async function runInteractiveHotSwap(
     // each other's picks and spread out, rather than each reading the leases
     // before any has written one and all picking the same account.
     nextAccount: (excluding) => {
+      setAside = new Set(excluding);
       // An ended worker picks and claims nothing more: the start that follows
       // ends the run, whatever account it is handed.
       if (interruption?.exitCode != null) return { name: current?.name ?? '', dir: current?.dir ?? '' };
@@ -1768,7 +1828,7 @@ export async function runInteractiveHotSwap(
     // The account the session is ACTUALLY on right now: a seamless swap may
     // have moved it, and a verified limit may have turned out to belong to the
     // account the session was really signed in as. Caps are attributed here.
-    currentAccount: () => capOwner ?? current?.name ?? '',
+    currentAccount: () => limitMetOn ?? capOwner ?? current?.name ?? '',
     // Every account has hit a limit. If those limits are about ONE MODEL, the
     // session still works on another model, so start it and say which model is
     // out. Refusing here is what made a Fable limit look like being signed out.
@@ -1781,6 +1841,8 @@ export async function runInteractiveHotSwap(
       if (interruption?.exitCode != null) return { kind: 'ok', exitCode: interruption.exitCode };
       const account = accounts.find((a) => a.name === hotAccount.name);
       if (!account) return { kind: 'ok', exitCode: 1 };
+      // The swap loop has recorded the last launch's limit by now.
+      limitMetOn = null;
       // A new child on a new account. Whatever refusals were adding up belonged
       // to the last one, and carrying them over would escalate here on evidence
       // gathered somewhere else.
@@ -1911,6 +1973,8 @@ export async function runInteractiveHotSwap(
         // while one is held or being prepared every other move waits for the
         // session to be back: the request stays where it is.
         if (hop.poll()) return null;
+        // So does a usage limit being decided: the request waits for it.
+        if (limitBeingDecided()) return null;
         // A request can name an account added since this session started.
         refreshAccounts();
         // This session's OWN request (written by `ccx use --session <pid>` or
@@ -1949,14 +2013,18 @@ export async function runInteractiveHotSwap(
         if (readiness === 'renew') {
           // Renewed first, while this look returns at once: a later look
           // makes the move. The request stays where it is until then, so it
-          // is acted on once, and the renewal is started once for it.
+          // is acted on once, and the renewal is started once for it, and
+          // again after a while when it did not happen.
           const renewing = switchRenewal;
           const requestAt = request?.at ?? 0;
-          if (renewing === null || renewing.account !== target.name || renewing.requestAt !== requestAt) {
-            startSwitchRenewal(target, requestAt);
+          const forThisRequest = renewing !== null && renewing.account === target.name && renewing.requestAt === requestAt;
+          if (!forThisRequest || switchRenewalDue(renewing, Date.now())) {
+            startSwitchRenewal(target, requestAt, forThisRequest);
             return null;
           }
           if (renewing.result === null) return null;
+          // Something else is renewing it this moment: waited out, not restarted for.
+          if (!renewing.result.ok && renewing.result.why === 'busy') return null;
           refusal =
             `"${target.name}" needs its login renewed before it can go under a running Claude, and ` +
             (renewing.result.ok ? 'it was still due after renewing it' : renewalWithheld(target, renewing.result));
@@ -2013,7 +2081,8 @@ export async function runInteractiveHotSwap(
        * session has running.
        */
       const onCapConfirmed = (hit: { reason?: string; resetAt?: number }, opts: CapContext): CapDecision => {
-        const capName = capOwner ?? current?.name ?? account.name;
+        // Whose limit it is was settled when it was confirmed (see limitMetOn).
+        const capName = limitMetOn ?? capOwner ?? current?.name ?? account.name;
         capConfirmedAt = null;
 
         const carryOn = relaunchPrompt();
@@ -2091,6 +2160,7 @@ export async function runInteractiveHotSwap(
             // main thread's.
             limitedModel = undefined;
             limitedResetAt = undefined;
+            limitMetOn = null;
             return { kind: 'left' };
           }
           if (opts.relieve && limitedModel === undefined && relaunchForPrompt) {
@@ -2102,6 +2172,8 @@ export async function runInteractiveHotSwap(
           return { kind: 'restart' };
         }
 
+        // Acted on, here: what the session is on from now is its own.
+        limitMetOn = null;
         // Auto-rotation, not a targeted user switch: the global active account
         // and the editor pointer SHOULD follow, same as the swap loop's own moves.
         if (!worker) {
