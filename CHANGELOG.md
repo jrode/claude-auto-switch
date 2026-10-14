@@ -46,8 +46,9 @@ semantic versioning.
   it has saved a login of its own in the Keychain, after which it no longer
   follows the pointer (#129). Because it takes and lets go of that lock
   through the pointer, the pointer is not moved while the lock in the
-  account it is on is in use: it waits, up to ten seconds, without holding
-  anything up. A profile that shares its login with the one the editor is on
+  account it is on is in use: it waits up to ten seconds, then moves it
+  anyway. A running session goes on meanwhile, but `ccx use`, swap, rotate,
+  run and auto stay open until the pointer has moved. A profile that shares its login with the one the editor is on
   has a lock of its own, so it is still not renewed while the editor may be
   using it. No command that
   ends when it has printed renews anything. After a limit, ccx waits at most

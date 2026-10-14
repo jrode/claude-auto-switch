@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { CliContext } from '../context.js';
@@ -85,6 +85,31 @@ describe('pointing the editor at the active account', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('B');
+  });
+
+  it('moves the pointer anyway when its wait ends with the lock still in use', async () => {
+    // Nothing else would move it, so the editor would stay on the old account.
+    const { home, context } = await editorOn(['A', 'B']);
+    const lock = path.join(home, 'profiles', 'A', CREDENTIALS_LOCK_DIR);
+    mkdirSync(lock);
+    vi.useFakeTimers();
+    try {
+      setActive('B', context.ctx);
+      syncEditorPointerIfEnabled(context);
+      // Touched at every step, as Claude touches its own, so it is in use throughout.
+      for (let waited = 0; waited < 9_600; waited += 200) {
+        utimesSync(lock, new Date(), new Date());
+        vi.advanceTimersByTime(200);
+      }
+      expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('A');
+      for (let waited = 9_600; waited < 10_400; waited += 200) {
+        utimesSync(lock, new Date(), new Date());
+        vi.advanceTimersByTime(200);
+      }
+      expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('B');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('never throws, and leaves the pointer alone, when the file naming the active account cannot be read', async () => {

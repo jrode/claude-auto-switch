@@ -97,9 +97,11 @@ const POINTER_LOOK_MS = 200;
  * a pointer moved in between makes it remove the lock of the account moved
  * to, which a session may have just taken to renew that login. So while the
  * account the pointer is on has its login lock in use, the move waits,
- * looking again every POINTER_LOOK_MS on a timer, never holding up whatever
- * called this, and gives up after POINTER_WAIT_MS, leaving the pointer where
- * it was until the next switch.
+ * looking again every POINTER_LOOK_MS on a timer. This returns at once, but
+ * the timer keeps a short-lived command such as `ccx use` running until the
+ * pointer has moved. After POINTER_WAIT_MS the pointer moves anyway, since
+ * nothing else would move it later; the race then needs a lock held longer
+ * than that as well.
  */
 export function syncEditorPointerIfEnabled(context: CliContext): void {
   movePointerWhenFree(context, Date.now() + POINTER_WAIT_MS);
@@ -115,8 +117,12 @@ function movePointerWhenFree(context: CliContext, giveUpAt: number): void {
     const active = getActive(context.ctx);
     const to = active ? getAccount(active, context.ctx) : undefined;
     const moving = from !== null && to !== undefined && path.resolve(from) !== path.resolve(to.dir);
-    if (moving && lockDirHeld(path.join(path.resolve(from), CREDENTIALS_LOCK_DIR), LOCK_IN_USE_MS)) {
-      if (Date.now() < giveUpAt) setTimeout(() => movePointerWhenFree(context, giveUpAt), POINTER_LOOK_MS);
+    if (
+      moving &&
+      Date.now() < giveUpAt &&
+      lockDirHeld(path.join(path.resolve(from), CREDENTIALS_LOCK_DIR), LOCK_IN_USE_MS)
+    ) {
+      setTimeout(() => movePointerWhenFree(context, giveUpAt), POINTER_LOOK_MS);
       return;
     }
     syncEditorJunctionToActive(context);
