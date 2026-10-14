@@ -1230,27 +1230,31 @@ export async function runInteractiveHotSwap(
 
   /**
    * A login being renewed so that a requested switch can go under the running
-   * Claude: whose, for which request, how it came out once it has, and when.
+   * Claude: whose, for which request, how it came out once it has, and when,
+   * and whether a look has acted on that yet.
    */
   let switchRenewal: {
     account: string;
     requestAt: number;
     result: MoveRenewal | null;
     endedAt: number;
+    actedOn: boolean;
   } | null = null;
   /**
    * How long a renewal that did not happen is left before the same request
    * tries it again: a session using the login can end, an outage can pass.
    * One that found something else renewing the login right now is tried again
-   * sooner, since that is over in seconds.
+   * sooner, since that is over in seconds. Never before a look has acted on
+   * the result, so the reason is said, however short the wait.
    */
   const moveRenewalRetryMs = (): number => context.moveRenewalRetryMs ?? 20_000;
   const switchRenewalDue = (renewing: NonNullable<typeof switchRenewal>, now: number): boolean =>
+    renewing.actedOn &&
     renewing.result !== null &&
     !renewing.result.ok &&
     now - renewing.endedAt >= (renewing.result.why === 'busy' ? 2_000 : moveRenewalRetryMs());
   const startSwitchRenewal = (target: Account, requestAt: number, again: boolean): void => {
-    const renewing = { account: target.name, requestAt, result: null as MoveRenewal | null, endedAt: 0 };
+    const renewing = { account: target.name, requestAt, result: null as MoveRenewal | null, endedAt: 0, actedOn: false };
     switchRenewal = renewing;
     if (!again) {
       notice(`renewing the "${target.name}" login first, to move this session onto it in place`, {
@@ -2023,6 +2027,7 @@ export async function runInteractiveHotSwap(
             return null;
           }
           if (renewing.result === null) return null;
+          renewing.actedOn = true;
           // Something else is renewing it this moment: waited out, not restarted for.
           if (!renewing.result.ok && renewing.result.why === 'busy') return null;
           refusal =

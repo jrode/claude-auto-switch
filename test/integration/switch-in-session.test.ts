@@ -680,7 +680,8 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a runnin
   it('tries the renewal again once the session that was using the login has gone', async () => {
     const { runs, renewals } = await switchToDueLogin({
       bInUseElsewhere: true,
-      retryMs: 300,
+      // No wait at all: the refusal is still said once before it is tried again.
+      retryMs: 0,
       afterAsking: async (home) => {
         await waitFor(
           'the renewal to be refused',
