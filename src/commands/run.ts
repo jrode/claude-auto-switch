@@ -10,7 +10,7 @@ import { preferredModel, roomOfFromSnapshot } from '../usage/account-room.js';
 import { getClaude, type CliContext } from '../context.js';
 import { hasAnyUsableAccount, runInteractiveHotSwap } from './session.js';
 import { advanceActiveToHealthy } from '../state/active-sync.js';
-import { shouldHintShim, shimHintText, wasHinted, markHinted } from './shim-hint.js';
+import { shouldHintShim, shimHintText, wasHinted, markHinted, markCovered, recentlyCovered } from './shim-hint.js';
 import { shellCoverage, shellPlans } from '../shell/shells.js';
 import { configHome } from '../config/paths.js';
 import { signedInAndNotRejected } from '../health/signed-in.js';
@@ -19,16 +19,17 @@ import { confirmCap } from '../usage/confirm-cap.js';
 /** Show a one-time tip about the transparent shim, after an interactive session. */
 function maybeHintShim(context: CliContext): void {
   const home = configHome(context.ctx);
-  // Cheap check first: once hinted, skip entirely (finding the PowerShell
-  // profiles starts both PowerShells, far too costly for an every-run no-op).
-  if (wasHinted(home)) return;
+  // Cheap checks first. Finding the PowerShell profiles starts both
+  // PowerShells, too costly after every session, so complete coverage is
+  // looked at again only once a day, which still notices a shell taken up later.
+  if (wasHinted(home) || recentlyCovered(home)) return;
   const coverage = shellCoverage(shellPlans(context.ctx));
   if (shouldHintShim(coverage, false)) {
     (context.err ?? ((m: string) => process.stderr.write(`${m}\n`)))(shimHintText(coverage));
+    markHinted(home);
+  } else {
+    markCovered(home);
   }
-  // Marked either way, so it is shown at most once: asking again after every
-  // session would start both PowerShells each time.
-  markHinted(home);
 }
 
 /** True for headless requests (`-p` / `--print`), where output can be captured. */

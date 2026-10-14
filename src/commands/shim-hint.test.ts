@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { shouldHintShim, shimHintText, wasHinted, markHinted } from './shim-hint.js';
+import { shouldHintShim, shimHintText, wasHinted, markHinted, markCovered, recentlyCovered } from './shim-hint.js';
 
 describe('shouldHintShim', () => {
   it('hints only while some shell lacks the shim, and not once it has been shown', () => {
@@ -29,6 +29,20 @@ describe('shimHintText', () => {
     expect(partial).toContain('once');
     expect(partial).toContain('other shells');
     expect(partial).not.toContain('without `ccx run`');
+  });
+});
+
+describe('covered marker', () => {
+  it('holds for a day, so a shell taken up later is still noticed', () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-covered-'));
+    const now = Date.now();
+    expect(recentlyCovered(home, now)).toBe(false);
+    markCovered(home);
+    expect(recentlyCovered(home, now)).toBe(true);
+    expect(recentlyCovered(home, now + 23 * 3_600_000)).toBe(true);
+    expect(recentlyCovered(home, now + 25 * 3_600_000)).toBe(false);
+    // It is not the shown marker: complete coverage never stops the tip for good.
+    expect(wasHinted(home)).toBe(false);
   });
 });
 
