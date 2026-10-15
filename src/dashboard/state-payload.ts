@@ -34,7 +34,7 @@ export interface StateAccount {
   cappedUntil?: number;
   usage?: DashboardSnapshot['accounts'][number]['usage'];
   status: {
-    /** ready | blocked | disabled | logged-out */
+    /** ready | blocked | disabled | logged-out | on-hold */
     state: string;
     /** What is being named: a model, `5h`, `week`, `capped`. Null when ready. */
     label: string | null;

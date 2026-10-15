@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.6]
+
+### Fixed
+
+- **An account signed out at Anthropic leaves rotation, wherever ccx finds
+  out.** Until now ccx only knew a login was finished when renewing it
+  failed, and it renews a login only once the stored expiry says so. A login
+  revoked before then (signed out at claude.ai, or the account put on hold)
+  still looked signed in: rotation kept choosing it, the dashboard kept it in
+  rotation, and a session started on it met "Please run /login". Now ccx asks
+  Anthropic instead of trusting the stored expiry:
+  - The usage read the dashboard, `ccx usage` and every session already make
+    for each account notices a token Anthropic turns away, and the login is
+    renewed at once. If Anthropic refuses that, the login is written down as
+    finished, the account leaves rotation, and the dashboard's recent lines say
+    so. A login a session or your editor may be using is never renewed this
+    way, as before.
+  - A session start asks about the account's token first, so a session never
+    starts on a revoked login; it starts on the next account instead.
+  - When Claude says "Please run /login" in a running session, ccx asks
+    Anthropic whether the login is really finished. If it is, the account
+    leaves rotation and the session moves to the next account and carries on
+    with its conversation, as it does when an account runs out of room. If the
+    login still works, nothing moves. Workers do the same.
+- **An account Anthropic put on hold says so.** Its login is refused with
+  "account_on_hold" and a link to claude.ai/restricted. The dashboard shows it
+  as "on hold" rather than "signed out", since signing in again does not bring
+  it back, and keeps it out of rotation.
+
 ## [2.6.5]
 
 ### Fixed

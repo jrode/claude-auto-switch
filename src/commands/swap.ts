@@ -141,6 +141,7 @@ function modelWindowOf(a: StateAccount, model: string | null, now: number): Wind
 
 function statusWords(a: StateAccount, here: boolean, now: number): string {
   if (!a.enabled) return 'turned off';
+  if (a.status.state === 'on-hold') return 'on hold at Anthropic (claude.ai/restricted)';
   if (!a.loggedIn || a.status.state === 'logged-out') return `signed out (ccx login ${a.name})`;
   if (a.status.state === 'blocked') {
     const what =

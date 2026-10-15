@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync } from 'node:fs';
@@ -15,6 +15,7 @@ import { saveLedger } from '../../src/ledger/ledger.js';
 import { writeSwitchRequest } from '../../src/state/switch-request.js';
 import { saveToken } from '../../src/daemon/token-store.js';
 import type { CliContext } from '../../src/context.js';
+import { loginServer, signIn } from './login-server.js';
 
 /**
  * `ccx worker` end to end against the fake claude: a headless run in a session
@@ -215,6 +216,7 @@ const TOUCHED = [
   'FAKE_CLAUDE_PARTIAL_LINE',
   'FAKE_CLAUDE_REFUSE_ON',
   'FAKE_CLAUDE_REFUSAL_ENDS_RUN',
+  'FAKE_CLAUDE_REFUSE_AS',
   'FAKE_CLAUDE_SUBAGENT_REFUSE_AFTER_MS',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'CLAUDE_CODE_ENTRYPOINT',
@@ -235,6 +237,7 @@ describe('ccx worker (against fake-claude)', () => {
       else process.env[name] = original[name];
     }
     process.chdir(startedIn);
+    vi.unstubAllGlobals();
   });
 
   it("runs the brief headless and prints Claude's answer with the accounts that did it", { timeout: 60_000 }, async () => {
@@ -279,6 +282,32 @@ describe('ccx worker (against fake-claude)', () => {
       expect(answer.result).toBe(`done: ${WORKER_CARRY_ON}`);
       expect(answer.ccx.accounts).toEqual(['A', 'B']);
       expect(answer.ccx.moves).toBe(1);
+    },
+  );
+
+  it(
+    'carries on on the next account when its login is found finished while it runs',
+    { timeout: 60_000 },
+    async () => {
+      const { home, context, runsLog } = await setup(['A', 'B']);
+      for (const name of ['A', 'B']) signIn(path.join(home, 'profiles', name), name);
+      const server = loginServer();
+      context.loginProbe = server.loginProbe;
+      // Claude, headless, gives up on a turn its login no longer covers and exits.
+      Object.assign(process.env, refusing(), {
+        FAKE_CLAUDE_REFUSE_AS: 'signed-out',
+        FAKE_CLAUDE_REFUSE_ON: 'A',
+        FAKE_CLAUDE_REFUSAL_ENDS_RUN: '1',
+      });
+      setTimeout(() => server.signOut('A'), 600);
+      const seen = capture();
+      expect(await workerCommand(context, ['refactor', 'billing'], {}, [], seen.io)).toBe(0);
+
+      const launches = launchesIn(runsLog);
+      expect(launches.map((l) => l.marker)).toEqual(['A', 'B']);
+      const id = valueAfter(launches[0]?.args ?? [], '--session-id');
+      expect(valueAfter(launches[1]?.args ?? [], '--resume')).toBe(id);
+      expect(launches[1]?.prompt).toBe(WORKER_CARRY_ON);
     },
   );
 

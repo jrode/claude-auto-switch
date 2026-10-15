@@ -6,7 +6,9 @@ import path from 'node:path';
 import { refreshCredentialIfExpired } from './oauth-refresh.js';
 import { CREDENTIALS_LOCK_DIR } from '../claude/locks.js';
 import { forgetRefusals } from './dead-login-memo.js';
-import { credentialPath, previousCredentialPath } from '../accounts/credential-vault.js';
+import { credentialFileFingerprint, credentialPath, previousCredentialPath } from '../accounts/credential-vault.js';
+import { deadLoginReason } from './dead-login-store.js';
+import { sha256Fingerprint } from '../util/fingerprint.js';
 
 const HOUR = 3600_000;
 
@@ -392,5 +394,53 @@ describe('renewing a login something else may be renewing', () => {
     ]);
     expect(outcome).toMatchObject({ status: 'unavailable' });
     expect(existsSync(path.join(dir, CREDENTIALS_LOCK_DIR))).toBe(false);
+  });
+});
+
+describe('renewing a login the server has just turned away', () => {
+  beforeEach(() => forgetRefusals());
+
+  it('renews before the stored expiry, when the token it holds is the one turned away', async () => {
+    const dir = account({ accessToken: 'revoked', refreshToken: 'r', expiresAt: now() + 8 * HOUR });
+    const outcome = await refreshCredentialIfExpired(dir, {
+      now,
+      renewRejected: sha256Fingerprint('revoked'),
+      fetchImpl: jsonFetch(200, { access_token: 'fresh', refresh_token: 'r2', expires_in: 28800 }),
+    });
+    expect(outcome.status).toBe('refreshed');
+    expect(JSON.parse(readFileSync(credentialPath(dir), 'utf8')).claudeAiOauth.accessToken).toBe('fresh');
+  });
+
+  it('sends nothing when the login has changed since, so a renewal made meanwhile is not repeated', async () => {
+    const dir = account({ accessToken: 'renewed-meanwhile', refreshToken: 'r', expiresAt: now() + 8 * HOUR });
+    let calls = 0;
+    const outcome = await refreshCredentialIfExpired(dir, {
+      now,
+      renewRejected: sha256Fingerprint('revoked'),
+      fetchImpl: (async () => {
+        calls += 1;
+        return new Response('{}');
+      }) as unknown as typeof fetch,
+    });
+    expect(outcome.status).toBe('not-needed');
+    expect(calls).toBe(0);
+  });
+
+  it('writes down why, word for word, when the account is on hold', async () => {
+    // The token endpoint's answer for an account Anthropic had restricted.
+    const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: mkdtempSync(path.join(tmpdir(), 'cas-hold-')) } };
+    const dir = account({ accessToken: 'revoked', refreshToken: 'r', expiresAt: now() + 8 * HOUR });
+    const outcome = await refreshCredentialIfExpired(dir, {
+      now,
+      ctx,
+      renewRejected: sha256Fingerprint('revoked'),
+      fetchImpl: jsonFetch(400, {
+        error: 'invalid_grant',
+        error_description: 'account_on_hold',
+        error_uri: 'https://claude.ai/restricted',
+      }),
+    });
+    expect(outcome.status).toBe('needs-login');
+    expect(deadLoginReason(credentialFileFingerprint(dir), ctx)).toContain('account_on_hold');
   });
 });

@@ -9,6 +9,11 @@ export interface DashboardAccount {
   email?: string;
   plan?: string;
   loggedIn: boolean;
+  /**
+   * Signed out because Anthropic put the account on hold: its login was
+   * refused with "account_on_hold". Signing in again does not bring it back.
+   */
+  onHold?: boolean;
   active: boolean;
   enabled: boolean;
   /** Epoch ms the account is capped until, if currently capped. */

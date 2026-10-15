@@ -275,6 +275,7 @@ export interface Table {
 function notesOf(placed: Placed, next: boolean, sessions: number): Note[] {
   const notes: Note[] = [];
   if (placed.status.state === 'logged-out') notes.push({ text: 'signed out', code: codes.red });
+  if (placed.status.state === 'on-hold') notes.push({ text: 'on hold', code: codes.red });
   if (placed.status.state === 'disabled') notes.push({ text: 'disabled', code: codes.dim });
   if (placed.block === 'usable') {
     if (next) notes.push({ text: 'next in line', short: 'next', code: codes.cyan });

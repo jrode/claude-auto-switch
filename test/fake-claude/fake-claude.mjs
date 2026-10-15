@@ -369,6 +369,23 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
     },
     ...extra,
   });
+  /**
+   * A turn refused because the login no longer works, as Claude writes one
+   * (measured): its own code, no HTTP status, "Please run /login". Written in
+   * place of a limit when FAKE_CLAUDE_REFUSE_AS is "signed-out".
+   */
+  const signedOutEntry = () => ({
+    type: 'assistant',
+    isSidechain: false,
+    isApiErrorMessage: true,
+    error: 'authentication_failed',
+    timestamp: new Date().toISOString(),
+    message: {
+      model: '<synthetic>',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Login expired · Please run /login' }],
+    },
+  });
 
   // The conversation's own record, at <config dir>/projects/<folder>/<id>.jsonl
   // where the real CLI keeps it. A refused turn is written the way Claude
@@ -384,7 +401,8 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
     const refusesHere = !refuseOn || refuseOn.split(',').includes(readMarker() ?? '');
     const refuse = () => {
       if (!refusesHere) return;
-      appendFileSync(transcript, `${JSON.stringify(refusalEntry())}\n`);
+      const entry = process.env.FAKE_CLAUDE_REFUSE_AS === 'signed-out' ? signedOutEntry() : refusalEntry();
+      appendFileSync(transcript, `${JSON.stringify(entry)}\n`);
       // Print mode ends the run on a refused turn, with an error result and
       // exit 1, where the terminal app stays up and waits.
       if (process.env.FAKE_CLAUDE_REFUSAL_ENDS_RUN && outputFormat) {

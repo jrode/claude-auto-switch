@@ -9,6 +9,8 @@ import { readCredentialEvents } from '../accounts/credential-log.js';
 import { takeLease } from '../session/lease.js';
 import { rememberDeadLogin } from './dead-login-store.js';
 import { credentialFileFingerprint } from '../accounts/credential-vault.js';
+import { readEvents } from '../events/log.js';
+import { configHome } from '../config/paths.js';
 
 function setup(names: string[]) {
   const home = mkdtempSync(path.join(tmpdir(), 'cas-usage-'));
@@ -643,5 +645,79 @@ describe('whose login answers for an account, when a session is running', () => 
     });
 
     expect(probed[0]).toContain('anon-session');
+  });
+});
+
+describe('a login the usage endpoint turns away', () => {
+  const turnedAway: LimitProbeResult = {
+    verdict: 'unknown',
+    detail: 'status 401',
+    rejected: { message: 'OAuth access token has been revoked.', token: 'fp' },
+  };
+  /** A probe that answers each look with the next of `answers`, the last one for good. */
+  const answering = (...answers: LimitProbeResult[]) => {
+    let at = 0;
+    return () => Promise.resolve(answers[Math.min(at++, answers.length - 1)] as LimitProbeResult);
+  };
+
+  it('renews it at once, for the token turned away, and reads the usage again', async () => {
+    const { c, accounts } = setup(['a']);
+    const asked: Array<string | undefined> = [];
+    const snap = await refreshUsage(accounts, c, {
+      probe: answering(turnedAway, result(0.3, 0.4)),
+      renew: (_dir, rejected) => {
+        asked.push(rejected);
+        return Promise.resolve({ status: rejected ? 'refreshed' : 'not-needed' });
+      },
+    });
+    expect(asked).toEqual([undefined, 'fp']);
+    expect(snap.accounts['a']?.fiveHour).toBe(0.3);
+  });
+
+  it('says so where the dashboard shows it when the token endpoint refuses the login', async () => {
+    const { c, accounts } = setup(['a', 'b']);
+    await refreshUsage(accounts, c, {
+      probe: (file) => Promise.resolve(file.includes(`${path.sep}a${path.sep}`) ? turnedAway : result(0.1, 0.1)),
+      renew: (_dir, rejected) =>
+        Promise.resolve(
+          rejected
+            ? { status: 'needs-login', detail: 'token endpoint 400: {"error": "invalid_grant", "error_description": "account_on_hold"}' }
+            : { status: 'not-needed' },
+        ),
+    });
+    expect(readCredentialEvents(10, c).map((e) => [e.account, e.kind])).toEqual([['a', 'needs-login']]);
+    const said = readEvents(configHome(c), 10).filter((e) => e.kind === 'signed-out');
+    expect(said.map((e) => e.msg)).toEqual(['"a" is on hold at Anthropic (claude.ai/restricted), so it is out of rotation']);
+  });
+
+  it('says nothing more about a refusal that was already known', async () => {
+    const { c, accounts } = setup(['a']);
+    await refreshUsage(accounts, c, {
+      probe: answering(turnedAway),
+      renew: (_dir, rejected) =>
+        Promise.resolve(rejected ? { status: 'needs-login', detail: 'invalid_grant', alreadyKnown: true } : { status: 'not-needed' }),
+    });
+    expect(readEvents(configHome(c), 10).filter((e) => e.kind === 'signed-out')).toEqual([]);
+  });
+
+  it('never renews a login a running session is using, even when its token is turned away', async () => {
+    const { c, accounts } = setup(['busy']);
+    const sessionDir = path.join(c.env.CLAUDE_AUTO_SWITCH_HOME as string, 'live-session');
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      path.join(sessionDir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'tok-live', refreshToken: 'rt-live' } }),
+      'utf8',
+    );
+    takeLease('busy', sessionDir, c);
+    const asked: Array<string | undefined> = [];
+    await refreshUsage(accounts, c, {
+      probe: answering(turnedAway),
+      renew: (_dir, rejected) => {
+        asked.push(rejected);
+        return Promise.resolve({ status: 'refreshed' });
+      },
+    });
+    expect(asked).toEqual([]);
   });
 });

@@ -23,7 +23,7 @@ export function gateRefusals(follower: RefusalFollower, gate: RefusalGate | unde
   return {
     poll(id) {
       // Nothing is read while held, so the next look after it still has all of it.
-      if (gate.held()) return { readable, refusals: [], promptAt: null, subagentsWrote: false };
+      if (gate.held()) return { readable, refusals: [], promptAt: null, subagentsWrote: false, signedOut: null };
       const news = follower.poll(id);
       readable = news.readable;
       return { ...news, refusals: news.refusals.filter((refusal) => !gate.ignores(refusal)) };

@@ -31,6 +31,8 @@ export type AccountState =
   | 'disabled'
   /** Signed out, so nothing can run on it. */
   | 'logged-out'
+  /** Put on hold by Anthropic, so nothing can run on it and signing in does not help. */
+  | 'on-hold'
   /** A window is spent, or ccx was refused. `constraints` says which. */
   | 'blocked';
 
@@ -102,7 +104,7 @@ export function accountStatus(
   now: number,
 ): AccountStatus {
   if (!a.enabled) return { state: 'disabled', constraints: [], label: null, until: null };
-  if (!a.loggedIn) return { state: 'logged-out', constraints: [], label: null, until: null };
+  if (!a.loggedIn) return { state: a.onHold ? 'on-hold' : 'logged-out', constraints: [], label: null, until: null };
 
   const constraints = constraintsOn(a, model, now);
   if (constraints.length === 0) {

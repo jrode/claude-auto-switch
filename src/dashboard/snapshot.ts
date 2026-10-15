@@ -15,6 +15,8 @@ export interface SnapshotInput {
   }>;
   /** Names currently logged in (from the health probe). */
   loggedIn: Set<string>;
+  /** Names whose login was refused because Anthropic put the account on hold. */
+  onHold?: Set<string>;
   /** Live email/plan from the health probe, overriding the cached registry values. */
   liveEmail?: Map<string, string>;
   livePlan?: Map<string, string>;
@@ -64,6 +66,7 @@ export function toSnapshot(input: SnapshotInput): DashboardSnapshot {
         email: input.liveEmail?.get(a.name) ?? a.email,
         plan: input.livePlan?.get(a.name) ?? a.plan,
         loggedIn: input.loggedIn.has(a.name),
+        ...(input.onHold?.has(a.name) ? { onHold: true } : {}),
         active: input.active === a.name,
         enabled: a.enabled,
         priority: a.priority,

@@ -41,6 +41,8 @@ export interface HeadlessSessionOptions {
   onTick?: () => void;
   /** Resolves true only when the account is really out (asked of the account). */
   verifyCap?: (renderedText: string) => Promise<boolean>;
+  /** As runPtySession's: resolves true only when the login is confirmed finished. */
+  verifySignedOut?: () => Promise<boolean>;
   ignoreLimits?: boolean;
   /** As runPtySession's: which refused turns are held back or passed over. */
   limitGate?: RefusalGate;
@@ -253,6 +255,9 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
   let verifying: Promise<void> | null = null;
   /** A refusal seen while another was being confirmed: asked about next, not dropped. */
   let held: { text: string; hit: Hit } | null = null;
+  /** What Claude showed when its login was turned away, once confirmed finished; and a check in flight. */
+  let signedOut: string | null = null;
+  let checkingLogin: Promise<void> | null = null;
   let exited = false;
   let stopped = false;
 
@@ -300,10 +305,34 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
     };
   };
 
+  /**
+   * A turn refused because the login no longer works. Claude headless gives
+   * up on it and exits; once the login is confirmed finished, the run ends as
+   * `needs-login` and its conversation carries on on the next account.
+   */
+  const loginEvidence = (text: string): void => {
+    if (!options.verifySignedOut || checkingLogin !== null || signedOut !== null) return;
+    checkingLogin = options
+      .verifySignedOut()
+      .catch(() => false)
+      .then((finished) => {
+        if (finished && !switchTo && interruptedBy === null) {
+          signedOut = text;
+          stop();
+        }
+      })
+      .finally(() => {
+        checkingLogin = null;
+      });
+  };
+
   const checkRecord = (): void => {
-    if (options.ignoreLimits || capped || switchTo || interruptedBy !== null) return;
+    if (capped || switchTo || interruptedBy !== null || signedOut !== null) return;
     const seen = record.poll(conversation);
     recordReadable = recordReadable || seen.readable;
+    // Not a limit, so watched even when limits are not.
+    if (seen.signedOut !== null) loginEvidence(seen.signedOut);
+    if (options.ignoreLimits) return;
     for (const refusal of seen.refusals) {
       // A subagent's refusal ends nothing here: a headless run cannot be moved
       // under a live Claude, and its main thread meets the same limit at its
@@ -376,6 +405,7 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
       // only briefly when the worker is being ended.
       const deadline = Date.now() + (interruptedBy !== null ? KILL_GRACE_MS : VERIFY_WAIT_MS);
       while (verifying !== null && Date.now() < deadline) await within(verifying, deadline - Date.now());
+      while (checkingLogin !== null && Date.now() < deadline) await within(checkingLogin, deadline - Date.now());
       if (switchTo && interruptedBy === null) {
         resolve({ kind: 'switch', exitCode: 0, switchTo, ranMs });
         return;
@@ -396,6 +426,10 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
       }
       if (interruptedBy !== null) {
         resolve({ kind: 'ok', exitCode: interruptedBy, ranMs });
+        return;
+      }
+      if (signedOut !== null) {
+        resolve({ kind: 'needs-login', exitCode, reason: signedOut, ranMs, midSession: true });
         return;
       }
       // A resume of a conversation that was never written: the swap loop's

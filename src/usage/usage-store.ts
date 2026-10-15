@@ -12,6 +12,7 @@ import { probeUsage, type LimitProbeResult } from './limit-probe.js';
 import { learnWindowCost } from './runway.js';
 import { refreshCredentialIfExpired, renewalIsDue, expiredLongerThan, type RefreshOutcome } from './oauth-refresh.js';
 import { editorPointerAccount } from '../editor/junction.js';
+import { isOnHold, reportFinishedLogin } from '../accounts/login-check.js';
 
 /**
  * Cached per-account subscription usage (5h/7d utilization + resets), fetched
@@ -155,8 +156,11 @@ export interface RefreshUsageOptions {
    * Renew an account's token before reading its usage. An account you are not
    * using goes stale within hours, and a stale token cannot report usage, which
    * would hide exactly the accounts rotation wants to move to.
+   *
+   * `rejected`: the fingerprint of an access token the usage endpoint just
+   * turned away, for a renewal made because of that rather than its expiry.
    */
-  renew?: (accountDir: string) => Promise<RefreshOutcome>;
+  renew?: (accountDir: string, rejected?: string) => Promise<RefreshOutcome>;
 }
 
 /**
@@ -333,7 +337,9 @@ export async function refreshUsage(
   const probe =
     options.probe ?? ((file: string) => probeUsage(file));
   const renew =
-    options.renew ?? ((accountDir: string) => refreshCredentialIfExpired(accountDir, { ctx: c }));
+    options.renew ??
+    ((accountDir: string, rejected?: string) =>
+      refreshCredentialIfExpired(accountDir, { ctx: c, ...(rejected ? { renewRejected: rejected } : {}) }));
 
   const snapshot = readUsageSnapshot(c);
   const aged = accounts.filter((a) => {
@@ -378,13 +384,33 @@ export async function refreshUsage(
     try {
       const { lease } = await renewIdleLogin(account, accounts, c, {
         ...(options.leaseOptions ? { leaseOptions: options.leaseOptions } : {}),
-        renew,
+        renew: (accountDir) => renew(accountDir),
         editorAccount,
       });
       // The live session's copy is the one being kept fresh, so for a leased
       // account that is the file to read, PROVIDED the session is actually
       // signed in as this account. See usageCredentialDir.
-      result = await probe(path.join(usageCredentialDir(account, lease?.configDir), '.credentials.json'));
+      const file = path.join(usageCredentialDir(account, lease?.configDir), '.credentials.json');
+      result = await probe(file);
+      // Turned away: revoked, or signed out at claude.ai, however long its
+      // stored expiry says it has. Only the token endpoint can say whether the
+      // login is finished, so it is renewed now, for that token, through the
+      // same guards as any idle renewal: never under a session or an editor
+      // that may be using it. A session's own copy is that session's to find
+      // out about, so only the profile's is taken up here.
+      const rejected = result.rejected;
+      if (rejected && !lease) {
+        const { renewal } = await renewIdleLogin(account, accounts, c, {
+          ...(options.leaseOptions ? { leaseOptions: options.leaseOptions } : {}),
+          renew: (accountDir) => renew(accountDir, rejected.token),
+          editorAccount,
+        });
+        if (renewal.status === 'refreshed') result = await probe(file);
+        else if (renewal.status === 'needs-login' && !renewal.alreadyKnown) {
+          const detail = renewal.detail ?? rejected.message;
+          reportFinishedLogin(account.name, { detail, onHold: isOnHold(detail) }, c);
+        }
+      }
     } catch {
       result = { verdict: 'unknown' };
     }

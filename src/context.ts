@@ -3,7 +3,7 @@ import { resolveRealClaude } from './launcher/real-claude.js';
 import type { Config } from './config/config.schema.js';
 import type { PathCtx } from './config/paths.js';
 import type { ClaudeInvoker } from './invoker.js';
-import type { LimitVerdict } from './usage/limit-probe.js';
+import type { LimitProbeResult, LimitVerdict } from './usage/limit-probe.js';
 import type { BlockedWatchOptions } from './launcher/blocked-watch.js';
 import type { NewerInstall } from './update/newer-install.js';
 import type { CarryOnTiming } from './launcher/carry-on.js';
@@ -23,6 +23,12 @@ export interface CliContext {
    * turns out to be).
    */
   capProbe?: ConfirmCapDeps['probe'];
+  /**
+   * Injected in tests: stands in for the usage request that asks whether a
+   * stored login's token is still accepted (accounts/login-check), so no test
+   * sends a made-up token to Anthropic.
+   */
+  loginProbe?: (credentialsFile: string) => Promise<LimitProbeResult>;
   /**
    * Injected in tests: how quickly a session counts as blocked. Production uses
    * the defaults in blocked-watch (three walls over two minutes), which no test

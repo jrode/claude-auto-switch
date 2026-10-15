@@ -27,6 +27,12 @@ export interface SessionOutcome {
    * no claim about which model is spent, so callers must not record one.
    */
   unproven?: true;
+  /**
+   * For kind 'needs-login': the login was found finished while the session was
+   * running, rather than before it started. The conversation it was in is
+   * carried on to the next account.
+   */
+  midSession?: true;
   /** For kind 'switch': the account the operator asked to switch to, in place. */
   switchTo?: string;
   /**
@@ -228,8 +234,16 @@ export async function runHotSwapSession(deps: HotSwapDeps): Promise<number> {
       // token and produce "Login expired" with nothing to act on. Try the next
       // account instead. `first` is deliberately not advanced: nothing ran, so
       // the next attempt is still the first real session and must not resume.
-      needsLogin.add(account.name);
-      deps.notify(`"${account.name}" needs signing in again; trying another account...`);
+      // Unless it did run, and its login was found finished mid-session: then
+      // its conversation is carried on to the next account like any move.
+      const signedOutAs = outcome.midSession ? deps.currentAccount?.() || account.name : account.name;
+      needsLogin.add(signedOutAs);
+      if (outcome.midSession) {
+        first = false;
+        deps.notify(`"${signedOutAs}" was signed out; moving this conversation to another account...`);
+      } else {
+        deps.notify(`"${account.name}" needs signing in again; trying another account...`);
+      }
       continue;
     }
     first = false;

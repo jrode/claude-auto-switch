@@ -49,6 +49,7 @@ import { loginCommand } from './login.js';
 import { getClaude, type CliContext } from '../context.js';
 import { claimRawTerminal } from '../ui/raw-terminal.js';
 import { signedInAndNotRejected } from '../health/signed-in.js';
+import { loginOnHold } from '../accounts/login-check.js';
 import { describeNextUp, describeWhenOut, type NextUpInput, type WhenOut } from '../dashboard/next-up.js';
 import { inDisplayOrder, keepSelection } from '../dashboard/arrange.js';
 import type { CapacityWindows } from '../usage/usable-capacity.js';
@@ -238,6 +239,7 @@ export async function dashboardCommand(
     refreshConfig();
     const accts = listAccounts(context.ctx);
     const loggedIn = signedInAndNotRejected(healths, accts, context.ctx);
+    const onHold = new Set(accts.filter((a) => !loggedIn.has(a.name) && loginOnHold(a.dir, context.ctx)).map((a) => a.name));
     const liveEmail = new Map(healths.filter((h) => h.email).map((h) => [h.name, h.email!]));
     const livePlan = new Map(healths.filter((h) => h.plan).map((h) => [h.name, h.plan!]));
     const now = Date.now();
@@ -269,6 +271,7 @@ export async function dashboardCommand(
         priority: a.priority,
       })),
       loggedIn,
+      onHold,
       liveEmail,
       livePlan,
       cappedUntil,

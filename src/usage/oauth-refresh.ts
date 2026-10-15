@@ -68,6 +68,15 @@ export interface RefreshOptions {
   lockWaitMs?: number;
   /** How long the token request may take (default REQUEST_TIMEOUT_MS). */
   requestTimeoutMs?: number;
+  /**
+   * The fingerprint of an access token the API just turned away (401). The
+   * login is then renewed however long its stored expiry says it has left,
+   * because that expiry is wrong: the token was revoked, and only the token
+   * endpoint can say whether the login behind it is finished. Only while the
+   * stored login still holds THAT token: one renewed meanwhile is left alone,
+   * as an expired one renewed meanwhile is.
+   */
+  renewRejected?: string;
 }
 
 /**
@@ -131,7 +140,7 @@ export async function refreshCredentialIfExpired(
 ): Promise<RefreshOutcome> {
   const now = options.now ?? (() => Date.now());
   // Looked at first without the lock, so a login with nothing to do never waits for it.
-  const before = assess(credentialPath(accountDir), now, options.ctx);
+  const before = assess(credentialPath(accountDir), now, options.ctx, options.renewRejected);
   if (!before.renew) return before.outcome;
   return oneRenewalPerLogin(sha256Fingerprint(before.refreshToken), () => renewUnderLock(accountDir, options));
 }
@@ -143,8 +152,11 @@ type Assessment =
   | { renew: false; outcome: RefreshOutcome }
   | { renew: true; raw: Record<string, unknown>; auth: OauthBlock; refreshToken: string; identity: string };
 
-/** Read `file` and decide whether its login wants renewing. */
-function assess(file: string, now: () => number, ctx: PathCtx | undefined): Assessment {
+/**
+ * Read `file` and decide whether its login wants renewing: when it is expired
+ * or nearly, or when it still holds the access token `rejected` fingerprints.
+ */
+function assess(file: string, now: () => number, ctx: PathCtx | undefined, rejected?: string): Assessment {
   let raw: Record<string, unknown>;
   let fileText: string;
   try {
@@ -189,7 +201,10 @@ function assess(file: string, now: () => number, ctx: PathCtx | undefined): Asse
   }
 
   const expiresAt = typeof oauth.expiresAt === 'number' ? oauth.expiresAt : 0;
-  if (expiresAt > now() + EXPIRY_BUFFER_MS && oauth.accessToken) return { renew: false, outcome: { status: 'not-needed' } };
+  const turnedAway = rejected !== undefined && !!oauth.accessToken && sha256Fingerprint(oauth.accessToken) === rejected;
+  if (expiresAt > now() + EXPIRY_BUFFER_MS && oauth.accessToken && !turnedAway) {
+    return { renew: false, outcome: { status: 'not-needed' } };
+  }
   return { renew: true, raw, auth: oauth, refreshToken: oauth.refreshToken, identity };
 }
 
@@ -220,7 +235,7 @@ async function renewUnderLock(accountDir: string, options: RefreshOptions): Prom
   try {
     // Read again now the lock is held: whoever held it before may have renewed
     // this login meanwhile, and the token read above is then spent.
-    const underLock = assess(file, now, ctx);
+    const underLock = assess(file, now, ctx, options.renewRejected);
     if (!underLock.renew) return underLock.outcome;
     return await performRenewal(accountDir, options, underLock);
   } finally {

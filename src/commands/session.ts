@@ -100,10 +100,12 @@ import {
   identityKey,
   sessionIdentityEmail,
   credentialFingerprint,
+  credentialFileFingerprint,
   hasUsableLogin,
   nudgeLoginReread,
 } from '../accounts/credential-vault.js';
 import { hasLogin, hasWorkingLogin } from '../accounts/account-login.js';
+import { askAboutLogin, isOnHold, reportFinishedLogin } from '../accounts/login-check.js';
 import {
   propagateRenewal,
   snapshotSharing,
@@ -141,6 +143,7 @@ import { holdBackOf } from '../dashboard/rotation-settings.js';
 import { activateWithLease, finishWithLease } from '../session/handoff.js';
 import { ensureLoginUsable, readinessMessage } from '../session/preflight.js';
 import { renewalIsDue, refreshCredentialIfExpired } from '../usage/oauth-refresh.js';
+import { probeUsage } from '../usage/limit-probe.js';
 import {
   withCredentialLock,
   withCredentialLockIfFree,
@@ -166,6 +169,8 @@ const RELIEF_RENEWAL_WAIT_MS = 5_000;
 const CHECK_BUDGET_MS = 10_000;
 /** How soon a renewal that found its login being renewed elsewhere tries again, after a limit. */
 const BUSY_RETRY_MS = 200;
+/** How long a session start waits to hear whether its account's token is still accepted. */
+const PREFLIGHT_PROBE_MS = 3_000;
 
 /** What became of renewing an account's login so a session could be moved onto it in place. */
 type MoveRenewal =
@@ -1393,6 +1398,32 @@ export async function runInteractiveHotSwap(
     ignores: (refusal) => hop.duringHop(refusal.at),
   };
   /**
+   * A turn refused because the session's login no longer works ("Please run
+   * /login"): true only when the token endpoint says the login is finished, and
+   * then the session ends and carries on elsewhere. Claude saying it is not
+   * enough on its own: the session's copy may just be behind the account's.
+   *
+   * The session's own copy is asked first, since it is what Claude was refused
+   * with; renewing it, when that works, is all the session needed. Then the
+   * account's stored login, when it is a different one: if THAT works, the
+   * account is fine and only this copy is stale, which is not a reason to leave
+   * it. Never while away, for the reason given at `verifyCap`.
+   */
+  const verifySignedOut = async (): Promise<boolean> => {
+    const on = current;
+    if (hop.away() || !on) return false;
+    const ask = (dir: string) =>
+      askAboutLogin(dir, { ctx: context.ctx, ...(context.loginProbe ? { probe: context.loginProbe } : {}) });
+    const own = await ask(sessionDir);
+    if (own.state !== 'finished') return false;
+    if (credentialFileFingerprint(on.dir) !== credentialFileFingerprint(sessionDir)) {
+      const stored = await ask(on.dir);
+      if (stored.state !== 'finished') return false;
+    }
+    reportFinishedLogin(on.name, own, context.ctx);
+    return true;
+  };
+  /**
    * The check every limit goes through. Never while away: the login in the
    * folder is the visited account's, and its answer would be recorded against
    * this session. Counted, so a visit does not start while one is in flight
@@ -1894,7 +1925,18 @@ export async function runInteractiveHotSwap(
           hasLogin: () => hasLogin(account.dir),
           renewalDue: () => renewalIsDue(account.dir),
           // Before Claude starts, nothing is relayed, so this one may wait for the lock.
-          renew: () => refreshCredentialIfExpired(account.dir, { ctx: context.ctx }),
+          renew: (rejected) =>
+            refreshCredentialIfExpired(account.dir, {
+              ctx: context.ctx,
+              ...(rejected ? { renewRejected: rejected } : {}),
+            }),
+          // One usage request, which costs no tokens, kept short: a slow answer
+          // must not hold up a session start, and no answer starts as before.
+          turnedAway: async () => {
+            const probe =
+              context.loginProbe ?? ((file: string) => probeUsage(file, fetch, PREFLIGHT_PROBE_MS));
+            return (await probe(path.join(account.dir, CREDS))).rejected?.token ?? null;
+          },
         });
       let readiness = await checkReadiness();
       if (readiness.state === 'needs-login') {
@@ -1939,6 +1981,10 @@ export async function runInteractiveHotSwap(
           { account: account.name, kind: 'needs-login', detail: readiness.detail },
           context.ctx,
         );
+        // Said where the dashboard shows it too, unless there was simply no login to check.
+        if (hasLogin(account.dir)) {
+          reportFinishedLogin(account.name, { detail: readiness.detail, onHold: isOnHold(readiness.detail) }, context.ctx);
+        }
       }
       // A finished login means this account cannot work at all. Starting here
       // would hand Claude a dead token, which shows up as "Login expired" with
@@ -2274,6 +2320,7 @@ export async function runInteractiveHotSwap(
         switchWatch,
         onTick,
         verifyCap,
+        verifySignedOut,
         limitGate,
         onCapConfirmed,
         onCarryOn,
@@ -2319,6 +2366,7 @@ export async function runInteractiveHotSwap(
           switchWatch,
           onTick,
           verifyCap,
+          verifySignedOut,
           limitGate,
           ...(runOptions?.ignoreLimits ? { ignoreLimits: true } : {}),
           ...(stdin !== undefined ? { stdin } : {}),

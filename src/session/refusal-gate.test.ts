@@ -21,7 +21,7 @@ function recordOf(): { follower: RefusalFollower; write: (r: Refusal) => void; l
         looks += 1;
         const refusals = waiting;
         waiting = [];
-        return { readable: true, refusals, promptAt: null, subagentsWrote: false };
+        return { readable: true, refusals, promptAt: null, subagentsWrote: false, signedOut: null };
       },
     },
     write: (r) => waiting.push(r),
@@ -41,7 +41,7 @@ describe('holding refused turns back', () => {
     const gate: RefusalGate = { held: () => held, ignores: () => false };
     const gated = gateRefusals(record.follower, gate);
     record.write(refusal(1_000));
-    expect(gated.poll('id')).toEqual({ readable: false, refusals: [], promptAt: null, subagentsWrote: false });
+    expect(gated.poll('id')).toEqual({ readable: false, refusals: [], promptAt: null, subagentsWrote: false, signedOut: null });
     expect(record.looks()).toBe(0);
     held = false;
     expect(gated.poll('id').refusals).toEqual([refusal(1_000)]);
@@ -54,7 +54,7 @@ describe('holding refused turns back', () => {
     expect(gated.poll('id').readable).toBe(true);
     held = true;
     // Nor a prompt or a subagent's writing: those are read on the first look after it.
-    expect(gated.poll('id')).toEqual({ readable: true, refusals: [], promptAt: null, subagentsWrote: false });
+    expect(gated.poll('id')).toEqual({ readable: true, refusals: [], promptAt: null, subagentsWrote: false, signedOut: null });
   });
 
   it('drops the turns the gate says to pass over, and keeps the rest in order', () => {

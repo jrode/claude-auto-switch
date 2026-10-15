@@ -713,6 +713,22 @@ describe('usable accounts first, the rest below', () => {
     expect(rowOf(out, 'cap1')).toContain('back in 30m');
   });
 
+  it('says an account Anthropic put on hold is on hold, not signed out, and keeps it out of rotation', () => {
+    const out = renderDashboard(
+      snapshot([
+        account({ name: 'ready1', pick: pick(1) }),
+        account({ name: 'held1', loggedIn: false, onHold: true }),
+        account({ name: 'out1', loggedIn: false }),
+      ]),
+      opts,
+    );
+    const lines = out.split('\n');
+    const at = (text: string): number => lines.findIndex((l) => l.includes(text));
+    expect(at('── not in rotation ')).toBeLessThan(at(' held1 '));
+    expect(rowOf(out, 'held1')).toMatch(/on hold$/);
+    expect(rowOf(out, 'out1')).toMatch(/signed out$/);
+  });
+
   it('draws no heading for a block with nothing in it', () => {
     const out = renderDashboard(snapshot([account({ name: 'a', pick: pick(1) })]), opts);
     expect(out).not.toContain('out of room');

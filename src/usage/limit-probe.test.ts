@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { probeLimit, probeUsage } from './limit-probe.js';
+import { sha256Fingerprint } from '../util/fingerprint.js';
 
 function credsFile(withToken = true): string {
   const dir = mkdtempSync(path.join(tmpdir(), 'cas-probe-'));
@@ -100,6 +101,36 @@ describe('probeLimit verdict', () => {
       throw new Error('offline');
     }) as unknown as typeof fetch;
     expect((await probeLimit(credsFile(), '', boom)).verdict).toBe('unknown');
+  });
+});
+
+describe('a login the server turns away', () => {
+  // What the endpoint answered for an account Anthropic had put on hold.
+  const REVOKED = {
+    type: 'error',
+    error: { type: 'authentication_error', message: 'OAuth access token has been revoked.' },
+    request_id: 'req_1',
+  };
+
+  it('says the login was rejected, with the server words and which token it was', async () => {
+    const r = await probeLimit(credsFile(), '', usageFetch(REVOKED, 401));
+    expect(r.verdict).toBe('unknown');
+    expect(r.rejected).toEqual({
+      message: 'OAuth access token has been revoked.',
+      token: sha256Fingerprint('tok-123'),
+    });
+  });
+
+  it('says so even when the body is not the usual shape', async () => {
+    const r = await probeLimit(credsFile(), '', usageFetch('nope', 401));
+    expect(r.rejected?.message).toBe('status 401');
+  });
+
+  it('does not take any other refusal for a rejected login', async () => {
+    for (const status of [403, 429, 500]) {
+      const r = await probeLimit(credsFile(), '', usageFetch(REVOKED, status));
+      expect(r.rejected, `status ${status}`).toBeUndefined();
+    }
   });
 });
 

@@ -75,6 +75,36 @@ export function refusalIn(entry: unknown): Refusal | null {
 }
 
 /**
+ * What Claude showed for a turn refused because its login no longer works, or
+ * null when the entry is anything else.
+ *
+ * Written the same way as a limit, with its own code: "authentication_failed",
+ * and wording such as "Login expired · Please run /login" or "Please run /login
+ * · API Error: 401 OAuth access token has been revoked." (measured, Claude
+ * 2.1.29x). The API's own code and a bare 401 are taken too. It says the login
+ * THIS session holds was turned away, not that the account is finished: that
+ * is for the token endpoint to say.
+ */
+export function signedOutIn(entry: unknown): string | null {
+  if (typeof entry !== 'object' || entry === null) return null;
+  const e = entry as {
+    type?: unknown;
+    isApiErrorMessage?: unknown;
+    error?: unknown;
+    apiErrorStatus?: unknown;
+    message?: { content?: unknown };
+  };
+  if (e.type !== 'assistant' || e.isApiErrorMessage !== true) return null;
+  const error = typeof e.error === 'string' ? e.error : '';
+  if (error !== 'authentication_failed' && error !== 'authentication_error' && e.apiErrorStatus !== 401) return null;
+  const content = Array.isArray(e.message?.content) ? (e.message.content as unknown[]) : [];
+  return content
+    .map((c) => (typeof (c as { text?: unknown })?.text === 'string' ? (c as { text: string }).text : ''))
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
  * When a prompt somebody typed at Claude's terminal was recorded, or null when
  * the entry is anything else: a tool result, a notice from a background task,
  * a subagent's prompt. Claude 2.1.296 marks the typed ones `origin.kind:
@@ -218,6 +248,12 @@ export interface RecordNews {
    * be known about it, and one that cannot be seen may be.
    */
   subagentsWrote: boolean;
+  /**
+   * What Claude showed for the newest turn refused because its login no longer
+   * works, the main thread's or a subagent's (it is the same login), among what
+   * was just read; null when there was none.
+   */
+  signedOut: string | null;
 }
 
 export interface RefusalFollower {
@@ -251,6 +287,7 @@ export function createRefusalFollower(configDir: string, firstFromStart = false)
     refusals: [],
     promptAt: null,
     subagentsWrote: false,
+    signedOut: null,
   });
   const subagentsDir = (record: string, id: string): string =>
     path.join(path.dirname(record), id, 'subagents');
@@ -289,10 +326,13 @@ export function createRefusalFollower(configDir: string, firstFromStart = false)
       const refusals: Refusal[] = [];
       let promptAt: number | null = null;
       let subagentsWrote = false;
+      let signedOut: string | null = null;
       for (const line of lines) {
         if (line.includes('"isApiErrorMessage":true')) {
-          const refusal = refusalIn(parsed(line));
+          const entry = parsed(line);
+          const refusal = refusalIn(entry);
           if (refusal) refusals.push(refusal);
+          signedOut = signedOutIn(entry) ?? signedOut;
         } else if (line.includes('"kind":"human"')) {
           const at = promptAtIn(parsed(line));
           if (at !== null && (promptAt === null || at > promptAt)) promptAt = at;
@@ -311,12 +351,14 @@ export function createRefusalFollower(configDir: string, firstFromStart = false)
         if (lines === null || tail.offset !== readTo) subagentsWrote = true;
         for (const line of lines ?? []) {
           if (!line.includes('"isApiErrorMessage":true')) continue;
-          const refusal = refusalIn(parsed(line));
+          const entry = parsed(line);
+          const refusal = refusalIn(entry);
           // The file is a subagent's, whatever the entry says of itself.
           if (refusal) refusals.push({ ...refusal, sidechain: true });
+          signedOut = signedOutIn(entry) ?? signedOut;
         }
       }
-      return { readable: true, refusals, promptAt, subagentsWrote };
+      return { readable: true, refusals, promptAt, subagentsWrote, signedOut };
     },
   };
 }

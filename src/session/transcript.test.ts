@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createRefusalFollower, findTranscript, refusalIn } from './transcript.js';
+import { createRefusalFollower, findTranscript, refusalIn, signedOutIn } from './transcript.js';
 
 const ID = '11111111-2222-4333-8444-555555555555';
 
@@ -79,6 +79,7 @@ describe('following a conversation record', () => {
       refusals: [],
       promptAt: null,
       subagentsWrote: false,
+      signedOut: null,
     });
     expect(follow.poll(ID).refusals).toHaveLength(0);
     appendFileSync(file, line(refused()));
@@ -147,6 +148,7 @@ describe('following a conversation record', () => {
       refusals: [],
       promptAt: null,
       subagentsWrote: false,
+      signedOut: null,
     });
   });
 });
@@ -390,5 +392,51 @@ describe('prompts a person submitted', () => {
         }),
     );
     expect(follow.poll(ID).promptAt).toBeNull();
+  });
+});
+
+describe('a turn refused because the login no longer works', () => {
+  /** As Claude writes it (measured): Claude's code, no HTTP status, its own wording. */
+  const signedOut = (text = 'Login expired · Please run /login', extra: Record<string, unknown> = {}) => ({
+    type: 'assistant',
+    isSidechain: false,
+    isApiErrorMessage: true,
+    error: 'authentication_failed',
+    message: { model: '<synthetic>', content: [{ type: 'text', text }] },
+    ...extra,
+  });
+
+  it('is told apart from a limit, with the wording Claude showed', () => {
+    expect(signedOutIn(signedOut())).toBe('Login expired · Please run /login');
+    expect(signedOutIn(signedOut('x', { error: 'authentication_error' }))).toBe('x');
+    expect(signedOutIn(signedOut('x', { error: '', apiErrorStatus: 401 }))).toBe('x');
+    expect(refusalIn(signedOut())).toBeNull();
+    expect(signedOutIn(refused())).toBeNull();
+    expect(signedOutIn(answered)).toBeNull();
+  });
+
+  it('is reported once, the newest, from the conversation and from its subagents', () => {
+    const { dir, file } = config();
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, line(answered));
+    const follow = createRefusalFollower(dir);
+    follow.poll(ID);
+    appendFileSync(file, line(signedOut('first')) + line(signedOut('Please run /login · API Error: 401')));
+    expect(follow.poll(ID)).toMatchObject({ refusals: [], signedOut: 'Please run /login · API Error: 401' });
+    expect(follow.poll(ID).signedOut).toBeNull();
+
+    const record = path.join(path.dirname(file), ID, 'subagents', 'agent-a1.jsonl');
+    mkdirSync(path.dirname(record), { recursive: true });
+    writeFileSync(record, line(signedOut('from a subagent', { isSidechain: true })));
+    expect(follow.poll(ID).signedOut).toBe('from a subagent');
+  });
+
+  it('is not news when a resumed conversation met it before', () => {
+    const { dir, file } = config();
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, line(signedOut()));
+    const follow = createRefusalFollower(dir);
+    expect(follow.poll(ID).signedOut).toBeNull();
+    expect(follow.poll(ID).signedOut).toBeNull();
   });
 });

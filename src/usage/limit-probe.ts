@@ -1,4 +1,5 @@
 import { readCredential } from '../accounts/credential-storage.js';
+import { sha256Fingerprint } from '../util/fingerprint.js';
 
 /**
  * Read an account's real subscription usage, and verify whether it is actually
@@ -53,6 +54,14 @@ export interface LimitProbeResult {
    */
   creditsCarryPastLimit?: boolean;
   detail?: string;
+  /**
+   * Set when the endpoint turned the login away (401): the token was revoked,
+   * or expired before its stored expiry says. `token` fingerprints the access
+   * token it refused, so a renewal can be made for that token and no other.
+   * Not a verdict on the account: only the token endpoint can say whether the
+   * login behind it is finished.
+   */
+  rejected?: { message: string; token: string };
 }
 
 /** Read the OAuth access token from a credentials file, or null. */
@@ -104,6 +113,16 @@ function epochMs(iso: string | null | undefined): number | undefined {
   return Number.isNaN(t) ? undefined : t;
 }
 
+/** The `error.message` of an API error body, or null when the body is anything else. */
+async function serverMessage(res: Response): Promise<string | null> {
+  try {
+    const body = (await res.json()) as { error?: { message?: unknown } };
+    return typeof body.error?.message === 'string' ? body.error.message : null;
+  } catch {
+    return null;
+  }
+}
+
 /** A limit is "hit" at/over 100%, or when its severity says so. */
 function isHit(percent: number | null | undefined, severity: string | null | undefined): boolean {
   if (typeof percent === 'number' && percent >= 100) return true;
@@ -120,12 +139,13 @@ export async function probeLimit(
   credentialsFile: string,
   renderedText = '',
   fetchImpl: typeof fetch = fetch,
+  timeoutMs = 8000,
 ): Promise<LimitProbeResult> {
   const token = readOauthToken(credentialsFile);
   if (!token) return { verdict: 'unknown', detail: 'no oauth token' };
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetchImpl(USAGE_URL, {
       headers: {
@@ -135,6 +155,13 @@ export async function probeLimit(
       },
       signal: controller.signal,
     });
+    if (res.status === 401) {
+      return {
+        verdict: 'unknown',
+        detail: 'status 401',
+        rejected: { message: (await serverMessage(res)) ?? 'status 401', token: sha256Fingerprint(token) },
+      };
+    }
     if (res.status !== 200) {
       // The usage endpoint has its own small budget: asking for several accounts
       // at once gets most of them turned away. Surface the back-off so callers
@@ -216,6 +243,7 @@ export async function probeLimit(
 export function probeUsage(
   credentialsFile: string,
   fetchImpl: typeof fetch = fetch,
+  timeoutMs?: number,
 ): Promise<LimitProbeResult> {
-  return probeLimit(credentialsFile, '', fetchImpl);
+  return probeLimit(credentialsFile, '', fetchImpl, timeoutMs);
 }
