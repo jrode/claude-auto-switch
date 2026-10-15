@@ -149,6 +149,32 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('a login revoked while a sess
     },
   );
 
+  it('still carries on elsewhere when Claude exits before the check comes back', { timeout: 60_000 }, async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-signed-out-exit-'));
+    const runsLog = path.join(home, 'runs.jsonl');
+    Object.assign(process.env, {
+      FAKE_CLAUDE_RUNS_LOG: runsLog,
+      // Gone 200 ms after it says "Please run /login", well before the answer.
+      FAKE_CLAUDE_IDLE_MS: '2700',
+      FAKE_CLAUDE_SESSION_RECORD: '1',
+      FAKE_CLAUDE_TRANSCRIPT: '1',
+      FAKE_CLAUDE_REFUSE_AFTER_MS: '2500',
+      FAKE_CLAUDE_REFUSE_AS: 'signed-out',
+      FAKE_CLAUDE_REFUSE_ON: 'A',
+    });
+    const server = loginServer({ slowMs: 2_000 });
+    const context = makeContext(home, server);
+    const dirA = await loginAccount(context, home, 'A');
+    await loginAccount(context, home, 'B');
+    setActive('A', context.ctx);
+    setTimeout(() => server.signOut('A'), 1_500);
+
+    expect(await runCommand(context, ['--resume', CONVERSATION])).toBe(0);
+
+    expect(launchesIn(runsLog).map((l) => l.marker)).toEqual(['A', 'B']);
+    expect(hasWorkingLogin(dirA, context.ctx)).toBe(false);
+  });
+
   it('never starts on an account signed out before the session, however long its login says it has', { timeout: 60_000 }, async () => {
     const home = mkdtempSync(path.join(tmpdir(), 'cas-signed-out-before-'));
     const runsLog = path.join(home, 'runs.jsonl');

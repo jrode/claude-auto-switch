@@ -31,8 +31,12 @@ export function signIn(dir: string, name: string): void {
   );
 }
 
-/** Installed until `vi.unstubAllGlobals()`. */
-export function loginServer(): LoginServer {
+/**
+ * Installed until `vi.unstubAllGlobals()`. `slowMs`: how long the usage read
+ * takes to turn a signed-out account's token away, for a check still under way
+ * when something else happens.
+ */
+export function loginServer(options: { slowMs?: number } = {}): LoginServer {
   const revoked = new Set<string>();
   const refused = new Set<string>();
   vi.stubGlobal('fetch', (input: string | URL | Request, init?: RequestInit) => {
@@ -49,15 +53,13 @@ export function loginServer(): LoginServer {
   return {
     loginProbe: (file) => {
       const token = readOauthToken(file);
-      return Promise.resolve(
-        token && revoked.has(token)
-          ? {
-              verdict: 'unknown',
-              detail: 'status 401',
-              rejected: { message: 'OAuth access token has been revoked.', token: sha256Fingerprint(token) },
-            }
-          : { verdict: 'allowed', fiveHour: 0.1, sevenDay: 0.1 },
-      );
+      if (!token || !revoked.has(token)) return Promise.resolve({ verdict: 'allowed', fiveHour: 0.1, sevenDay: 0.1 });
+      const turnedAway: LimitProbeResult = {
+        verdict: 'unknown',
+        detail: 'status 401',
+        rejected: { message: 'OAuth access token has been revoked.', token: sha256Fingerprint(token) },
+      };
+      return new Promise((resolve) => setTimeout(() => resolve(turnedAway), options.slowMs ?? 0));
     },
     signOut: (name) => {
       revoked.add(`a-${name}`);

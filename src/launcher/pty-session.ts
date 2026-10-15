@@ -328,6 +328,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
     let signedOut: string | null = null;
     /** A login check in flight, and when another may be asked after one that confirmed nothing. */
     let checkingLogin = false;
+    let pendingLoginCheck: Promise<void> | null = null;
     let loginQuietUntil = 0;
     let finalized = false;
     // The "No conversation found to continue" error only matters on a resuming
@@ -412,22 +413,24 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
      * elsewhere, only once that is confirmed: Claude's word alone is not enough,
      * since the session's copy of the login may only be behind the account's.
      * One check at a time, and after one that confirmed nothing, none for a
-     * while, however often Claude says it again.
+     * while, however often Claude says it again. `last`: read after the child
+     * exited, the last chance there is, so the quiet period does not apply.
      */
-    const onSignedOut = (text: string): void => {
-      if (!options.verifySignedOut || checkingLogin || signedOut !== null || switching || exited) return;
-      if (Date.now() < loginQuietUntil) return;
+    const onSignedOut = (text: string, last = false): void => {
+      if (!options.verifySignedOut || checkingLogin || signedOut !== null || switching) return;
+      if (!last && (exited || Date.now() < loginQuietUntil)) return;
       checkingLogin = true;
-      options
+      pendingLoginCheck = options
         .verifySignedOut()
         .catch(() => false)
         .then((finished) => {
           checkingLogin = false;
-          // Left alone when it ended meanwhile (the operator quit), or a switch
-          // took it: neither is this check's to turn into a move.
-          if (finished && !exited && !switching) {
+          // A switch owns the session's outcome, and this check does not take
+          // it over. A child that exited meanwhile still counts: the exit waits
+          // for this answer (see finalize), as it does for a limit check.
+          if (finished && !switching) {
             signedOut = text;
-            setTimeout(safeKill, 150);
+            if (!exited) setTimeout(safeKill, 150);
           } else if (!finished) {
             loginQuietUntil = Date.now() + LOGIN_RECHECK_MS;
           }
@@ -924,6 +927,21 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
 
       const finalize = (): void => {
         if (finalized) return;
+        // A login check still in flight decides this exit as much as a limit
+        // check does: Claude can exit, or be closed, after "Please run /login"
+        // and before the answer comes back. Waited for once, and not for ever.
+        const loginCheck = pendingLoginCheck;
+        if (loginCheck && checkingLogin) {
+          pendingLoginCheck = null;
+          void new Promise<void>((settled) => {
+            const giveUp = setTimeout(settled, 12_000);
+            void loginCheck.finally(() => {
+              clearTimeout(giveUp);
+              settled();
+            });
+          }).then(finalize);
+          return;
+        }
         finalized = true;
         dataSub.dispose();
         // Nothing is killed here. The child has already exited; calling kill()
@@ -952,7 +970,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
                   ranMs,
                   ...(cap.isConfirmed() ? {} : { unproven: true as const }),
                 }
-              : signedOut !== null && weKilled
+              : signedOut !== null
                 ? { kind: 'needs-login', exitCode, reason: signedOut, ranMs, midSession: true as const }
                 : noConversation
                   ? { kind: 'no-conversation', exitCode, ranMs }
@@ -1022,10 +1040,15 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
         const verifyHeldThenFinalize = (): void => {
           // One last read of the record, for a refusal written just before the
           // exit; the screen only counts while the record could not be read.
-          const final = options.ignoreLimits ? null : record.poll(lastConversation);
-          if (final?.readable) recordReadable = true;
+          const final = record.poll(lastConversation);
+          if (final.readable && !options.ignoreLimits) recordReadable = true;
+          // A "Please run /login" written just before the exit is asked about
+          // too; finalize waits for the answer.
+          if (final.signedOut !== null) onSignedOut(final.signedOut, true);
           // The main thread's only, as above.
-          const lastRefusal = final?.refusals.filter((refusal) => !refusal.sidechain).pop();
+          const lastRefusal = options.ignoreLimits
+            ? undefined
+            : final.refusals.filter((refusal) => !refusal.sidechain).pop();
           const recorded = lastRefusal ? hitOf(lastRefusal) : null;
           const live = recordReadable ? null : matchesCapText(window);
           const pending = unprobed ?? recorded ?? (live ? { text: window, hit: live } : null);
