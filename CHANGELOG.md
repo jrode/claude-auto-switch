@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.4]
+
+### Changed
+
+- **The message after an in-place account move no longer mentions the move.**
+  It now reads: "The usage limit no longer applies. Continue where you stopped
+  and retry anything it cut off. If nothing was cut off, say so in one line and
+  wait." The session only needs to know the limit is over, since the error it
+  can still see names a reset time, and what to retry. With no restart implied,
+  it has no reason to start again agents that are still running. A prompt you
+  set yourself is still typed as written.
+
 ## [2.6.3]
 
 ### Changed
