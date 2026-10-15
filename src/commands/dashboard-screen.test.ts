@@ -65,7 +65,7 @@ describe('repaint', () => {
   const frame = (lines: number): string => Array.from({ length: lines }, (_, i) => `line ${i + 1}`).join('\n');
 
   it('never scrolls the screen, whatever the frame it is handed', () => {
-    for (const rows of [3, 10, 24, 50]) {
+    for (const rows of [1, 2, 3, 10, 24, 50]) {
       for (const lines of [1, rows - 1, rows, rows + 1, rows * 3]) {
         expect(scrolled(repaint(frame(lines), rows), rows), `${lines} lines on ${rows} rows`).toBe(0);
       }
@@ -85,5 +85,12 @@ describe('repaint', () => {
 
   it('draws the whole frame when the screen size is not known', () => {
     expect(repaint(frame(30), undefined)).toContain('line 30');
+    // What a terminal that cannot say its size reports, read as unknown here
+    // as the renderer reads it, rather than as a screen with no rows.
+    expect(repaint(frame(30), 0)).toContain('line 30');
+  });
+
+  it('draws nothing on a one-row window rather than scroll it', () => {
+    expect(repaint(frame(5), 1)).toBe('\x1b[H\x1b[J');
   });
 });

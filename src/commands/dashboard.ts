@@ -152,13 +152,16 @@ const { enter: ENTER_SCREEN, epilogue: SCREEN_EPILOGUE } = screenSequences(proce
  * the dashboard is on the main screen (see `screenSequences`) and each
  * scrolled line lands in the scrollback, so the top of the dashboard piled up
  * there every few seconds. The renderer keeps its frames short enough; this
- * holds the line for any frame that is not, keeping its top. `rows` unknown
- * (not a terminal that says) draws the whole frame.
+ * holds the line for any frame that is not, keeping its top, down to drawing
+ * nothing at all on a one-row window, where even one line break would scroll.
+ * `rows` unknown (undefined, or the 0 a terminal that cannot say reports, as
+ * the renderer also reads it) draws the whole frame.
  */
 export function repaint(frame: string, rows: number | undefined): string {
   const lines = frame.split('\n');
-  const shown = rows && rows > 1 ? lines.slice(0, rows - 1) : lines;
-  return HOME + shown.map((l) => l + CLEAR_LINE_END).join('\r\n') + '\r\n' + CLEAR_BELOW;
+  const shown = rows ? lines.slice(0, rows - 1) : lines;
+  const drawn = shown.map((l) => l + CLEAR_LINE_END).join('\r\n');
+  return HOME + drawn + (shown.length > 0 ? '\r\n' : '') + CLEAR_BELOW;
 }
 
 /** Live account dashboard. `--once` prints a single frame (script/CI friendly). */
