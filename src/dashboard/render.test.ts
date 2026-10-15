@@ -1551,3 +1551,82 @@ describe('the settings panel', () => {
     for (const l of lines) expect(l.length).toBeLessThanOrEqual(60);
   });
 });
+
+describe('a screen too short for everything', () => {
+  /**
+   * The live view repaints from the top of the screen and leaves the cursor on
+   * the line under the frame, so a frame that reaches the last row scrolls the
+   * screen on every repaint. On Windows there is no alternate screen, and each
+   * scrolled line lands in the scrollback: the reported "the ccx line spams the
+   * top of the window every few seconds", which began after a sign-in added a
+   * notice and a recent line to a frame that had just fitted.
+   */
+  const busy = (): DashboardSnapshot => ({
+    ...machine(),
+    events: [
+      '16:24  every account looks out of room',
+      '16:24  session on stephenalvi (x2)',
+      '16:26  signed in aass',
+    ],
+    settings: { model: 'Opus, then Fable', order: 'longest run first', holdBack: 'weeks 80%+ used' },
+    desktop: { line: 'Desktop  on aass · nothing open', keys: 'd moves by hand' },
+  });
+  const live = (height: number, selected = 0) => ({
+    color: false as const,
+    interactive: true,
+    clock: utc,
+    width: 80,
+    height,
+    selected,
+    notice: 'signed "aass" in again',
+  });
+  const everything = renderDashboard(busy(), { ...live(1000) }).split('\n');
+
+  it('never draws on the last row, at any height', () => {
+    for (let height = 4; height <= everything.length + 2; height++) {
+      const lines = renderDashboard(busy(), live(height)).split('\n');
+      expect(lines.length, `at ${height} rows`).toBeLessThanOrEqual(height - 1);
+    }
+  });
+
+  it('draws everything when the screen has room for it and the line under it', () => {
+    const lines = renderDashboard(busy(), live(everything.length + 1)).split('\n');
+    expect(lines).toEqual(everything);
+  });
+
+  it('gives up the recent lines first, the oldest before the newest, and keeps their label', () => {
+    const lines = renderDashboard(busy(), live(everything.length - 1)).split('\n');
+    expect(lines.length).toBe(everything.length - 2);
+    expect(lines.filter((l) => l.includes('16:2'))).toEqual([' recent  16:26 signed in aass']);
+    expect(lines).toContain('   d moves by hand');
+  });
+
+  it('keeps every account, the notice and the keys while anything else can go', () => {
+    const rows = tableRows(everything.join('\n')).length;
+    const from = everything.findIndex((l) => l.includes('ACCOUNT'));
+    const accountLines = everything.findIndex((l, i) => i > from && /^─+$/.test(l)) - from - 1;
+    // The title, its rule, the header, the account lines with their block
+    // headings, the rule over the footer, the notice, the keys, and the row
+    // left free for the cursor.
+    const out = renderDashboard(busy(), live(accountLines + 7));
+    expect(tableRows(out).length).toBe(rows);
+    // With nothing left between them, the rule under the table and the one
+    // over the footer would be two in a row.
+    const lines = out.split('\n');
+    expect(lines.some((l, i) => i > 0 && /^─+$/.test(l) && /^─+$/.test(lines[i - 1] ?? ''))).toBe(false);
+    expect(out).toContain('  signed "aass" in again');
+    expect(out).toContain('q/esc quit');
+    expect(out).not.toContain('recent');
+    expect(out).not.toContain('Desktop');
+    expect(out).not.toContain('when one runs out');
+  });
+
+  it('scrolls the accounts to keep the highlighted one in view when even they do not fit', () => {
+    const last = machine().accounts.length - 1;
+    const out = renderDashboard(busy(), live(12, last));
+    expect(out.split('\n').length).toBeLessThanOrEqual(11);
+    expect(tableRows(out).some((l) => l.startsWith('▸'))).toBe(true);
+    expect(out).toContain('q/esc quit');
+    expect(out.split('\n')[0]).toContain('ccx 2.3.2');
+  });
+});

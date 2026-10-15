@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.5]
+
+### Fixed
+
+- **The dashboard no longer fills the scrollback with copies of its top lines
+  on Windows.** When the dashboard had more lines than the window had rows, for
+  example after a sign-in added a notice and a recent line, every refresh
+  scrolled the window, and on Windows, where the dashboard draws on the main
+  screen, each scrolled line stayed behind: the title and the rule under it
+  piled up above the dashboard every few seconds. The dashboard now always
+  leaves the bottom row free. On a short window the lines under the table give
+  way first (recent activity, oldest first, then the account detail, the
+  Desktop lines, the settings line, "when one runs out", and last the line
+  about sessions on removed accounts), and then the accounts scroll to keep the highlighted one in view, as the settings panel
+  already did. The title, the notice and the keys stay.
+
 ## [2.6.4]
 
 ### Changed

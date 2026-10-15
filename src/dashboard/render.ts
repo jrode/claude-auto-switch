@@ -130,9 +130,10 @@ export interface RenderOptions {
   /** The settings panel, drawn instead of the accounts while it is open. */
   panel?: SettingsPanel;
   /**
-   * How many rows there are to draw in. The settings panel scrolls to keep the
-   * highlighted setting on screen rather than grow past the bottom, where a
-   * frame repainted from the top would tear.
+   * How many rows there are to draw in. The frame keeps to one fewer, leaving
+   * the last row for the cursor (see `toHeight`): the accounts give up their
+   * extra lines and then scroll, and the settings panel scrolls, to keep the
+   * highlighted row on screen rather than grow past the bottom.
    */
   height?: number;
   /**
@@ -279,32 +280,48 @@ export function renderDashboard(snapshot: DashboardSnapshot, options: RenderOpti
       : `${title}${' '.repeat(frameW - named.length - subtitle.length)}${paint(subtitle, codes.dim, color)}`;
   const rule = paint('─'.repeat(frameW), codes.dim, color);
 
-  const lines = [titleLine, rule];
+  const head = [titleLine, rule];
+  // The account lines, each marked with the row it draws (null for a block's
+  // heading), so a screen too short for all of them can scroll them instead.
+  const body: Array<{ text: string; row: number | null }> = [];
   if (placed.length === 0) {
     // An empty table is not an answer. Someone seeing this has just installed
     // ccx, and the screen should say what to do rather than showing a header
     // with nothing under it and leaving them to guess whether it is broken.
-    lines.push(paint(fit(' no accounts yet. add one with:  ccx add <name>', maxLine), codes.yellow, color));
+    body.push({
+      text: paint(fit(' no accounts yet. add one with:  ccx add <name>', maxLine), codes.yellow, color),
+      row: null,
+    });
   } else {
-    lines.push(table.header);
+    head.push(table.header);
     let block: Block = 'usable';
-    for (const row of table.rows) {
+    table.rows.forEach((row, i) => {
       const heading = row.block === block ? null : BLOCK_HEADING[row.block];
       block = row.block;
       if (heading) {
         const lead = fit(`── ${heading} `, frameW);
-        lines.push(paint(`${lead}${'─'.repeat(Math.max(0, frameW - lead.length))}`, codes.dim, color));
+        body.push({
+          text: paint(`${lead}${'─'.repeat(Math.max(0, frameW - lead.length))}`, codes.dim, color),
+          row: null,
+        });
       }
-      lines.push(row.line);
-    }
+      body.push({ text: row.line, row: i });
+    });
   }
-  lines.push(rule);
+
+  // The lines under the table, in the order they are drawn. Each says how long
+  // it holds out on a short screen, after the recent lines have gone: the
+  // lowest `keep` goes first. They all go before any account does.
+  const extras: Array<{ text: string; keep: number }> = [];
 
   // What the table cannot show: where a session goes when its account runs
   // out. Every other tool can only report the state it is in; ccx knows the
   // policy and the numbers, so it can say what happens next before it happens.
   if (snapshot.whenOut) {
-    lines.push(paint(fit(` when one runs out → ${snapshot.whenOut.words}`, maxLine), codes.cyan, color));
+    extras.push({
+      text: paint(fit(` when one runs out → ${snapshot.whenOut.words}`, maxLine), codes.cyan, color),
+      keep: 5,
+    });
   }
 
   // The settings rotation runs on, with the keys that change them, so they can
@@ -318,11 +335,12 @@ export function renderDashboard(snapshot: DashboardSnapshot, options: RenderOpti
       // rest, it was there and nobody saw it. (M and o still change the model
       // and the pick rule from here.)
       const line = fit(` s settings  ·  ${values}`, maxLine);
-      lines.push(
-        line.length > 2 ? ` ${paint('s', codes.bold, color)}${paint(line.slice(2), codes.dim, color)}` : line,
-      );
+      extras.push({
+        text: line.length > 2 ? ` ${paint('s', codes.bold, color)}${paint(line.slice(2), codes.dim, color)}` : line,
+        keep: 4,
+      });
     } else {
-      lines.push(paint(fit(` ${values}`, maxLine), codes.dim, color));
+      extras.push({ text: paint(fit(` ${values}`, maxLine), codes.dim, color), keep: 4 });
     }
   }
 
@@ -333,8 +351,8 @@ export function renderDashboard(snapshot: DashboardSnapshot, options: RenderOpti
   if (stray.length > 0) {
     const count = stray.reduce((n, [, running]) => n + running, 0);
     const where = stray.length === 1 ? 'an account' : 'accounts';
-    lines.push(
-      paint(
+    extras.push({
+      text: paint(
         fit(
           ` ${count} session${count === 1 ? '' : 's'} on ${where} no longer here: ${stray.map(([name]) => name).join(', ')}`,
           maxLine,
@@ -342,31 +360,104 @@ export function renderDashboard(snapshot: DashboardSnapshot, options: RenderOpti
         codes.yellow,
         color,
       ),
-    );
+      keep: 6,
+    });
   }
 
   // Claude Desktop runs on its own account, which ccx cannot switch, so it gets
   // a line of its own: what it is spending, and the keys that move its
   // conversations somewhere ccx can.
   if (snapshot.desktop) {
-    lines.push(paint(fit(` ${snapshot.desktop.line}`, maxLine), codes.magenta, color));
+    extras.push({ text: paint(fit(` ${snapshot.desktop.line}`, maxLine), codes.magenta, color), keep: 3 });
     if (options.interactive) {
-      lines.push(paint(fit(`   ${snapshot.desktop.keys}`, maxLine), codes.dim, color));
+      extras.push({ text: paint(fit(`   ${snapshot.desktop.keys}`, maxLine), codes.dim, color), keep: 2 });
     }
   }
 
   const highlighted = placed[options.selected ?? 0]?.account;
   if (options.interactive && highlighted) {
-    lines.push(paint(fit(` ${detailLine(highlighted, now)}`, maxLine), codes.dim, color));
+    extras.push({ text: paint(fit(` ${detailLine(highlighted, now)}`, maxLine), codes.dim, color), keep: 1 });
   }
 
-  plainRecent(snapshot.events).forEach((event, i) => {
-    lines.push(paint(fit(`${i === 0 ? ' recent  ' : '         '}${event}`, maxLine), codes.dim, color));
-  });
+  // What happened lately, oldest first. Drawn for however many of the newest
+  // lines there is room for, the label on whichever comes first.
+  const recent = plainRecent(snapshot.events);
+  const history = {
+    size: recent.length,
+    draw: (count: number): string[] =>
+      recent
+        .slice(recent.length - count)
+        .map((event, i) => paint(fit(`${i === 0 ? ' recent  ' : '         '}${event}`, maxLine), codes.dim, color)),
+  };
 
   const bottom = footer(options, maxLine, color, MAIN_HINTS);
-  if (bottom.length > 0) lines.push(rule, ...bottom);
-  return lines.join('\n');
+  const foot = bottom.length > 0 ? [rule, ...bottom] : [];
+  return toHeight({ head, body, under: [rule], extras, history, foot }, options).join('\n');
+}
+
+/**
+ * The account view cut to the rows the screen has.
+ *
+ * The live view repaints from the top of the screen and leaves the cursor on
+ * the line under the frame, so the frame gets one row fewer than the screen
+ * has: a frame that reaches the last row scrolls the screen a line on every
+ * repaint. On Windows the dashboard draws on the main screen (see
+ * `screenSequences`), where every scrolled line lands in the scrollback, so an
+ * overfull frame piles copies of its top lines up there every few seconds.
+ *
+ * What gives way, in order: the recent lines, the oldest first; the other
+ * lines under the table, by their `keep`; then the accounts, which scroll to
+ * keep the highlighted one in view, as the settings panel's list does. The
+ * title, the header and the footer (a notice, a question, the keys) stay. A
+ * screen too short even for those keeps its top.
+ */
+function toHeight(
+  parts: {
+    head: readonly string[];
+    body: ReadonlyArray<{ text: string; row: number | null }>;
+    under: readonly string[];
+    extras: ReadonlyArray<{ text: string; keep: number }>;
+    history: { size: number; draw: (count: number) => string[] };
+    foot: readonly string[];
+  },
+  options: RenderOptions,
+): string[] {
+  const { head, body, under, extras, history, foot } = parts;
+  // The footer opens with a rule of its own, so with nothing left between the
+  // table and the footer, the rule under the table would only double it.
+  const between = (kept: typeof extras, past: number): readonly string[] =>
+    kept.length + past > 0 || foot.length === 0 ? under : [];
+  const lines = (rows: typeof body, kept: typeof extras, past: number): string[] => [
+    ...head,
+    ...rows.map((r) => r.text),
+    ...between(kept, past),
+    ...kept.map((e) => e.text),
+    ...history.draw(past),
+    ...foot,
+  ];
+  if (!options.height) return lines(body, extras, history.size);
+  const room = Math.max(1, options.height - 1);
+
+  let past = history.size;
+  while (past > 0 && lines(body, extras, past).length > room) past--;
+  const kept = [...extras];
+  while (kept.length > 0 && lines(body, kept, past).length > room) {
+    let least = 0;
+    kept.forEach((e, i) => {
+      if (e.keep < (kept[least]?.keep ?? e.keep)) least = i;
+    });
+    kept.splice(least, 1);
+  }
+
+  let rows = body;
+  const left = room - (head.length + between(kept, past).length + kept.length + past + foot.length);
+  if (body.length > left) {
+    const n = Math.max(1, left);
+    const at = Math.max(0, body.findIndex((r) => r.row === (options.selected ?? 0)));
+    const from = Math.min(Math.max(0, at - Math.floor(n / 2)), body.length - n);
+    rows = body.slice(from, from + n);
+  }
+  return lines(rows, kept, past).slice(0, room);
 }
 
 /**

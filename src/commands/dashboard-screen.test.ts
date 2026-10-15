@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { screenSequences } from './dashboard.js';
+import { repaint, screenSequences } from './dashboard.js';
 
 /**
  * The dashboard draws a full-screen live view. Everywhere but Windows it does so
@@ -47,5 +47,43 @@ describe('screenSequences', () => {
     const seq = screenSequences('win32');
     expect(seq.enter).toContain('\x1b[2J');
     expect(seq.enter).toContain('\x1b[H');
+  });
+});
+
+describe('repaint', () => {
+  /**
+   * How many lines a repaint scrolls the screen by. It starts on the top row
+   * and each line break moves down one; a break on the last row scrolls. On
+   * Windows the dashboard is on the main screen, so every scrolled line lands
+   * in the scrollback: the top of the dashboard piling up there on every tick.
+   */
+  const scrolled = (written: string, rows: number): number => {
+    expect(written.startsWith('\x1b[H')).toBe(true);
+    const breaks = written.split('\r\n').length - 1;
+    return Math.max(0, 1 + breaks - rows);
+  };
+  const frame = (lines: number): string => Array.from({ length: lines }, (_, i) => `line ${i + 1}`).join('\n');
+
+  it('never scrolls the screen, whatever the frame it is handed', () => {
+    for (const rows of [3, 10, 24, 50]) {
+      for (const lines of [1, rows - 1, rows, rows + 1, rows * 3]) {
+        expect(scrolled(repaint(frame(lines), rows), rows), `${lines} lines on ${rows} rows`).toBe(0);
+      }
+    }
+  });
+
+  it('draws a frame that fits as it is, each line clearing its own tail, then clears below', () => {
+    expect(repaint('a\nb', 10)).toBe('\x1b[Ha\x1b[K\r\nb\x1b[K\r\n\x1b[J');
+  });
+
+  it('keeps the top of a frame that does not fit', () => {
+    const written = repaint(frame(30), 10);
+    expect(written).toContain('line 1\x1b[K');
+    expect(written).toContain('line 9\x1b[K');
+    expect(written).not.toContain('line 10');
+  });
+
+  it('draws the whole frame when the screen size is not known', () => {
+    expect(repaint(frame(30), undefined)).toContain('line 30');
   });
 });
