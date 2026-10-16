@@ -77,8 +77,8 @@ step then puts the real program over it from a second package,
 `@anthropic-ai/claude-code-win32-x64` (or `-arm64`). Sometimes the install
 loses that program and keeps only the placeholder, or nothing. The suspected
 cause, not yet confirmed, is an update that ran while Claude was open, since
-Windows will not let a running program be replaced. ccx repairs such an
-install before it starts Claude: from the second package when it is
+Windows can refuse to delete or overwrite the file of a program that is
+running. ccx repairs such an install before it starts Claude: from the second package when it is
 still there, with no download, or else by reinstalling the same version with
 npm. `ccx doctor` reports such an install and `ccx doctor --fix` repairs it.
 If the repair cannot help, close every Claude window, then run

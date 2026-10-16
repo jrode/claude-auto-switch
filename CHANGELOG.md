@@ -15,8 +15,8 @@ semantic versioning.
   (or `-arm64`). When the install loses its program, it is left with only the
   placeholder, or with nothing, while npm's `claude` and `claude.cmd` stay
   behind. The suspected cause, not yet confirmed (#138), is an update that ran
-  while Claude was open and stopped part way, since Windows will not let a
-  running program be replaced. ccx then said it had found `claude.cmd` and
+  while Claude was open and stopped part way, since Windows can refuse to
+  delete or overwrite the file of a program that is running. ccx then said it had found `claude.cmd` and
   could not launch it, and gave no fix. Now:
   - ccx never picks the placeholder. It tells it apart by its first bytes,
     since every Windows program starts with "MZ" and the placeholder does not.

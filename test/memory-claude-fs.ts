@@ -28,7 +28,7 @@ export const NPM_CMD_SHIM = [
 ].join('\r\n');
 
 export interface MemoryFsOptions {
-  /** Files another process has open, which Windows will not let anyone rename or remove. */
+  /** Files another process holds open in a way that stops Windows renaming or removing them. */
   inUse?: string[];
   /** Files that exist but cannot be opened. */
   unreadable?: string[];
