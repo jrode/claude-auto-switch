@@ -34,7 +34,14 @@ import {
   findRealClaude,
   type ClaudeSearch,
 } from '../launcher/real-claude.js';
-import { repairClaudeInstalls } from '../launcher/claude-repair.js';
+import {
+  fileRepairMemory,
+  nodeRepairFs,
+  REPAIR_MEMORY,
+  repairClaudeInstalls,
+  stampOf,
+  type RepairMemory,
+} from '../launcher/claude-repair.js';
 import type { ClaudeInvoker } from '../invoker.js';
 import { signedInAndNotRejected } from '../health/signed-in.js';
 import { settingsPath, readSettings, isOurs } from '../statusline/settings-install.js';
@@ -65,6 +72,8 @@ export interface DoctorDeps {
   findClaude?: () => ClaudeSearch;
   /** What `--fix` runs for a broken Claude Code npm install; injected in tests, which never run npm. */
   repairClaude?: () => string[];
+  /** Repairs that failed, as ccx wrote them down; injected in tests. */
+  repairMemory?: RepairMemory;
   /** Browser debug-port reachability probe; injected in tests. */
   checkBrowserPort?: (port: number) => Promise<boolean>;
   /** Whether nobody is at a browser here; read from the session when absent. */
@@ -133,29 +142,56 @@ function auditRealClaude(context: CliContext, deps: DoctorDeps): DoctorCheck {
   }
   const platform = context.ctx.platform ?? process.platform;
   const search = (deps.findClaude ?? (() => findRealClaude({ platform })))();
-  const repair = search.broken.length > 0 ? { fix: ['ccx doctor --fix'] } : {};
-  if (!search.bin) {
-    return { name, ok: false, detail: cannotFindClaude(search.candidates, platform, search.broken), ...repair };
+  const resolved = `resolved to ${[search.bin, ...search.prefixArgs].join(' ')}`;
+  if (search.broken.length === 0) {
+    return search.bin
+      ? { name, ok: true, detail: resolved }
+      : { name, ok: false, detail: cannotFindClaude(search.candidates, platform) };
   }
-  if (search.broken.length === 0) return { name, ok: true, detail: `resolved to ${search.bin}` };
+  const repair = { fix: ['ccx doctor --fix'] };
+  const failed = rememberedFailures(context, deps, search);
+  if (!search.bin) {
+    const detail = cannotFindClaude(search.candidates, platform, search.broken);
+    return { name, ok: false, detail: failed.length > 0 ? `${detail}\n${failed.join('\n')}` : detail, ...repair };
+  }
   return {
     name,
     ok: true,
     note: true,
-    detail: `resolved to ${search.bin}, but Claude Code's npm install is missing its program: ${search.broken
-      .map(describeBrokenInstall)
-      .join('; ')}`,
+    detail: [
+      `${resolved}, but Claude Code's npm install is missing its program: ${search.broken.map(describeBrokenInstall).join('; ')}`,
+      ...failed,
+    ].join('; '),
     ...repair,
   };
 }
 
-/** `ccx doctor --fix`: the repair a launch makes, run when the search finds a broken npm install. */
+/** What ccx wrote down about a repair that failed on an install, while the install is as it left it. */
+function rememberedFailures(context: CliContext, deps: DoctorDeps, search: ClaudeSearch): string[] {
+  let memory: RepairMemory;
+  try {
+    memory = deps.repairMemory ?? fileRepairMemory(path.join(configHome(context.ctx), REPAIR_MEMORY));
+  } catch {
+    return [];
+  }
+  return search.broken.flatMap((install) => {
+    const failed = memory.get(install.folder);
+    return failed && failed.stamp === stampOf(install, nodeRepairFs)
+      ? [`ccx's last repair of ${install.folder}, on ${failed.at}, did not work: ${failed.reason}`]
+      : [];
+  });
+}
+
+/**
+ * `ccx doctor --fix`: the repair a launch makes, of every broken npm install
+ * the search finds, including one an earlier repair failed on.
+ */
 function repairClaudeIfBroken(context: CliContext, deps: DoctorDeps): void {
   if (deps.resolveClaude || context.claude || context.config.realClaudePath) return;
   const platform = context.ctx.platform ?? process.platform;
   const search = (deps.findClaude ?? (() => findRealClaude({ platform })))();
   if (search.broken.length === 0) return;
-  (deps.repairClaude ?? (() => repairClaudeInstalls(claudeRepairDeps(context))))();
+  (deps.repairClaude ?? (() => repairClaudeInstalls(claudeRepairDeps(context), { force: true })))();
 }
 
 /** Informational: is Chrome listening on the debug port (needed only for auto-login)? */

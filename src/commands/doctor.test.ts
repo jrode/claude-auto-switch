@@ -12,6 +12,7 @@ import {
   type DoctorCheck,
 } from './doctor.js';
 import type { BrokenNpmInstall, ClaudeSearch } from '../launcher/real-claude.js';
+import { nodeRepairFs, stampOf, type RepairMemory } from '../launcher/claude-repair.js';
 import { settingsPath } from '../statusline/settings-install.js';
 import { addAccount } from '../accounts/registry.js';
 import { installShim } from '../shell/install-shim.js';
@@ -557,10 +558,11 @@ describe('doctor and a Claude Code npm install that has lost its program', () =>
     state: 'missing',
     platformProgram: null,
     version: '2.1.302',
+    busy: false,
   };
   const shims = [path.win32.join(prefix, 'claude'), path.win32.join(prefix, 'claude.cmd')];
 
-  function report(search: ClaudeSearch, fix = false) {
+  function report(search: ClaudeSearch, fix = false, repairMemory?: RepairMemory) {
     const repairs: string[] = [];
     const lines: string[] = [];
     const c = context(lines);
@@ -577,6 +579,7 @@ describe('doctor and a Claude Code npm install that has lost its program', () =>
         checkBrowserPort: () => Promise.resolve(true),
         shellPlans: [],
         skipNetwork: true,
+        ...(repairMemory ? { repairMemory } : {}),
       },
       { fix },
     );
@@ -587,7 +590,7 @@ describe('doctor and a Claude Code npm install that has lost its program', () =>
   }
 
   it('names the install and the fix, and repairs nothing by itself', async () => {
-    const { claude, repairs } = await report({ bin: null, fromPlatformPackage: false, candidates: shims, broken: [missing] });
+    const { claude, repairs } = await report({ bin: null, prefixArgs: [], fromPlatformPackage: false, candidates: shims, broken: [missing] });
     expect(claude?.ok).toBe(false);
     expect(claude?.detail).toContain(folder);
     expect(claude?.detail).toContain('missing its program');
@@ -597,9 +600,20 @@ describe('doctor and a Claude Code npm install that has lost its program', () =>
     expect(repairs).toEqual([]);
   });
 
+  it("says when ccx's last repair of the install did not work, while it is as that repair left it", async () => {
+    const failed = { stamp: stampOf(missing, nodeRepairFs), version: '2.1.302', at: '2026-10-16T22:00:00.000Z', reason: 'npm stopped with exit code 1' };
+    const memory: RepairMemory = { get: () => failed, set: () => {} };
+    const search: ClaudeSearch = { bin: null, prefixArgs: [], fromPlatformPackage: false, candidates: shims, broken: [missing] };
+    const { claude } = await report(search, false, memory);
+    expect(claude?.detail).toContain('did not work: npm stopped with exit code 1');
+    // Changed since, so that repair says nothing about it now.
+    const changed: RepairMemory = { get: () => ({ ...failed, stamp: 'something else' }), set: () => {} };
+    expect((await report(search, false, changed)).claude?.detail).not.toContain('did not work');
+  });
+
   it('reports a package folder that is gone the same way', async () => {
     const gone: BrokenNpmInstall = { ...missing, state: 'folder-missing', version: null };
-    const { claude, repairs } = await report({ bin: null, fromPlatformPackage: false, candidates: shims, broken: [gone] });
+    const { claude, repairs } = await report({ bin: null, prefixArgs: [], fromPlatformPackage: false, candidates: shims, broken: [gone] });
     expect(claude?.ok).toBe(false);
     expect(claude?.detail).toContain('the folder is not there');
     expect(claude?.fix).toEqual(['ccx doctor --fix']);
@@ -607,13 +621,13 @@ describe('doctor and a Claude Code npm install that has lost its program', () =>
   });
 
   it('runs the repair with --fix', async () => {
-    const { repairs } = await report({ bin: null, fromPlatformPackage: false, candidates: shims, broken: [missing] }, true);
+    const { repairs } = await report({ bin: null, prefixArgs: [], fromPlatformPackage: false, candidates: shims, broken: [missing] }, true);
     expect(repairs).toEqual(['repaired']);
   });
 
   it('runs no repair with --fix when nothing is broken', async () => {
     const bin = path.win32.join(folder, 'bin', 'claude.exe');
-    const { claude, repairs } = await report({ bin, fromPlatformPackage: false, candidates: shims, broken: [] }, true);
+    const { claude, repairs } = await report({ bin, prefixArgs: [], fromPlatformPackage: false, candidates: shims, broken: [] }, true);
     expect(claude).toMatchObject({ ok: true, detail: `resolved to ${bin}` });
     expect(repairs).toEqual([]);
   });
@@ -621,6 +635,7 @@ describe('doctor and a Claude Code npm install that has lost its program', () =>
   it('still mentions a broken install while Claude starts from its platform package', async () => {
     const { claude } = await report({
       bin: platformProgram,
+      prefixArgs: [],
       fromPlatformPackage: true,
       candidates: shims,
       broken: [{ ...missing, state: 'placeholder', platformProgram }],

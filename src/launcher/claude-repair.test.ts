@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import type { SpawnSyncOptions } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { buildContext, getClaude, getClaudeAsIs } from '../context.js';
+import { buildContext, claudeForSession, getClaude, getClaudeAsIs } from '../context.js';
 import {
   nodeRepairFs,
   npmFor,
@@ -11,14 +11,20 @@ import {
   repairClaudeInstalls,
   resolveClaudeForLaunch,
   runNpm,
+  takeRepairLock,
+  LOCK_MAX_HOLD_MS,
+  LOCK_WAIT_MS,
+  type FailedRepair,
   type LaunchDeps,
   type NpmRun,
+  type RepairMemory,
 } from './claude-repair.js';
 import { inspectNpmInstall, type BrokenNpmInstall } from './real-claude.js';
 import { RealClaudeError } from '../util/errors.js';
 import type { LockHandle } from '../claude/locks.js';
 import {
   memoryWindowsFs,
+  NPM_CLI_JS_CMD_SHIM,
   NPM_CMD_SHIM,
   NPM_PLACEHOLDER,
   NPM_SH_SHIM,
@@ -31,7 +37,8 @@ const SHIM = `${PREFIX}\\claude`;
 const CMD = `${PREFIX}\\claude.cmd`;
 const PKG = `${PREFIX}\\node_modules\\@anthropic-ai\\claude-code`;
 const PKG_JSON = `${PKG}\\package.json`;
-const PACKAGE_JSON = '{"name":"@anthropic-ai/claude-code","version":"2.1.302"}';
+const PACKAGE_JSON = '{"name":"@anthropic-ai/claude-code","version":"2.1.302","bin":{"claude":"bin/claude.exe"}}';
+const OLD_PACKAGE_JSON = '{"name":"@anthropic-ai/claude-code","version":"2.1.110","bin":{"claude":"cli.js"}}';
 const BIN = `${PKG}\\bin\\claude.exe`;
 const BIN_DIR = `${PKG}\\bin`;
 const NESTED = `${PKG}\\node_modules\\@anthropic-ai\\claude-code-win32-x64\\claude.exe`;
@@ -71,6 +78,20 @@ interface Harness {
   said: string[];
   npmCalls: Array<{ node: string; args: string[] }>;
   locks: number[];
+  memory: RepairMemory & { all: Map<string, FailedRepair> };
+}
+
+/** Failed repairs kept in memory, as the file in ccx's folder keeps them. */
+function memoryOfRepairs(): RepairMemory & { all: Map<string, FailedRepair> } {
+  const all = new Map<string, FailedRepair>();
+  return {
+    all,
+    get: (folder) => all.get(folder.toLowerCase()) ?? null,
+    set: (folder, failed) => {
+      if (failed) all.set(folder.toLowerCase(), failed);
+      else all.delete(folder.toLowerCase());
+    },
+  };
 }
 
 /**
@@ -80,11 +101,12 @@ interface Harness {
 function harness(
   fs: MemoryFs,
   options: {
-    npm?: (fs: MemoryFs) => NpmRun;
+    npm?: (fs: MemoryFs, args: string[]) => NpmRun;
     lock?: (waitMs: number) => LockHandle;
     candidates?: string[];
   } = {},
 ): Harness {
+  const memory = memoryOfRepairs();
   const said: string[] = [];
   const npmCalls: Harness['npmCalls'] = [];
   const locks: number[] = [];
@@ -103,12 +125,13 @@ function harness(
     runNpm: (node, args) => {
       npmCalls.push({ node, args });
       if (!options.npm) throw new Error('npm must not run here');
-      return options.npm(fs);
+      return options.npm(fs, args);
     },
     say: (line) => said.push(line),
+    memory,
     run: { repairTried: false },
   };
-  return { deps, said, npmCalls, locks };
+  return { deps, said, npmCalls, locks, memory };
 }
 
 function messageOf(fn: () => unknown): string {
@@ -184,7 +207,24 @@ describe('repairing an npm install from its platform package (no network)', () =
     const result = placeProgram(brokenAt(fs), { fs, say: () => {} });
     expect(result.repaired).toBe(false);
     expect(fs.content(BIN)).toBe('MZ, what npm just put there');
-    expect(fs.changes.some((c) => c.startsWith('link') || c.startsWith('copy'))).toBe(false);
+    expect(fs.changes.some((c) => c.startsWith(`link ${NESTED}`) || c.startsWith(`copy ${NESTED}`))).toBe(false);
+  });
+
+  it('keeps a real program that lands in bin\\claude.exe after the placeholder was moved aside', () => {
+    // Claude's own setup finishing at that moment. A rename on Windows replaces
+    // its target, so putting the placeholder back by renaming it would undo that.
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }));
+    const link = fs.link;
+    fs.link = (from, to) => {
+      if (from === NESTED) fs.put(BIN, "MZ, what Claude's setup put there");
+      link(from, to);
+    };
+    const result = placeProgram(brokenAt(fs), { fs, say: () => {} });
+    expect(result.repaired).toBe(false);
+    expect(fs.content(BIN)).toBe("MZ, what Claude's setup put there");
+    const aside = fs.changes.find((c) => c.startsWith(`rename ${BIN} -> `))?.split(' -> ')[1];
+    expect(aside).toBeDefined();
+    expect(fs.content(aside as string)).toBeUndefined();
   });
 
   it('leaves bin\\claude.exe alone when it is in use, and launches from the platform package', () => {
@@ -267,7 +307,7 @@ describe('repairing an npm install by reinstalling it with npm', () => {
   });
 
   it('installs the latest when the version cannot be read', () => {
-    const fs = memoryWindowsFs(missingInstall({ [PKG_JSON]: 'not json' }));
+    const fs = memoryWindowsFs(missingInstall({ [PKG_JSON]: '{"bin":{"claude":"bin/claude.exe"}}' }));
     const h = harness(fs, { npm: reinstalled });
     resolveClaudeForLaunch(h.deps);
     expect(h.npmCalls[0]?.args.at(-1)).toBe('@anthropic-ai/claude-code');
@@ -441,11 +481,13 @@ describe('when the repair is allowed to run', () => {
     expect(h.locks).toEqual([]);
   });
 
-  it('never off Windows', () => {
+  it('never off Windows, where the first candidate is taken as it is', () => {
+    // The same broken layout: only the search's platform gate keeps it out.
     const fs = memoryWindowsFs(missingInstall());
-    const h = harness(fs, { candidates: [] });
-    expect(() => resolveClaudeForLaunch({ ...h.deps, platform: 'linux' })).toThrow(RealClaudeError);
+    const h = harness(fs);
+    expect(resolveClaudeForLaunch({ ...h.deps, platform: 'linux' }).bin).toBe(SHIM);
     expect(h.locks).toEqual([]);
+    expect(h.npmCalls).toEqual([]);
   });
 
   it('at most once in one ccx run', () => {
@@ -484,8 +526,40 @@ describe('when the repair is allowed to run', () => {
     const fs = memoryWindowsFs(missingInstall());
     const h = harness(fs, { lock: () => ({ held: false, release: () => {} }) });
     expect(messageOf(() => resolveClaudeForLaunch(h.deps))).toContain(LOCK);
-    expect(h.locks).toEqual([0]);
+    // Tried twice, since a lock released in between looks the same at first.
+    expect(h.locks).toEqual([0, 0]);
     expect(h.npmCalls).toEqual([]);
+  });
+
+  it('takes the lock when it was released between the first try and the look', () => {
+    const fs = memoryWindowsFs(missingInstall());
+    let tries = 0;
+    const h = harness(fs, {
+      lock: () => ({ held: ++tries > 1, release: () => {} }),
+      npm: (f) => {
+        f.put(BIN, WINDOWS_PROGRAM);
+        return { status: 0 };
+      },
+    });
+    expect(resolveClaudeForLaunch(h.deps).bin).toBe(BIN);
+    expect(h.locks).toEqual([0, 0]);
+  });
+
+  it('takes over a lock older than any repair, whatever pid it names', () => {
+    // Windows reuses the pid of a ccx that was killed, so a live pid proves
+    // nothing; the age does. The clock runs fast; the lock file is real.
+    const dir = mkdtempSync(path.join(tmpdir(), 'cas-repair-lock-'));
+    const lockFile = path.join(dir, 'claude-repair.lock');
+    writeFileSync(lockFile, '4242');
+    const start = Date.now();
+    let ticks = 0;
+    const handle = takeRepairLock(lockFile, LOCK_WAIT_MS, undefined, {
+      now: () => start + ticks++ * 10_000,
+      isRunning: () => true,
+    });
+    expect(handle.held).toBe(true);
+    handle.release();
+    expect(LOCK_WAIT_MS).toBeGreaterThan(LOCK_MAX_HOLD_MS);
   });
 
   it('releases the lock however the repair ends', () => {
@@ -506,5 +580,135 @@ describe('when the repair is allowed to run', () => {
     const h = harness(fs, { candidates: [NATIVE, SHIM, CMD] });
     expect(repairClaudeInstalls(h.deps)).toEqual([]);
     expect(fs.content(BIN)).toBe(WINDOWS_PROGRAM);
+  });
+
+  // A second npm prefix on PATH, with its own broken install, npm and node.
+  const SECOND = 'C:\\Users\\me\\AppData\\Roaming\\npm';
+  const secondInstall = {
+    [`${SECOND}\\claude.cmd`]: NPM_CMD_SHIM,
+    [`${SECOND}\\node_modules\\@anthropic-ai\\claude-code\\package.json`]: PACKAGE_JSON,
+    [`${SECOND}\\node_modules\\@anthropic-ai\\claude-code\\bin`]: null,
+    [`${SECOND}\\node.exe`]: WINDOWS_PROGRAM,
+    [`${SECOND}\\node_modules\\npm\\bin\\npm-cli.js`]: '',
+  };
+  /** npm putting the program back into whichever prefix it was given. */
+  const reinstallsPrefix = (fs: MemoryFs, args: string[]): NpmRun => {
+    fs.put(`${args[4]}\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe`, WINDOWS_PROGRAM);
+    return { status: 0 };
+  };
+
+  it('at a launch, only the install about to be started', () => {
+    const fs = memoryWindowsFs(missingInstall(secondInstall));
+    const h = harness(fs, { candidates: [SHIM, CMD, `${SECOND}\\claude.cmd`], npm: reinstallsPrefix });
+    expect(resolveClaudeForLaunch(h.deps).bin).toBe(BIN);
+    expect(h.npmCalls.map((call) => call.args[4])).toEqual([PREFIX]);
+  });
+
+  it('with doctor --fix, every install it finds', () => {
+    const fs = memoryWindowsFs(missingInstall(secondInstall));
+    const h = harness(fs, { candidates: [SHIM, CMD, `${SECOND}\\claude.cmd`], npm: reinstallsPrefix });
+    expect(repairClaudeInstalls(h.deps, { force: true })).toEqual([]);
+    expect(h.npmCalls.map((call) => call.args[4])).toEqual([PREFIX, SECOND]);
+  });
+
+  it('never on an older install that runs cli.js, which has no bin\\claude.exe to lose', () => {
+    const fs = memoryWindowsFs({
+      [SHIM]: '',
+      [CMD]: NPM_CLI_JS_CMD_SHIM,
+      [PKG_JSON]: OLD_PACKAGE_JSON,
+      [`${PKG}\\cli.js`]: '#!/usr/bin/env node\n',
+      [NODE]: WINDOWS_PROGRAM,
+      [NPM_CLI]: '',
+    });
+    const h = harness(fs);
+    expect(resolveClaudeForLaunch(h.deps)).toEqual({ bin: NODE, prefixArgs: [`${PKG}\\cli.js`] });
+    expect(h.npmCalls).toEqual([]);
+    expect(h.locks).toEqual([]);
+  });
+
+  it('not again, after it failed, until the install changes', () => {
+    const fs = memoryWindowsFs(missingInstall());
+    const h = harness(fs, { npm: () => ({ status: 1 }) });
+    messageOf(() => resolveClaudeForLaunch(h.deps));
+    expect(h.memory.all.size).toBe(1);
+
+    // The next ccx run: the same install, so npm is not run again for it.
+    const next = messageOf(() => resolveClaudeForLaunch({ ...h.deps, run: { repairTried: false } }));
+    expect(next).toContain('ccx tried on');
+    expect(next).toContain('ccx doctor --fix');
+    expect(h.npmCalls).toHaveLength(1);
+
+    // Reinstalled by hand since, and settled: tried again.
+    fs.put(PKG_JSON, PACKAGE_JSON, Date.now() - 10 * 60_000);
+    messageOf(() => resolveClaudeForLaunch({ ...h.deps, run: { repairTried: false } }));
+    expect(h.npmCalls).toHaveLength(2);
+  });
+
+  it('again with doctor --fix, even after it failed', () => {
+    const fs = memoryWindowsFs(missingInstall());
+    const h = harness(fs, { npm: () => ({ status: 1 }) });
+    messageOf(() => resolveClaudeForLaunch(h.deps));
+    repairClaudeInstalls({ ...h.deps, run: { repairTried: false } }, { force: true });
+    expect(h.npmCalls).toHaveLength(2);
+  });
+
+  it('forgets a failure once a repair works', () => {
+    const fs = memoryWindowsFs(missingInstall());
+    let first = true;
+    const h = harness(fs, {
+      npm: (f) => {
+        if (first) {
+          first = false;
+          return { status: 1 };
+        }
+        f.put(BIN, WINDOWS_PROGRAM);
+        return { status: 0 };
+      },
+    });
+    messageOf(() => resolveClaudeForLaunch(h.deps));
+    repairClaudeInstalls({ ...h.deps, run: { repairTried: false } }, { force: true });
+    expect(h.memory.all.size).toBe(0);
+  });
+
+  it('never while npm may still be writing the install, and says so', () => {
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }), {
+      modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 60_000 },
+    });
+    const h = harness(fs);
+    const message = messageOf(() => resolveClaudeForLaunch({ ...h.deps, now: () => now }));
+    expect(message).toContain('npm may still be installing it');
+    expect(fs.changes).toEqual([]);
+    expect(h.npmCalls).toEqual([]);
+  });
+
+  it('never in a worker, which stops at once, naming ccx doctor --fix', () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-repair-worker-'));
+    const context = buildContext({ ctx: { env: { CLAUDE_AUTO_SWITCH_HOME: home }, platform: 'win32' } });
+    const h = harness(memoryWindowsFs(missingInstall()));
+    context.claudeSearch = h.deps;
+    let message = '';
+    try {
+      claudeForSession(context, true);
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain('ccx doctor --fix');
+    expect(h.npmCalls).toEqual([]);
+    expect(h.locks).toEqual([]);
+  });
+
+  it('in a session that is not a worker', () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-repair-session-'));
+    const context = buildContext({ ctx: { env: { CLAUDE_AUTO_SWITCH_HOME: home }, platform: 'win32' } });
+    const h = harness(memoryWindowsFs(missingInstall()), {
+      npm: (f) => {
+        f.put(BIN, WINDOWS_PROGRAM);
+        return { status: 0 };
+      },
+    });
+    context.claudeSearch = h.deps;
+    expect(claudeForSession(context, false).bin).toBe(BIN);
+    expect(h.npmCalls).toHaveLength(1);
   });
 });

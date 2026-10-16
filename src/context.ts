@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { loadConfig } from './config/config.js';
 import { resolveRealClaude } from './launcher/real-claude.js';
-import { REPAIR_LOCK, resolveClaudeForLaunch } from './launcher/claude-repair.js';
+import { REPAIR_LOCK, REPAIR_MEMORY, resolveClaudeForLaunch, type LaunchDeps } from './launcher/claude-repair.js';
 import type { Config } from './config/config.schema.js';
 import { configHome, type PathCtx } from './config/paths.js';
 import type { ClaudeInvoker } from './invoker.js';
@@ -72,6 +72,8 @@ export interface CliContext {
   artifactHop?: { holdMs?: number };
   /** Injected in tests: whether a folder's login lives in the macOS Keychain (see nudgeLoginReread). */
   loginInKeychain?: (dir: string) => boolean;
+  /** Injected in tests: the file system, npm, lock and clock the search for Claude and its repair use. */
+  claudeSearch?: Partial<LaunchDeps>;
   out: (message: string) => void;
   /** ccx's own status messages. MUST go to stderr so it never corrupts a run's stdout protocol. */
   err?: (message: string) => void;
@@ -106,7 +108,10 @@ export function buildContext(options: BuildContextOptions = {}): CliContext {
  * Claude Code that has lost its program is repaired first (claude-repair).
  */
 export function getClaude(context: CliContext): ClaudeInvoker {
-  return context.claude ?? resolveClaudeForLaunch({ config: context.config, ...claudeRepairDeps(context) });
+  return (
+    context.claude ??
+    resolveClaudeForLaunch({ config: context.config, ...claudeRepairDeps(context), ...context.claudeSearch })
+  );
 }
 
 /**
@@ -116,16 +121,31 @@ export function getClaude(context: CliContext): ClaudeInvoker {
 export function claudeRepairDeps(context: CliContext): {
   platform: NodeJS.Platform | undefined;
   lockFile: () => string;
+  memoryFile: () => string;
   say: (message: string) => void;
 } {
   return {
     platform: context.ctx.platform,
     lockFile: () => path.join(configHome(context.ctx), REPAIR_LOCK),
+    memoryFile: () => path.join(configHome(context.ctx), REPAIR_MEMORY),
     say: context.err ?? ((message) => void process.stderr.write(`${message}\n`)),
   };
 }
 
 /** The claude invoker as things are, repairing nothing: for commands that only report. */
 export function getClaudeAsIs(context: CliContext): ClaudeInvoker {
-  return context.claude ?? resolveRealClaude({ config: context.config, platform: context.ctx.platform });
+  return (
+    context.claude ??
+    resolveRealClaude({ config: context.config, platform: context.ctx.platform, ...context.claudeSearch })
+  );
+}
+
+/**
+ * The claude a session starts. A worker's is never repaired: a repair can block
+ * for minutes (npm, the lock) where nothing else runs, and a worker has to end
+ * when its --timeout says. It stops at once instead, with the message, which
+ * names `ccx doctor --fix`.
+ */
+export function claudeForSession(context: CliContext, worker: boolean): ClaudeInvoker {
+  return worker ? getClaudeAsIs(context) : getClaude(context);
 }

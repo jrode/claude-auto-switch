@@ -1,10 +1,11 @@
 import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
-import { constants, copyFileSync, linkSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
+import { constants, copyFileSync, linkSync, mkdirSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
-import { acquireOwnedLock, type LockHandle } from '../claude/locks.js';
+import { acquireOwnedLock, type LockHandle, type OwnedLockOptions } from '../claude/locks.js';
 import { configHome } from '../config/paths.js';
 import type { ClaudeInvoker } from '../invoker.js';
 import { RealClaudeError } from '../util/errors.js';
+import { writeJsonFile } from '../util/fs-json.js';
 import {
   cannotFindClaude,
   findRealClaude,
@@ -70,24 +71,54 @@ export interface LaunchDeps extends Omit<ResolveDeps, 'fs'>, Partial<RepairDeps>
   lockFile?: () => string;
   /** Takes the repair lock, waiting up to `waitMs` for another ccx that holds it. */
   lock?: (waitMs: number) => LockHandle;
+  /** Where a repair that failed is written down, so the next run does not repeat it. */
+  memoryFile?: () => string;
+  memory?: RepairMemory;
   /** Shared by every resolve in one ccx run, so the repair is tried at most once. */
   run?: { repairTried: boolean };
 }
 
 export type RepairResult = { repaired: true } | { repaired: false; reason: string };
 
+/** A repair that did not work, and what the install looked like after it. */
+export interface FailedRepair {
+  stamp: string;
+  version: string | null;
+  at: string;
+  reason: string;
+}
+
+export interface RepairMemory {
+  get(folder: string): FailedRepair | null;
+  set(folder: string, failed: FailedRepair | null): void;
+}
+
+export interface RepairOptions {
+  /** Repair only this install folder: the one a launch is about to start. */
+  only?: string;
+  /** Repair what an earlier repair failed on too, as `ccx doctor --fix` asks. */
+  force?: boolean;
+}
+
 const PACKAGE = '@anthropic-ai/claude-code';
 export const REPAIR_LOCK = 'claude-repair.lock';
+export const REPAIR_MEMORY = 'claude-repair.json';
 const NPM_TIMEOUT_MS = 10 * 60_000;
-/** Longer than npm may take, so a running repair is never taken over. */
-const LOCK_MAX_HOLD_MS = 20 * 60_000;
-const LOCK_WAIT_MS = 15 * 60_000;
+/**
+ * The longest one hold of the lock can last: it covers one install's repair,
+ * which is at most one npm run and then placing the program. A lock older than
+ * that is abandoned whatever pid it names, since Windows reuses the pid of a
+ * ccx that was killed.
+ */
+export const LOCK_MAX_HOLD_MS = NPM_TIMEOUT_MS + 60_000;
+/** Long enough for a running repair to finish, or for its abandoned lock to be taken over. */
+export const LOCK_WAIT_MS = LOCK_MAX_HOLD_MS + 30_000;
 
 const thisRun = { repairTried: false };
 
 /**
  * The real claude for a launch. On Windows, when the only Claude to be had is
- * an npm install that has lost its program, the install is repaired first:
+ * an npm install that has lost its program, that install is repaired first:
  * from its platform package when that is there, or by reinstalling it with
  * npm. A Claude that starts as it is, a configured `realClaudePath` included,
  * is launched untouched.
@@ -98,65 +129,161 @@ export function resolveClaudeForLaunch(deps: LaunchDeps = {}): ClaudeInvoker {
 
   const platform = deps.platform ?? process.platform;
   const withFs = { ...deps, fs: deps.fs ?? nodeRepairFs };
+  // Off Windows the search finds nothing broken, so nothing is repaired there.
   const search = findRealClaude(withFs);
-  const usesBrokenInstall = search.bin === null || search.fromPlatformPackage;
-  if (platform !== 'win32' || search.broken.length === 0 || !usesBrokenInstall) {
-    return launchable(search, platform, []);
-  }
-  const failures = repairClaudeInstalls(withFs);
+  const target = search.fromPlatformPackage
+    ? search.broken.find((install) => install.platformProgram === search.bin)
+    : search.bin === null
+      ? search.broken[0]
+      : undefined;
+  if (!target) return launchable(search, platform, []);
+  const failures = repairClaudeInstalls(withFs, { only: target.folder });
   return launchable(findRealClaude(withFs), platform, failures);
 }
 
 function launchable(search: ClaudeSearch, platform: NodeJS.Platform, failures: string[]): ClaudeInvoker {
-  if (search.bin) return { bin: search.bin, prefixArgs: [] };
+  if (search.bin) return { bin: search.bin, prefixArgs: search.prefixArgs };
   throw new RealClaudeError(cannotFindClaude(search.candidates, platform, search.broken, failures));
 }
 
 /**
- * Repair every broken npm install the search finds, under ccx's repair lock,
- * at most once in a run. Returns why any of them could not be repaired.
+ * Repair the broken npm installs the search finds (or only the one named),
+ * each under ccx's repair lock, at most once in a run. Returns why any of them
+ * could not be repaired.
  */
-export function repairClaudeInstalls(deps: LaunchDeps): string[] {
+export function repairClaudeInstalls(deps: LaunchDeps, options: RepairOptions = {}): string[] {
   const run = deps.run ?? thisRun;
   if (run.repairTried) return ['ccx already tried to repair it once in this run'];
   run.repairTried = true;
 
   const fs = deps.fs ?? nodeRepairFs;
   const say = deps.say ?? ((line: string) => void process.stderr.write(`${line}\n`));
-  let lockFile: string;
-  try {
-    lockFile = (deps.lockFile ?? (() => path.join(configHome({}), REPAIR_LOCK)))();
-  } catch (err) {
-    return [`ccx could not find its own folder for its repair lock (${(err as Error).message})`];
-  }
-  const lock = deps.lock ?? ((waitMs: number) => takeRepairLock(lockFile, waitMs, deps.platform));
-
   const notRepaired = (reason: string): string[] => {
     say(`ccx: did not repair Claude Code: ${reason}`);
     return [reason];
   };
-  let handle = lock(0);
-  if (!handle.held) {
-    if (!fs.exists(lockFile)) return notRepaired(`ccx could not make its repair lock, ${lockFile}`);
-    say('ccx: another ccx is repairing Claude Code; waiting for it to finish');
-    handle = lock(LOCK_WAIT_MS);
-    if (!handle.held) return notRepaired('another ccx was still repairing it; try again once it has finished');
-  }
+  let lockFile: string;
+  let memory: RepairMemory;
   try {
-    // Looked at again under the lock: the ccx that held it may have repaired it.
-    const failures: string[] = [];
-    for (const install of findRealClaude({ ...deps, fs }).broken) {
-      const repairDeps = { ...deps, fs, say };
-      const result = install.platformProgram ? placeProgram(install, repairDeps) : reinstallWithNpm(install, repairDeps);
-      if (!result.repaired) failures.push(result.reason);
-    }
-    return failures;
-  } finally {
-    handle.release();
+    lockFile = (deps.lockFile ?? (() => path.join(configHome({}), REPAIR_LOCK)))();
+    memory = deps.memory ?? fileRepairMemory((deps.memoryFile ?? (() => path.join(configHome({}), REPAIR_MEMORY)))());
+  } catch (err) {
+    return [`ccx could not find its own folder for its repair lock (${(err as Error).message})`];
   }
+  const lock = deps.lock ?? ((waitMs: number) => takeRepairLock(lockFile, waitMs, deps.platform));
+  const same = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+
+  const failures: string[] = [];
+  const folders = findRealClaude({ ...deps, fs })
+    .broken.filter((install) => options.only === undefined || same(install.folder, options.only))
+    .map((install) => install.folder);
+  for (const folder of folders) {
+    // One hold per install, so no hold outlasts LOCK_MAX_HOLD_MS.
+    let handle = lock(0);
+    // No lock file and no lock: it may have been released in between, so try once more.
+    if (!handle.held && !fs.exists(lockFile)) handle = lock(0);
+    if (!handle.held) {
+      if (!fs.exists(lockFile)) return [...failures, ...notRepaired(`ccx could not make its repair lock, ${lockFile}`)];
+      say('ccx: another ccx is repairing Claude Code; waiting for it to finish');
+      handle = lock(LOCK_WAIT_MS);
+      if (!handle.held) {
+        return [...failures, ...notRepaired('another ccx was still repairing it; try again once it has finished')];
+      }
+    }
+    try {
+      // Looked at again under the lock: the ccx that held it may have repaired it.
+      const install = findRealClaude({ ...deps, fs }).broken.find((found) => same(found.folder, folder));
+      if (install) failures.push(...repairOne(install, { ...deps, fs, say }, memory, options.force === true));
+    } finally {
+      handle.release();
+    }
+  }
+  return failures;
 }
 
-function takeRepairLock(lockFile: string, waitMs: number, platform?: NodeJS.Platform): LockHandle {
+function repairOne(install: BrokenNpmInstall, deps: LaunchDeps & RepairDeps, memory: RepairMemory, force: boolean): string[] {
+  const fs = deps.fs ?? nodeRepairFs;
+  const notRepaired = (reason: string): string[] => {
+    deps.say(`ccx: did not repair Claude Code: ${reason}`);
+    return [reason];
+  };
+  // Asked first: what a failed repair of ccx's own left behind is recent too,
+  // and is not npm at work.
+  const remembered = memory.get(install.folder);
+  if (!force && remembered && remembered.stamp === stampOf(install, fs)) {
+    return notRepaired(
+      `ccx tried on ${remembered.at} and could not (${remembered.reason}); it tries again once the install changes, or when you run ccx doctor --fix`,
+    );
+  }
+  if (install.busy) {
+    return notRepaired(`${install.folder} changed in the last few minutes, so npm may still be installing it; ccx leaves it alone until it settles`);
+  }
+  const result = install.platformProgram ? placeProgram(install, deps) : reinstallWithNpm(install, deps);
+  // ccx's own changes are finished, so nothing here is still being written.
+  const after = inspectNpmInstall(install.folder, fs, deps.arch, { settledMs: 0 });
+  if (result.repaired || after === null) {
+    memory.set(install.folder, null);
+    return [];
+  }
+  memory.set(install.folder, {
+    stamp: stampOf(after, fs),
+    version: install.version,
+    at: new Date((deps.now ?? Date.now)()).toISOString(),
+    reason: result.reason,
+  });
+  return [result.reason];
+}
+
+/** What an install looked like, to tell whether it has changed since a repair failed on it. */
+export function stampOf(install: BrokenNpmInstall, fs: ClaudeFs): string {
+  const p = path.win32;
+  const at = (file: string): string => String(fs.modifiedAt(file) ?? '-');
+  return [
+    install.state,
+    install.version ?? '-',
+    at(install.folder),
+    at(install.program),
+    at(p.join(install.folder, 'package.json')),
+    at(p.join(install.prefix, 'claude.cmd')),
+  ].join('|');
+}
+
+/** Failed repairs, kept in a JSON file in ccx's folder, one per install folder. */
+export function fileRepairMemory(file: string): RepairMemory {
+  const read = (): Record<string, FailedRepair> => {
+    try {
+      const data = JSON.parse(readFileSync(file, 'utf8')) as unknown;
+      return data !== null && typeof data === 'object' ? (data as Record<string, FailedRepair>) : {};
+    } catch {
+      return {};
+    }
+  };
+  return {
+    get: (folder) => {
+      const entry = read()[folder.toLowerCase()];
+      return entry && typeof entry.stamp === 'string' && typeof entry.reason === 'string' ? entry : null;
+    },
+    set: (folder, failed) => {
+      const all = read();
+      const key = folder.toLowerCase();
+      if (!failed && !(key in all)) return;
+      if (failed) all[key] = failed;
+      else delete all[key];
+      try {
+        writeJsonFile(file, all);
+      } catch {
+        // Only a courtesy: without it the next run tries the repair again.
+      }
+    },
+  };
+}
+
+export function takeRepairLock(
+  lockFile: string,
+  waitMs: number,
+  platform?: NodeJS.Platform,
+  clock: Pick<OwnedLockOptions, 'now' | 'isRunning'> = {},
+): LockHandle {
   try {
     mkdirSync(path.dirname(lockFile), { recursive: true });
   } catch {
@@ -167,6 +294,7 @@ function takeRepairLock(lockFile: string, waitMs: number, platform?: NodeJS.Plat
     staleMs: 60_000,
     maxHoldMs: LOCK_MAX_HOLD_MS,
     ...(platform ? { platform } : {}),
+    ...clock,
   });
 }
 
@@ -234,11 +362,36 @@ export function placeProgram(install: BrokenNpmInstall, deps: Pick<RepairDeps, '
   return { repaired: true };
 }
 
+/**
+ * Put the placeholder back where it was, unless something took its place
+ * meanwhile, such as Claude's own setup finishing. A link never replaces a
+ * file, where a rename on Windows does, so it goes first; a real program that
+ * arrived is kept and the placeholder beside it removed.
+ */
 function putBack(fs: RepairFs, aside: string, to: string): void {
+  const keepWhatArrived = (): void => {
+    if (isWindowsProgram(fs, to) !== true) return; // left beside, under its own name
+    try {
+      fs.remove(aside);
+    } catch {
+      // A placeholder beside the program does no harm.
+    }
+  };
   try {
-    fs.rename(aside, to);
+    fs.link(aside, to);
+  } catch (err) {
+    if (codeOf(err) === 'EEXIST' || fs.exists(to)) return keepWhatArrived();
+    try {
+      fs.rename(aside, to);
+    } catch {
+      // It stays beside, under its own name; nothing is lost.
+    }
+    return;
+  }
+  try {
+    fs.remove(aside);
   } catch {
-    // It stays beside, under its own name; nothing is lost.
+    // Both names hold the placeholder, which does no harm.
   }
 }
 
@@ -271,7 +424,8 @@ export function reinstallWithNpm(install: BrokenNpmInstall, deps: RepairDeps): R
     return { repaired: false, reason };
   }
 
-  const after = inspectNpmInstall(install.folder, fs, deps.arch);
+  // npm has exited, so what it wrote is finished, however recent.
+  const after = inspectNpmInstall(install.folder, fs, deps.arch, { settledMs: 0 });
   if (after?.platformProgram) {
     deps.say('ccx: npm reinstalled Claude Code but did not put its program in place');
     return placeProgram(after, deps);

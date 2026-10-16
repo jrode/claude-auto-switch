@@ -153,7 +153,7 @@ import {
 } from '../claude/locks.js';
 import { logCredentialEvent } from '../accounts/credential-log.js';
 import { appendEvent, type EventDetail } from '../events/log.js';
-import { getClaude, type CliContext } from '../context.js';
+import { claudeForSession, type CliContext } from '../context.js';
 import type { Account } from '../accounts/registry.schema.js';
 
 const CREDS = '.credentials.json';
@@ -458,7 +458,7 @@ export async function runInteractiveHotSwap(
     claudeArgs: string[];
     startPrompt: string | null;
   } | null = null;
-  const claude = getClaude(context);
+  const claude = claudeForSession(context, worker !== null);
   // A directory of this session's OWN, never one shared with other sessions.
   // Starting a session copies the chosen account's login into here, so while
   // this was shared the second session to start took the first one's account:

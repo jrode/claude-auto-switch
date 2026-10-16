@@ -6,6 +6,7 @@ import { findRealClaude, resolveRealClaude, whereItIsUsuallyInstalled, type Clau
 import { RealClaudeError } from '../util/errors.js';
 import {
   memoryWindowsFs,
+  NPM_CLI_JS_CMD_SHIM,
   NPM_CMD_SHIM,
   NPM_PLACEHOLDER,
   NPM_PS1_SHIM,
@@ -20,7 +21,9 @@ const SHIM = `${PREFIX}\\claude`;
 const CMD = `${PREFIX}\\claude.cmd`;
 const PKG = `${PREFIX}\\node_modules\\@anthropic-ai\\claude-code`;
 const PKG_JSON = `${PKG}\\package.json`;
-const PACKAGE_JSON = '{"name":"@anthropic-ai/claude-code","version":"2.1.302"}';
+// As 2.1.302 ships it: its bin is the program, not the cli.js of 2.1.110 and older.
+const PACKAGE_JSON = '{"name":"@anthropic-ai/claude-code","version":"2.1.302","bin":{"claude":"bin/claude.exe"}}';
+const OLD_PACKAGE_JSON = '{"name":"@anthropic-ai/claude-code","version":"2.1.110","bin":{"claude":"cli.js"}}';
 const BIN = `${PKG}\\bin\\claude.exe`;
 const NESTED = `${PKG}\\node_modules\\@anthropic-ai\\claude-code-win32-x64\\claude.exe`;
 const HOISTED = `${PREFIX}\\node_modules\\@anthropic-ai\\claude-code-win32-x64\\claude.exe`;
@@ -188,6 +191,7 @@ describe('a Claude Code npm install that has lost its program (Windows)', () => 
         state: 'missing',
         platformProgram: NESTED,
         version: '2.1.302',
+        busy: false,
       },
     ]);
   });
@@ -235,7 +239,10 @@ describe('a Claude Code npm install that has lost its program (Windows)', () => 
   });
 
   it('keeps a version only when it is one', () => {
-    const fs = memoryWindowsFs({ [CMD]: NPM_CMD_SHIM, [PKG_JSON]: '{"version":"2.1.302 --registry=http://x"}' });
+    const fs = memoryWindowsFs({
+      [CMD]: NPM_CMD_SHIM,
+      [PKG_JSON]: '{"version":"2.1.302 --registry=http://x","bin":{"claude":"bin/claude.exe"}}',
+    });
     const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs });
     expect(search.broken[0]?.version).toBeNull();
   });
@@ -248,7 +255,7 @@ describe('a Claude Code npm install that has lost its program (Windows)', () => 
     const search = findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs });
     expect(search.bin).toBeNull();
     expect(search.broken).toEqual([
-      { folder: PKG, prefix: PREFIX, program: BIN, state: 'folder-missing', platformProgram: null, version: null },
+      { folder: PKG, prefix: PREFIX, program: BIN, state: 'folder-missing', platformProgram: null, version: null, busy: false },
     ]);
     const message = brokenMessage(fs);
     expect(message).toContain(PKG);
@@ -279,6 +286,81 @@ describe('a Claude Code npm install that has lost its program (Windows)', () => 
     const message = brokenMessage(fs);
     expect(message).toContain('none of them can be launched directly');
     expect(message).not.toContain('missing its program');
+  });
+});
+
+describe('an older Claude Code, which runs cli.js (Windows)', () => {
+  // 2.1.110 and older ship bin: cli.js and no bin\claude.exe, so the missing
+  // program is no sign of a broken install there.
+  const NODE = `${PREFIX}\\node.exe`;
+  const SCRIPT = `${PKG}\\cli.js`;
+  const oldInstall = (extra: Record<string, string | null> = {}): MemoryFs =>
+    memoryWindowsFs({
+      [SHIM]: '',
+      [CMD]: NPM_CLI_JS_CMD_SHIM,
+      [PKG_JSON]: OLD_PACKAGE_JSON,
+      [SCRIPT]: '#!/usr/bin/env node\n',
+      ...extra,
+    });
+
+  it('is launched as node running its cli.js, and never counted as broken', () => {
+    const fs = oldInstall({ [NODE]: WINDOWS_PROGRAM });
+    const search = findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs });
+    expect(search.broken).toEqual([]);
+    expect(resolveRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs })).toEqual({
+      bin: NODE,
+      prefixArgs: [SCRIPT],
+    });
+  });
+
+  it('runs on the node running ccx when the prefix has no node.exe', () => {
+    const ours = 'C:\\Program Files\\nodejs\\node.exe';
+    const claude = resolveRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs: oldInstall(), execPath: ours });
+    expect(claude).toEqual({ bin: ours, prefixArgs: [SCRIPT] });
+  });
+
+  it('never takes the node.exe its .cmd names for Claude', () => {
+    // Without the package to read, all that is left is the .cmd, whose first
+    // .exe is the node that runs the script.
+    const fs = memoryWindowsFs({ [CMD]: NPM_CLI_JS_CMD_SHIM, [NODE]: WINDOWS_PROGRAM });
+    expect(findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs }).bin).toBeNull();
+  });
+});
+
+describe('an install npm may still be writing (Windows)', () => {
+  const NOW = Date.parse('2026-10-16T22:00:00Z');
+  const SCOPE = `${PREFIX}\\node_modules\\@anthropic-ai`;
+
+  it('never takes a platform program that changed in the last few minutes, which may be half written', () => {
+    const fs = memoryWindowsFs(
+      { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER, [NESTED]: WINDOWS_PROGRAM },
+      { modified: { [NESTED]: NOW - 5_000 } },
+    );
+    const search = findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, now: () => NOW });
+    expect(search.bin).toBeNull();
+    expect(search.broken[0]).toMatchObject({ busy: true, platformProgram: null });
+    expect(() =>
+      resolveRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, now: () => NOW }),
+    ).toThrow('npm may still be installing it');
+  });
+
+  it('counts a moved-aside folder npm is still working in as an update running', () => {
+    const fs = memoryWindowsFs(
+      { [CMD]: NPM_CMD_SHIM, [`${SCOPE}\\.claude-code-Ab3dE9xQ\\package.json`]: PACKAGE_JSON },
+      { modified: { [SCOPE]: NOW - 60_000 } },
+    );
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, now: () => NOW });
+    expect(search.broken[0]).toMatchObject({ state: 'folder-missing', busy: true });
+  });
+
+  it('takes the platform program once the install has settled', () => {
+    const fs = memoryWindowsFs(
+      { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER, [NESTED]: WINDOWS_PROGRAM },
+      { modified: { [NESTED]: NOW - 10 * 60_000, [SCOPE]: NOW - 10 * 60_000 } },
+    );
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, now: () => NOW });
+    expect(search.bin).toBe(NESTED);
+    expect(search.broken[0]?.busy).toBe(false);
   });
 });
 

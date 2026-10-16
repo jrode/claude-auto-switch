@@ -31,13 +31,25 @@ semantic versioning.
     and left behind, if there is one, and is otherwise the current release.
     ccx starts npm as `node.exe` running npm's own script, since Node refuses
     to start `npm.cmd` without a shell.
-  - The repair runs only when Claude cannot otherwise start from that install,
-    at most once per run, and never while another ccx is repairing; that ccx
-    is waited for instead.
+  - A launch repairs only the install it is about to start, and only when
+    Claude cannot otherwise start from it; at most once per run, and never
+    while another ccx is repairing, which it waits for instead. `ccx doctor
+    --fix` repairs every broken install it finds.
+  - An install that changed in the last few minutes is left alone, since npm
+    may still be writing it, and nothing is taken from it.
+  - A repair that did not work is written down, and ccx does not run npm for
+    that install again until the install changes. `ccx doctor` says so, and
+    `ccx doctor --fix` tries again.
+  - `ccx worker` never repairs, since a repair can take minutes and a worker
+    has to stop when its `--timeout` says; it stops at once with the message.
+  - An older Claude Code that runs `cli.js` (2.1.110 and older) is never taken
+    for a broken install, and is started as node running its `cli.js`, where
+    ccx used to start node itself.
   - When the repair cannot help, the message names the install folder, says it
     is missing its program and what most likely caused that, and gives the
     fix: close every Claude window, then run
-    `npm i -g @anthropic-ai/claude-code`, or install the native build.
+    `npm i -g @anthropic-ai/claude-code`, install the native build, or run
+    `ccx doctor --fix`.
   - `ccx doctor` reports such an install, and `ccx doctor --fix` repairs it.
 
 ## [2.6.6]
