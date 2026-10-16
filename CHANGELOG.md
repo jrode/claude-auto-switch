@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.7]
+
+### Fixed
+
+- **On Windows, ccx repairs an npm install of Claude Code that has lost its
+  program, and starts Claude.** Claude Code's npm package ships
+  `bin\claude.exe` as a short placeholder script, and its setup step puts the
+  real program over it from a second package, `@anthropic-ai/claude-code-win32-x64`
+  (or `-arm64`). An update that runs while Claude is open can stop part way
+  and leave the install with only the placeholder, or with nothing, while
+  npm's `claude` and `claude.cmd` stay behind. ccx then said it had found
+  `claude.cmd` and could not launch it, and gave no fix. Now:
+  - ccx never picks the placeholder. It tells it apart by its first bytes,
+    since every Windows program starts with "MZ" and the placeholder does not.
+  - When the second package still holds the real program, ccx puts it back in
+    place the way the package's own setup does, with a hardlink or else a
+    copy, and needs no network. It replaces only the placeholder or an empty
+    spot, never a real program, and leaves a file another process has open
+    alone. If that fails, ccx starts Claude from the second package directly.
+  - Otherwise ccx reinstalls the same version with the npm that belongs to the
+    folder, saying so before and after, with npm's own output in between.
+  - The repair runs only when Claude cannot otherwise start from that install,
+    at most once per run, and never while another ccx is repairing; that ccx
+    is waited for instead.
+  - When the repair cannot help, the message names the install folder, says it
+    is missing its program, which usually happens when an update ran while
+    Claude was open, and gives the fix: close every Claude window, then run
+    `npm i -g @anthropic-ai/claude-code`, or install the native build.
+  - `ccx doctor` reports such an install, and `ccx doctor --fix` repairs it.
+
 ## [2.6.6]
 
 ### Fixed

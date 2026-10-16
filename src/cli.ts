@@ -357,8 +357,9 @@ program
 program
   .command('doctor')
   .description('check the setup: each shell, accounts, logins, editors and more')
-  .action(async () => {
-    process.exitCode = await doctorCommand(context());
+  .option('--fix', 'first repair what ccx can by itself: a Claude Code npm install that has lost its program')
+  .action(async (opts: { fix?: boolean }) => {
+    process.exitCode = await doctorCommand(context(), {}, { fix: opts.fix === true });
   });
 
 program

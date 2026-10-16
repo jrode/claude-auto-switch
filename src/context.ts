@@ -1,7 +1,9 @@
+import path from 'node:path';
 import { loadConfig } from './config/config.js';
 import { resolveRealClaude } from './launcher/real-claude.js';
+import { REPAIR_LOCK, resolveClaudeForLaunch } from './launcher/claude-repair.js';
 import type { Config } from './config/config.schema.js';
-import type { PathCtx } from './config/paths.js';
+import { configHome, type PathCtx } from './config/paths.js';
 import type { ClaudeInvoker } from './invoker.js';
 import type { LimitProbeResult, LimitVerdict } from './usage/limit-probe.js';
 import type { BlockedWatchOptions } from './launcher/blocked-watch.js';
@@ -98,10 +100,32 @@ export function buildContext(options: BuildContextOptions = {}): CliContext {
   };
 }
 
-/** Resolve the claude invoker lazily so commands that never touch claude never look it up. */
+/**
+ * Resolve the claude invoker lazily so commands that never touch claude never
+ * look it up. It is about to be launched, so on Windows an npm install of
+ * Claude Code that has lost its program is repaired first (claude-repair).
+ */
 export function getClaude(context: CliContext): ClaudeInvoker {
-  return (
-    context.claude ??
-    resolveRealClaude({ config: context.config, platform: context.ctx.platform })
-  );
+  return context.claude ?? resolveClaudeForLaunch({ config: context.config, ...claudeRepairDeps(context) });
+}
+
+/**
+ * What a repair of Claude's install needs from a run. Every repair takes this
+ * one lock, the launch's and `ccx doctor --fix`'s alike, so no two overlap.
+ */
+export function claudeRepairDeps(context: CliContext): {
+  platform: NodeJS.Platform | undefined;
+  lockFile: () => string;
+  say: (message: string) => void;
+} {
+  return {
+    platform: context.ctx.platform,
+    lockFile: () => path.join(configHome(context.ctx), REPAIR_LOCK),
+    say: context.err ?? ((message) => void process.stderr.write(`${message}\n`)),
+  };
+}
+
+/** The claude invoker as things are, repairing nothing: for commands that only report. */
+export function getClaudeAsIs(context: CliContext): ClaudeInvoker {
+  return context.claude ?? resolveRealClaude({ config: context.config, platform: context.ctx.platform });
 }

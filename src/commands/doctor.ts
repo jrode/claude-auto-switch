@@ -27,7 +27,14 @@ import { sharedLoginGroups } from '../accounts/duplicate-guard.js';
 import { loadLedger } from '../ledger/ledger.js';
 import { probeAll } from '../health/prober.js';
 import { codes, paint } from '../ui/style.js';
-import { getClaude, type CliContext } from '../context.js';
+import { claudeRepairDeps, getClaudeAsIs, type CliContext } from '../context.js';
+import {
+  cannotFindClaude,
+  describeBrokenInstall,
+  findRealClaude,
+  type ClaudeSearch,
+} from '../launcher/real-claude.js';
+import { repairClaudeInstalls } from '../launcher/claude-repair.js';
 import type { ClaudeInvoker } from '../invoker.js';
 import { signedInAndNotRejected } from '../health/signed-in.js';
 import { settingsPath, readSettings, isOurs } from '../statusline/settings-install.js';
@@ -52,8 +59,12 @@ export interface DoctorCheck {
 export interface DoctorDeps {
   /** Tracked file list (defaults to `git ls-files`); injected in tests. */
   gitTrackedFiles?: () => string[];
-  /** Claude resolver (defaults to getClaude); injected in tests. */
+  /** Claude resolver, standing in for the whole search; injected in tests. */
   resolveClaude?: () => ClaudeInvoker;
+  /** The search for Claude, repairing nothing; injected in tests. */
+  findClaude?: () => ClaudeSearch;
+  /** What `--fix` runs for a broken Claude Code npm install; injected in tests, which never run npm. */
+  repairClaude?: () => string[];
   /** Browser debug-port reachability probe; injected in tests. */
   checkBrowserPort?: (port: number) => Promise<boolean>;
   /** Whether nobody is at a browser here; read from the session when absent. */
@@ -105,13 +116,46 @@ function auditConfig(context: CliContext): DoctorCheck {
   };
 }
 
+/**
+ * Which claude ccx would start. Only looks: a Claude Code npm install that has
+ * lost its program is reported with `ccx doctor --fix`, which repairs it, as
+ * starting Claude through ccx would.
+ */
 function auditRealClaude(context: CliContext, deps: DoctorDeps): DoctorCheck {
-  try {
-    const claude = (deps.resolveClaude ?? (() => getClaude(context)))();
-    return { name: 'real-claude', ok: true, detail: `resolved to ${claude.bin}` };
-  } catch (err) {
-    return { name: 'real-claude', ok: false, detail: (err as Error).message };
+  const name = 'real-claude';
+  if (deps.resolveClaude || context.claude || context.config.realClaudePath) {
+    try {
+      const claude = (deps.resolveClaude ?? (() => getClaudeAsIs(context)))();
+      return { name, ok: true, detail: `resolved to ${claude.bin}` };
+    } catch (err) {
+      return { name, ok: false, detail: (err as Error).message };
+    }
   }
+  const platform = context.ctx.platform ?? process.platform;
+  const search = (deps.findClaude ?? (() => findRealClaude({ platform })))();
+  const repair = search.broken.length > 0 ? { fix: ['ccx doctor --fix'] } : {};
+  if (!search.bin) {
+    return { name, ok: false, detail: cannotFindClaude(search.candidates, platform, search.broken), ...repair };
+  }
+  if (search.broken.length === 0) return { name, ok: true, detail: `resolved to ${search.bin}` };
+  return {
+    name,
+    ok: true,
+    note: true,
+    detail: `resolved to ${search.bin}, but Claude Code's npm install is missing its program: ${search.broken
+      .map(describeBrokenInstall)
+      .join('; ')}`,
+    ...repair,
+  };
+}
+
+/** `ccx doctor --fix`: the repair a launch makes, run when the search finds a broken npm install. */
+function repairClaudeIfBroken(context: CliContext, deps: DoctorDeps): void {
+  if (deps.resolveClaude || context.claude || context.config.realClaudePath) return;
+  const platform = context.ctx.platform ?? process.platform;
+  const search = (deps.findClaude ?? (() => findRealClaude({ platform })))();
+  if (search.broken.length === 0) return;
+  (deps.repairClaude ?? (() => repairClaudeInstalls(claudeRepairDeps(context))))();
 }
 
 /** Informational: is Chrome listening on the debug port (needed only for auto-login)? */
@@ -382,7 +426,7 @@ export async function auditAccounts(context: CliContext): Promise<DoctorCheck> {
   try {
     // Ask claude itself: a credential FILE can exist while its token is dead,
     // and a doctor that reports a dead login as healthy is worse than none.
-    const healths = await probeAll(accounts, { claude: getClaude(context) });
+    const healths = await probeAll(accounts, { claude: getClaudeAsIs(context) });
     loggedInNames = signedInAndNotRejected(healths, accounts, context.ctx);
   } catch {
     loggedInNames = new Set(
@@ -668,8 +712,17 @@ const LABELS: Record<string, string> = {
   'page-routing': 'pages',
 };
 
-/** Print the doctor report and return 0 when all checks pass, 1 otherwise. */
-export async function doctorCommand(context: CliContext, deps: DoctorDeps = {}): Promise<number> {
+/**
+ * Print the doctor report and return 0 when all checks pass, 1 otherwise.
+ * With `fix`, first repair what ccx can repair by itself; the report then says
+ * how things are after it.
+ */
+export async function doctorCommand(
+  context: CliContext,
+  deps: DoctorDeps = {},
+  options: { fix?: boolean } = {},
+): Promise<number> {
+  if (options.fix) repairClaudeIfBroken(context, deps);
   const { checks, ok } = await runDoctor(context, deps);
   const color = process.stdout.isTTY === true && !context.json;
 

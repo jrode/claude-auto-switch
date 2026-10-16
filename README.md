@@ -65,6 +65,25 @@ runs it:
 (`pwsh` for PowerShell 7). Then run `ccx on` again. When Group Policy sets it,
 that command changes nothing, so doctor says to ask an administrator instead.
 
+### Finding Claude on Windows
+
+ccx starts Claude's own program, `claude.exe`, never npm's `claude.cmd`, which
+Windows cannot start without a shell. It looks on `PATH`, where Claude installs
+itself, and beside npm's `claude.cmd` in
+`node_modules\@anthropic-ai\claude-code\bin\claude.exe`.
+
+npm installs that file as a short placeholder script, and Claude Code's setup
+step then puts the real program over it from a second package,
+`@anthropic-ai/claude-code-win32-x64` (or `-arm64`). An update that runs while
+Claude is open can stop part way and leave only the placeholder, or nothing.
+ccx repairs that before it starts Claude: from the second package when it is
+still there, with no download, or else by reinstalling the same version with
+npm. `ccx doctor` reports such an install and `ccx doctor --fix` repairs it.
+If the repair cannot help, close every Claude window, then run
+`npm i -g @anthropic-ai/claude-code`, or install the
+[native build](https://code.claude.com/docs/en/setup). To point ccx at a Claude
+somewhere else, set `realClaudePath`.
+
 ## How it works
 
 **A config folder per session.** Claude reads its login from its config folder
@@ -413,7 +432,7 @@ are already in `~/.claude/settings.json`.
 | `ccx login --host <host> [name]`         | sign in a server's accounts from here, over SSH (`--all`, `--remote-ccx <path>`)                                         |
 | `ccx keepalive on\|off\|status`          | renew idle logins every four hours with cron, for a machine nobody uses                                                  |
 | `ccx list` / `status [name]`             | account health: email, plan, signed in, capped until                                                                     |
-| `ccx doctor`                             | check the setup, shell by shell, and who each profile really is                                                          |
+| `ccx doctor`                             | check the setup, shell by shell, and who each profile really is (`--fix`: repair a broken npm install of Claude first)   |
 | `ccx history`                            | what ccx did to logins, sessions and your settings                                                                       |
 | `ccx state`                              | everything ccx knows, as JSON                                                                                            |
 | `ccx cap <name>`                         | mark an account out by hand (`--clear`)                                                                                  |
