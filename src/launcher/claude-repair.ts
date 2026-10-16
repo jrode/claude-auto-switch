@@ -22,10 +22,10 @@ import {
  *
  * The package ships `bin\claude.exe` as a placeholder script, and its
  * postinstall puts the real program over it from the platform package
- * (`@anthropic-ai/claude-code-win32-x64` or `-arm64`). An update that runs
- * while Claude is open can fail part way, and leave the install with the
- * placeholder, or with nothing, under npm's shims. Claude then cannot start
- * at all, so ccx repairs it before launching, and only then.
+ * (`@anthropic-ai/claude-code-win32-x64` or `-arm64`). An install can lose
+ * that program and keep the placeholder, or nothing, under npm's shims; an
+ * update that ran while Claude was open is the suspected cause (#138). Claude
+ * then cannot start at all, so ccx repairs it before launching, and only then.
  */
 
 /** The file changes a repair makes, on top of what the search reads. */

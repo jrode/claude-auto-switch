@@ -116,10 +116,11 @@ describe('resolveRealClaude', () => {
 describe('a Claude Code npm install that has lost its program (Windows)', () => {
   // Claude Code's npm package ships bin\claude.exe as a short placeholder
   // script, and its postinstall puts the real program over it from the
-  // platform package. An update that runs while Claude is open can leave the
-  // install with only the placeholder, or with nothing there at all, while
-  // npm's claude and claude.cmd stay behind. On the owner's PC ccx then said it
-  // found claude.cmd and could not launch it, and named no fix.
+  // platform package. An install can lose that program and keep only the
+  // placeholder, or nothing at all, while npm's claude and claude.cmd stay
+  // behind (an update that ran while Claude was open is the suspected cause).
+  // On the owner's PC ccx then said it found claude.cmd and could not launch
+  // it, and named no fix.
 
   const brokenMessage = (fs: MemoryFs, arch = 'x64'): string => {
     try {

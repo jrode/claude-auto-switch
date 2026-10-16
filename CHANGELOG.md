@@ -12,10 +12,12 @@ semantic versioning.
   program, and starts Claude.** Claude Code's npm package ships
   `bin\claude.exe` as a short placeholder script, and its setup step puts the
   real program over it from a second package, `@anthropic-ai/claude-code-win32-x64`
-  (or `-arm64`). An update that runs while Claude is open can stop part way
-  and leave the install with only the placeholder, or with nothing, while
-  npm's `claude` and `claude.cmd` stay behind. ccx then said it had found
-  `claude.cmd` and could not launch it, and gave no fix. Now:
+  (or `-arm64`). When the install loses its program, it is left with only the
+  placeholder, or with nothing, while npm's `claude` and `claude.cmd` stay
+  behind. The suspected cause, not yet confirmed (#138), is an update that ran
+  while Claude was open and stopped part way, since Windows will not let a
+  running program be replaced. ccx then said it had found `claude.cmd` and
+  could not launch it, and gave no fix. Now:
   - ccx never picks the placeholder. It tells it apart by its first bytes,
     since every Windows program starts with "MZ" and the placeholder does not.
   - When the second package still holds the real program, ccx puts it back in
@@ -29,8 +31,8 @@ semantic versioning.
     at most once per run, and never while another ccx is repairing; that ccx
     is waited for instead.
   - When the repair cannot help, the message names the install folder, says it
-    is missing its program, which usually happens when an update ran while
-    Claude was open, and gives the fix: close every Claude window, then run
+    is missing its program and what most likely caused that, and gives the
+    fix: close every Claude window, then run
     `npm i -g @anthropic-ai/claude-code`, or install the native build.
   - `ccx doctor` reports such an install, and `ccx doctor --fix` repairs it.
 
