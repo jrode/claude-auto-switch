@@ -597,6 +597,15 @@ describe('doctor and a Claude Code npm install that has lost its program', () =>
     expect(repairs).toEqual([]);
   });
 
+  it('reports a package folder that is gone the same way', async () => {
+    const gone: BrokenNpmInstall = { ...missing, state: 'folder-missing', version: null };
+    const { claude, repairs } = await report({ bin: null, fromPlatformPackage: false, candidates: shims, broken: [gone] });
+    expect(claude?.ok).toBe(false);
+    expect(claude?.detail).toContain('the folder is not there');
+    expect(claude?.fix).toEqual(['ccx doctor --fix']);
+    expect(repairs).toEqual([]);
+  });
+
   it('runs the repair with --fix', async () => {
     const { repairs } = await report({ bin: null, fromPlatformPackage: false, candidates: shims, broken: [missing] }, true);
     expect(repairs).toEqual(['repaired']);

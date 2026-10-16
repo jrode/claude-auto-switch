@@ -1,12 +1,16 @@
 import { describe, it, expect } from 'vitest';
+import type { SpawnSyncOptions } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { buildContext, getClaude, getClaudeAsIs } from '../context.js';
 import {
+  nodeRepairFs,
+  npmFor,
   placeProgram,
   repairClaudeInstalls,
   resolveClaudeForLaunch,
+  runNpm,
   type LaunchDeps,
   type NpmRun,
 } from './claude-repair.js';
@@ -17,6 +21,7 @@ import {
   memoryWindowsFs,
   NPM_CMD_SHIM,
   NPM_PLACEHOLDER,
+  NPM_SH_SHIM,
   WINDOWS_PROGRAM,
   type MemoryFs,
 } from '../../test/memory-claude-fs.js';
@@ -312,11 +317,90 @@ describe('repairing an npm install by reinstalling it with npm', () => {
     expect(messageOf(() => resolveClaudeForLaunch(h.deps))).toContain('still only the placeholder');
   });
 
+  it('reinstalls a package folder that is gone, at the version npm left in the folder it moved aside', () => {
+    const retired = `${PREFIX}\\node_modules\\@anthropic-ai\\.claude-code-Ab3dE9xQ\\package.json`;
+    const fs = memoryWindowsFs({
+      [SHIM]: NPM_SH_SHIM,
+      [CMD]: NPM_CMD_SHIM,
+      [retired]: '{"name":"@anthropic-ai/claude-code","version":"2.1.300"}',
+      [NODE]: WINDOWS_PROGRAM,
+      [NPM_CLI]: '',
+    });
+    const h = harness(fs, { npm: reinstalled });
+    expect(resolveClaudeForLaunch(h.deps).bin).toBe(BIN);
+    expect(h.npmCalls).toEqual([
+      {
+        node: NODE,
+        args: [NPM_CLI, 'install', '--global', '--prefix', PREFIX, '@anthropic-ai/claude-code@2.1.300'],
+      },
+    ]);
+  });
+
+  it('installs the current release when the folder is gone and left no package.json', () => {
+    const fs = memoryWindowsFs({ [SHIM]: NPM_SH_SHIM, [CMD]: NPM_CMD_SHIM, [NODE]: WINDOWS_PROGRAM, [NPM_CLI]: '' });
+    const h = harness(fs, { npm: reinstalled });
+    expect(resolveClaudeForLaunch(h.deps).bin).toBe(BIN);
+    expect(h.npmCalls[0]?.args.at(-1)).toBe('@anthropic-ai/claude-code');
+  });
+
+  it('says so when npm finishes and the folder is still not there', () => {
+    const fs = memoryWindowsFs({ [CMD]: NPM_CMD_SHIM, [NODE]: WINDOWS_PROGRAM, [NPM_CLI]: '' });
+    const h = harness(fs, { candidates: [CMD], npm: () => ({ status: 0 }) });
+    expect(messageOf(() => resolveClaudeForLaunch(h.deps))).toContain(`${PKG} is still not there`);
+  });
+
+  it('never reinstalls for shims that point somewhere other than their own node_modules', () => {
+    const fs = memoryWindowsFs({
+      [CMD]: '"D:\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"   %*\r\n',
+      [SHIM]: 'exec "$basedir/tools/claude.exe" "$@"\n',
+      [NODE]: WINDOWS_PROGRAM,
+      [NPM_CLI]: '',
+    });
+    const h = harness(fs);
+    expect(() => resolveClaudeForLaunch(h.deps)).toThrow(RealClaudeError);
+    expect(h.npmCalls).toEqual([]);
+    expect(h.locks).toEqual([]);
+  });
+
   it('gives the manual steps when no npm can be found for the folder', () => {
     const fs = memoryWindowsFs(missingInstall({ [NPM_CLI]: null, [NODE]: null }));
     const h = harness(fs);
     expect(messageOf(() => resolveClaudeForLaunch(h.deps))).toContain('found no npm');
     expect(h.npmCalls).toEqual([]);
+  });
+});
+
+describe('how the repair starts npm', () => {
+  it('runs the node it is given on npm-cli.js, with no shell and its output on stderr', () => {
+    // npm on Windows is npm.cmd, which Node 20.12 and later refuse to start
+    // without a shell. Starting node.exe on npm's own script needs none.
+    const calls: Array<{ command: string; args: string[]; options: SpawnSyncOptions }> = [];
+    const run = runNpm(NODE, [NPM_CLI, 'install'], (command, args, options) => {
+      calls.push({ command, args, options });
+      return { status: 0 };
+    });
+    expect(run).toEqual({ status: 0 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.command).toBe(NODE);
+    expect(calls[0]?.args).toEqual([NPM_CLI, 'install']);
+    expect(calls[0]?.options.shell).toBeUndefined();
+    expect(calls[0]?.options.stdio).toEqual(['ignore', 2, 2]);
+  });
+
+  it('reports a timeout as npm taking too long', () => {
+    const timedOut = Object.assign(new Error('spawnSync node.exe ETIMEDOUT'), { code: 'ETIMEDOUT' });
+    const run = runNpm(NODE, [NPM_CLI], () => ({ status: null, error: timedOut }));
+    expect(run.error).toContain('took longer than');
+  });
+
+  // The real thing, where it matters: on Windows, npm started exactly as a
+  // repair starts it answers, so the repair is not refused before npm runs.
+  it.skipIf(process.platform !== 'win32')('starts the real npm on Windows the way a repair does', () => {
+    const npm = npmFor(path.dirname(process.execPath), nodeRepairFs, process.execPath);
+    expect(npm).not.toBeNull();
+    if (!npm) return;
+    expect(npm.node.toLowerCase().endsWith('node.exe')).toBe(true);
+    expect(runNpm(npm.node, [npm.cli, '--version'])).toEqual({ status: 0 });
   });
 });
 

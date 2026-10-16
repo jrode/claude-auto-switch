@@ -27,6 +27,23 @@ export const NPM_CMD_SHIM = [
   '',
 ].join('\r\n');
 
+/** The `claude.ps1` npm writes beside it. */
+export const NPM_PS1_SHIM = [
+  '#!/usr/bin/env pwsh',
+  '$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent',
+  '& "$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe"   $args',
+  'exit $LASTEXITCODE',
+  '',
+].join('\n');
+
+/** The extensionless `claude` npm writes for Git Bash. */
+export const NPM_SH_SHIM = [
+  '#!/bin/sh',
+  'basedir=$(dirname "$0")',
+  'exec "$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe"   "$@"',
+  '',
+].join('\n');
+
 export interface MemoryFsOptions {
   /** Files another process holds open in a way that stops Windows renaming or removing them. */
   inUse?: string[];
@@ -97,6 +114,15 @@ export function memoryWindowsFs(layout: Record<string, string | null>, options: 
       return Buffer.from(content, 'latin1').subarray(0, bytes);
     },
     readText: (f) => (unreadable.has(key(f)) ? null : (files.get(key(f)) ?? null)),
+    list: (dir) => {
+      const inside = `${key(dir)}\\`;
+      const names = new Set<string>();
+      for (const f of [...files.keys(), ...dirs]) {
+        const name = f.startsWith(inside) ? f.slice(inside.length).split('\\')[0] : undefined;
+        if (name) names.add(name);
+      }
+      return [...names];
+    },
     link: (from, to) => place(from, to, options.refuse?.link, 'link'),
     copyNew: (from, to) => place(from, to, options.refuse?.copy, 'copy'),
     rename: (from, to) => {

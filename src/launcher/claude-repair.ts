@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
 import { constants, copyFileSync, linkSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { acquireOwnedLock, type LockHandle } from '../claude/locks.js';
@@ -277,7 +277,13 @@ export function reinstallWithNpm(install: BrokenNpmInstall, deps: RepairDeps): R
     return placeProgram(after, deps);
   }
   if (after) {
-    const reason = `npm finished, but ${after.program} is ${after.state === 'missing' ? 'still not there' : 'still only the placeholder'}`;
+    const still =
+      after.state === 'folder-missing'
+        ? `${after.folder} is still not there`
+        : after.state === 'missing'
+          ? `${after.program} is still not there`
+          : `${after.program} is still only the placeholder`;
+    const reason = `npm finished, but ${still}`;
     deps.say(`ccx: ${reason}`);
     return { repaired: false, reason };
   }
@@ -288,10 +294,11 @@ export function reinstallWithNpm(install: BrokenNpmInstall, deps: RepairDeps): R
 /**
  * The npm that belongs to the prefix: the one installed in it (as with
  * nvm-windows and the Node.js installer), else the one beside the node running
- * ccx. Run as `node npm-cli.js`, since Windows will not start `npm.cmd` without
- * a shell.
+ * ccx. It is run as `node.exe npm-cli.js`, which is what `npm.cmd` runs, and
+ * never as `npm.cmd` itself: Node 20.12 and later refuse to start a .cmd
+ * without a shell (EINVAL), and a shell would have to quote every argument.
  */
-function npmFor(prefix: string, fs: ClaudeFs, execPath: string): { node: string; cli: string } | null {
+export function npmFor(prefix: string, fs: ClaudeFs, execPath: string): { node: string; cli: string } | null {
   const p = path.win32;
   const own = p.join(prefix, 'node.exe');
   const node = fs.isFile(own) ? own : execPath;
@@ -301,9 +308,23 @@ function npmFor(prefix: string, fs: ClaudeFs, execPath: string): { node: string;
   return cli ? { node, cli } : null;
 }
 
-/** npm with its output on stderr, so what Claude writes to stdout (`claude -p`) stays Claude's alone. */
-function runNpm(node: string, args: string[]): NpmRun {
-  const result = spawnSync(node, args, {
+/** How a test stands in for spawnSync. */
+export type SpawnNpm = (
+  command: string,
+  args: string[],
+  options: SpawnSyncOptions,
+) => { status: number | null; error?: Error };
+
+/**
+ * npm with its output on stderr, so what Claude writes to stdout (`claude -p`)
+ * stays Claude's alone. No shell: the program is node.exe (see npmFor).
+ */
+export function runNpm(
+  node: string,
+  args: string[],
+  spawn: SpawnNpm = (command, spawnArgs, options) => spawnSync(command, spawnArgs, options),
+): NpmRun {
+  const result = spawn(node, args, {
     stdio: ['ignore', 2, 2],
     timeout: NPM_TIMEOUT_MS,
     windowsHide: true,

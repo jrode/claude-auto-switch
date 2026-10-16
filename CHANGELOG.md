@@ -13,8 +13,8 @@ semantic versioning.
   `bin\claude.exe` as a short placeholder script, and its setup step puts the
   real program over it from a second package, `@anthropic-ai/claude-code-win32-x64`
   (or `-arm64`). When the install loses its program, it is left with only the
-  placeholder, or with nothing, while npm's `claude` and `claude.cmd` stay
-  behind. The suspected cause, not yet confirmed (#138), is an update that ran
+  placeholder, with no program, or with no package folder at all, while npm's
+  `claude` and `claude.cmd` stay behind. The suspected cause, not yet confirmed (#138), is an update that ran
   while Claude was open and stopped part way, since Windows can refuse to
   delete or overwrite the file of a program that is running. ccx then said it had found `claude.cmd` and
   could not launch it, and gave no fix. Now:
@@ -26,7 +26,11 @@ semantic versioning.
     spot, never a real program, and leaves a file another process has open
     alone. If that fails, ccx starts Claude from the second package directly.
   - Otherwise ccx reinstalls the same version with the npm that belongs to the
-    folder, saying so before and after, with npm's own output in between.
+    folder, saying so before and after, with npm's own output in between. When
+    the package folder is gone, the version comes from the copy npm moved aside
+    and left behind, if there is one, and is otherwise the current release.
+    ccx starts npm as `node.exe` running npm's own script, since Node refuses
+    to start `npm.cmd` without a shell.
   - The repair runs only when Claude cannot otherwise start from that install,
     at most once per run, and never while another ccx is repairing; that ccx
     is waited for instead.

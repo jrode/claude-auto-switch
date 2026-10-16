@@ -75,7 +75,8 @@ itself, and beside npm's `claude.cmd` in
 npm installs that file as a short placeholder script, and Claude Code's setup
 step then puts the real program over it from a second package,
 `@anthropic-ai/claude-code-win32-x64` (or `-arm64`). Sometimes the install
-loses that program and keeps only the placeholder, or nothing. The suspected
+loses that program and keeps only the placeholder, nothing, or not even its
+package folder, while npm's `claude.cmd` still points there. The suspected
 cause, not yet confirmed, is an update that ran while Claude was open, since
 Windows can refuse to delete or overwrite the file of a program that is
 running. ccx repairs such an install before it starts Claude: from the second package when it is

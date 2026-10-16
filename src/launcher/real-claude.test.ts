@@ -8,6 +8,8 @@ import {
   memoryWindowsFs,
   NPM_CMD_SHIM,
   NPM_PLACEHOLDER,
+  NPM_PS1_SHIM,
+  NPM_SH_SHIM,
   WINDOWS_PROGRAM,
   type MemoryFs,
 } from '../../test/memory-claude-fs.js';
@@ -238,8 +240,42 @@ describe('a Claude Code npm install that has lost its program (Windows)', () => 
     expect(search.broken[0]?.version).toBeNull();
   });
 
-  it('says nothing about npm when no install sits beside the shims', () => {
-    const fs = memoryWindowsFs({ [CMD]: NPM_CMD_SHIM });
+  it("names an install whose package folder is gone while npm's shims still point into it", () => {
+    // The owner's PC may have been in this state: the old message said
+    // bin\claude.exe did not exist, and a folder still holding the placeholder
+    // would have been picked and failed another way.
+    const fs = memoryWindowsFs({ [SHIM]: NPM_SH_SHIM, [CMD]: NPM_CMD_SHIM });
+    const search = findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs });
+    expect(search.bin).toBeNull();
+    expect(search.broken).toEqual([
+      { folder: PKG, prefix: PREFIX, program: BIN, state: 'folder-missing', platformProgram: null, version: null },
+    ]);
+    const message = brokenMessage(fs);
+    expect(message).toContain(PKG);
+    expect(message).toContain('the folder is not there');
+    expect(message).toContain('npm i -g @anthropic-ai/claude-code');
+  });
+
+  it('reads the PowerShell shim too', () => {
+    const fs = memoryWindowsFs({ [`${PREFIX}\\claude.ps1`]: NPM_PS1_SHIM, [SHIM]: '#!/bin/sh\n' });
+    const search = findRealClaude({ findCandidates: () => [SHIM], platform: 'win32', fs });
+    expect(search.broken.map((b) => b.state)).toEqual(['folder-missing']);
+  });
+
+  it('takes the version from the folder npm moved aside and never put back', () => {
+    const retired = `${PREFIX}\\node_modules\\@anthropic-ai\\.claude-code-Ab3dE9xQ\\package.json`;
+    const fs = memoryWindowsFs({ [CMD]: NPM_CMD_SHIM, [retired]: '{"name":"@anthropic-ai/claude-code","version":"2.1.300"}' });
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs });
+    expect(search.broken[0]?.version).toBe('2.1.300');
+  });
+
+  it('leaves alone shims that point somewhere other than their own node_modules', () => {
+    // An absolute path into another npm folder, and a program of its own.
+    const fs = memoryWindowsFs({
+      [CMD]: '"D:\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"   %*\r\n',
+      [SHIM]: 'exec "$basedir/tools/claude.exe" "$@"\n',
+    });
+    expect(findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs }).broken).toEqual([]);
     const message = brokenMessage(fs);
     expect(message).toContain('none of them can be launched directly');
     expect(message).not.toContain('missing its program');

@@ -5,6 +5,7 @@ import {
   constants,
   lstatSync,
   openSync,
+  readdirSync,
   readFileSync,
   readSync,
   statSync,
@@ -24,6 +25,8 @@ export interface ClaudeFs {
   /** Up to `bytes` from the start of the file, or null when it cannot be read. */
   readStart(file: string, bytes: number): Uint8Array | null;
   readText(file: string): string | null;
+  /** The names in a folder, none when it cannot be read. */
+  list(dir: string): string[];
 }
 
 export const nodeClaudeFs: ClaudeFs = {
@@ -76,6 +79,13 @@ export const nodeClaudeFs: ClaudeFs = {
       return null;
     }
   },
+  list: (dir) => {
+    try {
+      return readdirSync(dir);
+    } catch {
+      return [];
+    }
+  },
 };
 
 export interface ResolveDeps {
@@ -99,7 +109,8 @@ export interface ResolveDeps {
 
 /**
  * A Claude Code npm install whose `bin\claude.exe` is not the program: it is
- * not there, or it is still the placeholder the package ships.
+ * not there, it is still the placeholder the package ships, or the whole
+ * package folder is gone while npm's shims still point into it.
  */
 export interface BrokenNpmInstall {
   /** `<prefix>\node_modules\@anthropic-ai\claude-code` */
@@ -108,10 +119,10 @@ export interface BrokenNpmInstall {
   prefix: string;
   /** `<folder>\bin\claude.exe`, which the shims run. */
   program: string;
-  state: 'missing' | 'placeholder';
+  state: 'missing' | 'placeholder' | 'folder-missing';
   /** The platform package's own program, when npm left a real one. */
   platformProgram: string | null;
-  /** From its package.json, when that names one. */
+  /** From its package.json, or the one npm left in the folder it moved aside; null when neither names one. */
   version: string | null;
 }
 
@@ -200,9 +211,11 @@ export function cannotFindClaude(
 
 /** One line per install: where it is and what is wrong with its program. */
 export function describeBrokenInstall(install: BrokenNpmInstall): string {
-  return install.state === 'missing'
-    ? `${install.folder}: its bin\\claude.exe is not there`
-    : `${install.folder}: its bin\\claude.exe is only the placeholder npm puts there first, a short script rather than the program`;
+  if (install.state === 'missing') return `${install.folder}: its bin\\claude.exe is not there`;
+  if (install.state === 'placeholder') {
+    return `${install.folder}: its bin\\claude.exe is only the placeholder npm puts there first, a short script rather than the program`;
+  }
+  return `${install.folder}: the folder is not there, though npm's claude shims in ${install.prefix} still point into it`;
 }
 
 function brokenInstallMessage(broken: BrokenNpmInstall[], repairFailures: string[]): string {
@@ -296,13 +309,19 @@ function brokenNpmInstalls(candidates: string[], fs: ClaudeFs, arch: string): Br
 
 /**
  * The install in `folder`, when it is verifiably broken: the folder is there
- * and its `bin\claude.exe` is missing or reads as no program. Null for a
+ * and its `bin\claude.exe` is missing or reads as no program, or the folder is
+ * gone and one of npm's shims in the prefix still points into it. Null for a
  * healthy install, for no install, and for a program that cannot be read.
  */
 export function inspectNpmInstall(folder: string, fs: ClaudeFs, arch: string = process.arch): BrokenNpmInstall | null {
   const p = path.win32;
-  if (!fs.isDirectory(folder)) return null;
+  const prefix = p.dirname(p.dirname(p.dirname(folder)));
   const program = p.join(folder, 'bin', 'claude.exe');
+  if (!fs.isDirectory(folder)) {
+    if (!shimsPointInto(prefix, fs)) return null;
+    // Nothing is left to put a program back into, so this is npm's to repair.
+    return { folder, prefix, program, state: 'folder-missing', platformProgram: null, version: leftoverVersion(folder, fs) };
+  }
   const state = !fs.exists(program)
     ? 'missing'
     : fs.isFile(program) && isWindowsProgram(fs, program) === false
@@ -311,12 +330,42 @@ export function inspectNpmInstall(folder: string, fs: ClaudeFs, arch: string = p
   if (!state) return null;
   return {
     folder,
-    prefix: p.dirname(p.dirname(p.dirname(folder))),
+    prefix,
     program,
     state,
     platformProgram: platformProgramOf(folder, fs, arch),
     version: versionOf(folder, fs),
   };
+}
+
+/**
+ * How npm's shims name the package's program: inside their own folder, as
+ * `%dp0%\node_modules\...` in `claude.cmd` and `$basedir/node_modules/...` in
+ * `claude.ps1` and `claude`. A shim naming any other place, an absolute path
+ * into another npm folder included, says nothing about this prefix.
+ */
+const POINTS_INTO_PACKAGE = /(?:%~?dp0%?|\$basedir)[\\/]+node_modules[\\/]+@anthropic-ai[\\/]+claude-code[\\/]/i;
+
+function shimsPointInto(prefix: string, fs: ClaudeFs): boolean {
+  return ['claude.cmd', 'claude.ps1', 'claude'].some((name) =>
+    POINTS_INTO_PACKAGE.test(fs.readText(path.win32.join(prefix, name)) ?? ''),
+  );
+}
+
+/**
+ * While npm replaces a package it first renames the old folder beside it, to
+ * `.claude-code-` and eight letters or digits (npm's retire-path), and puts it
+ * back if the install fails. One left behind still holds the old package.json.
+ */
+const RETIRED_FOLDER = /^\.claude-code-[a-z0-9]{8}$/i;
+
+function leftoverVersion(folder: string, fs: ClaudeFs): string | null {
+  const scope = path.win32.dirname(folder);
+  for (const name of fs.list(scope).filter((n) => RETIRED_FOLDER.test(n)).sort()) {
+    const version = versionOf(path.win32.join(scope, name), fs);
+    if (version) return version;
+  }
+  return null;
 }
 
 /**
