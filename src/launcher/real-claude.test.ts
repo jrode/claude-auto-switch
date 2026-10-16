@@ -336,11 +336,11 @@ describe('an install npm may still be writing (Windows)', () => {
       { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER, [NESTED]: WINDOWS_PROGRAM },
       { modified: { [NESTED]: NOW - 5_000 } },
     );
-    const search = findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, now: () => NOW });
+    const search = findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
     expect(search.bin).toBeNull();
     expect(search.broken[0]).toMatchObject({ busy: true, platformProgram: null });
     expect(() =>
-      resolveRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, now: () => NOW }),
+      resolveRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW }),
     ).toThrow('npm may still be installing it');
   });
 
@@ -349,7 +349,7 @@ describe('an install npm may still be writing (Windows)', () => {
       { [CMD]: NPM_CMD_SHIM, [`${SCOPE}\\.claude-code-Ab3dE9xQ\\package.json`]: PACKAGE_JSON },
       { modified: { [SCOPE]: NOW - 60_000 } },
     );
-    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, now: () => NOW });
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
     expect(search.broken[0]).toMatchObject({ state: 'folder-missing', busy: true });
   });
 
@@ -358,7 +358,7 @@ describe('an install npm may still be writing (Windows)', () => {
       { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER, [NESTED]: WINDOWS_PROGRAM },
       { modified: { [NESTED]: NOW - 10 * 60_000, [SCOPE]: NOW - 10 * 60_000 } },
     );
-    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, now: () => NOW });
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
     expect(search.bin).toBe(NESTED);
     expect(search.broken[0]?.busy).toBe(false);
   });
