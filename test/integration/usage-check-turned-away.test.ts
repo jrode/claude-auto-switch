@@ -37,6 +37,7 @@ const ROOM: LimitProbeResult = { verdict: 'allowed', fiveHour: 0.1, sevenDay: 0.
 const ALSO_SET = [
   'FAKE_CLAUDE_CAP_AFTER_MS',
   'FAKE_CLAUDE_CAP_EVERY_MS',
+  'FAKE_CLAUDE_LOG_CAP_WORDS',
   'FAKE_CLAUDE_REFUSAL_AGE_MS',
   'FAKE_CLAUDE_REFUSE_AGAIN_AFTER_MS',
   'FAKE_CLAUDE_PROMPT_AFTER_MS',
@@ -194,7 +195,8 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
         const endNow = path.join(home, 'end-now');
         Object.assign(process.env, {
           FAKE_CLAUDE_RUNS_LOG: runsLog,
-          // Ended once ccx has said what it made of the words; this is a backstop.
+          // Ended once ccx has been shown the words again after its verdict;
+          // this is a backstop.
           FAKE_CLAUDE_IDLE_MS: '30000',
           FAKE_CLAUDE_EXIT_WHEN: endNow,
           // Claude says what it is doing, but keeps no record of the
@@ -202,6 +204,7 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
           FAKE_CLAUDE_SESSION_RECORD: '1',
           FAKE_CLAUDE_CAP_AFTER_MS: '1500',
           FAKE_CLAUDE_CAP_EVERY_MS: '1000',
+          FAKE_CLAUDE_LOG_CAP_WORDS: '1',
         });
 
         const started = Date.now();
@@ -216,12 +219,24 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
             return false; // not written yet, or caught mid-line
           }
         };
+        /** How many times the fake has put the words on the screen. */
+        const shown = (): number => {
+          try {
+            return readFileSync(runsLog, 'utf8').split('\n').filter((l) => l.includes('"cap-words"')).length;
+          } catch {
+            return 0;
+          }
+        };
         await waitFor('ccx to judge the limit words', () => ended || decided(), (done) => done, 30_000);
+        // Shown four more times after the verdict, so a move on any later
+        // sighting has had the chance to happen.
+        const atVerdict = shown();
+        await waitFor('four more sightings', () => ended || shown() >= atVerdict + 4, (done) => done, 30_000);
         writeFileSync(endNow, '', 'utf8');
         const code = await running;
         // Printed with each check, so a session that ended early says how.
         const story =
-          `ran ${Date.now() - started} ms; events: ` +
+          `ran ${Date.now() - started} ms; words shown ${shown()} times, ${atVerdict} by the verdict; events: ` +
           (existsSync(path.join(home, 'events.jsonl')) ? JSON.stringify(eventsIn(home)) : 'none') +
           `; runs log: ${JSON.stringify(readLog(runsLog))}`;
         expect(launches(readLog(runsLog)).map((l) => l.marker), story).toEqual(['A']);

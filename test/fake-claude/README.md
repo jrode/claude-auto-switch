@@ -33,8 +33,11 @@ Its behavior is driven by a **scenario** JSON, resolved in this order:
   beside `--continue` or `--resume` without `--fork-session`.
 - a test that must order something after an event, not after a length of time,
   names a file: `FAKE_CLAUDE_REFUSE_WHEN` refuses the main thread's turn once it
-  appears (with `FAKE_CLAUDE_SESSION_RECORD` and `FAKE_CLAUDE_TRANSCRIPT` set), and `FAKE_CLAUDE_EXIT_WHEN` ends the run once it appears, leaving
-  `FAKE_CLAUDE_IDLE_MS` as a backstop.
+  appears (with `FAKE_CLAUDE_SESSION_RECORD` and `FAKE_CLAUDE_TRANSCRIPT` set),
+  and `FAKE_CLAUDE_EXIT_WHEN` ends the run once it appears, leaving
+  `FAKE_CLAUDE_IDLE_MS` as a backstop. With `FAKE_CLAUDE_LOG_CAP_WORDS`, each
+  showing of the repeated limit words (`FAKE_CLAUDE_CAP_EVERY_MS`) is logged as
+  `cap-words`, so a test can count them.
 
 ## Scenario shape
 

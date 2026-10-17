@@ -839,10 +839,15 @@ const capEvery = Number(process.env.FAKE_CLAUDE_CAP_EVERY_MS) || 0;
 // Started late when asked, so a test can have ccx reading the conversation's
 // own record before any of it reaches the screen.
 const capFrom = Date.now() + (Number(process.env.FAKE_CLAUDE_CAP_AFTER_MS) || 0);
+// With FAKE_CLAUDE_LOG_CAP_WORDS each showing goes to the runs log once it is
+// written out, so a test can count how many times ccx was shown the words.
+const logCapWords = Boolean(runsLog && process.env.FAKE_CLAUDE_LOG_CAP_WORDS);
 if (capEvery > 0) {
   const t = setInterval(() => {
     if (Date.now() < capFrom) return;
-    process.stdout.write("You have reached your Fable 5 limit. Run /usage-credits to continue.\n");
+    process.stdout.write("You have reached your Fable 5 limit. Run /usage-credits to continue.\n", () => {
+      if (logCapWords) appendFileSync(runsLog, `${JSON.stringify({ type: 'cap-words' })}\n`, 'utf8');
+    });
   }, capEvery);
   if (t.unref) t.unref();
 }

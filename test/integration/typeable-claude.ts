@@ -25,7 +25,16 @@ export const ID = '77777777-8888-4999-8aaa-bbbbbbbbbbbb';
 export const PROMPT = 'Moved by ccx: carry on where you stopped.';
 
 export interface Entry {
-  type: 'launch' | 'reread' | 'prompt' | 'status' | 'subagent-refusal' | 'subagent-done' | 'menu' | 'menu-key';
+  type:
+    | 'launch'
+    | 'reread'
+    | 'prompt'
+    | 'status'
+    | 'subagent-refusal'
+    | 'subagent-done'
+    | 'menu'
+    | 'menu-key'
+    | 'cap-words';
   args?: string[];
   marker?: string | null;
   text?: string;
