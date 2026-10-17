@@ -23,8 +23,12 @@ account.
 - `.gitignore` also blocks `profiles/`, `*.credentials.json`, `accounts.json`,
   `ledger.json`, `oauth-token`, `session-debug.log`, and
   `last-setup-token-output.txt` as defense in depth.
-- `ccx doctor` fails if any of those credential, token, or transcript files is
-  ever found tracked in git.
+- `ccx doctor` asks git about ccx's own folders (`~/.claude-auto-switch`, the
+  profiles folder, and each account's folder) and fails when a repository, a
+  dotfiles one say, tracks any file in them other than ccx's settings,
+  `config.json`. It names the folder, the repository, and the files. In
+  `~/.claude` and in the repository it is run from, it looks only for login
+  files by name (`.credentials.json`, `.credentials.prev.json`, `oauth-token`).
 
 ## How rotation handles credentials
 

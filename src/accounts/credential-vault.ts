@@ -15,7 +15,7 @@ export { CREDENTIALS_FILE } from './credential-storage.js';
  * on one login, and what stops a killed refresh from destroying a good account.
  */
 
-const PREVIOUS_FILE = '.credentials.prev.json';
+export const PREVIOUS_FILE = '.credentials.prev.json';
 
 /**
  * A short, comparable fingerprint of the login stored in `dir`, or null when

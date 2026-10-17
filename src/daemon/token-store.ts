@@ -1,10 +1,10 @@
 import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 
-const FILENAME = 'oauth-token';
+export const TOKEN_FILE = 'oauth-token';
 
 export function tokenPath(accountDir: string): string {
-  return path.join(accountDir, FILENAME);
+  return path.join(accountDir, TOKEN_FILE);
 }
 
 /** Store an account's long-lived OAuth token (mode 0600 where the OS supports it). */
