@@ -213,6 +213,15 @@ function createOwnedLockFile(file: string, content: string): void {
 /** How long before the longest hold a release stops trusting that no takeover can begin. */
 const RELEASE_MARGIN_MS = 5_000;
 
+/**
+ * The one rule by which a running holder's lock may be taken over: once it is
+ * older than the longest hold. Release reads the same rule, so the two cannot
+ * drift apart and leave a young lock open to a takeover release does not expect.
+ */
+function pastLongestHold(age: number, maxHoldMs: number): boolean {
+  return age > maxHoldMs;
+}
+
 function ownedHandle(lockFile: string, content: string, maxHoldMs: number, now: () => number): LockHandle {
   let released = false;
   return {
@@ -230,7 +239,7 @@ function ownedHandle(lockFile: string, content: string, maxHoldMs: number, now: 
       // guard, and left when the guard cannot be had: whoever holds the guard
       // is taking it over. Most holds are short, and pay nothing for the guard.
       const since = mtimeMs(lockFile);
-      const young = since !== null && now() - since < Math.max(0, maxHoldMs - RELEASE_MARGIN_MS);
+      const young = since !== null && !pastLongestHold(now() - since + RELEASE_MARGIN_MS, maxHoldMs);
       const guard = `${lockFile}.takeover`;
       const guarded = !young && takeGuard(guard);
       if (!young && !guarded) return;
@@ -288,7 +297,7 @@ function isAbandoned(
   const age = now - since;
   const holder = lockHolder(lockFile);
   if (holder === null) return age > staleMs;
-  return age > maxHoldMs || !running(holder);
+  return pastLongestHold(age, maxHoldMs) || !running(holder);
 }
 
 function lockHolder(lockFile: string): number | null {
