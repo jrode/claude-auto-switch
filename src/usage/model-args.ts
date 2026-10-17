@@ -9,23 +9,28 @@
  * the settings file is shared across accounts and a rotation should not quietly
  * repin someone's editor. The flag lasts exactly as long as the session it
  * starts, which is the right lifetime for a decision made about one rotation.
+ *
+ * Only Claude's options are read and changed, never anything after `--`, which
+ * Claude reads as the prompt.
  */
+import { readCommandLine, withOptions, withoutOptions } from '../launcher/claude-args.js';
 
 /**
- * Both spellings a command line can use for this flag. `--model=fable` and
- * `--model fable` mean the same thing to the parser, so anything that removes
- * one has to remove the other, or the spent model survives and wins.
+ * Read in both spellings, `--model=fable` and `--model fable`, which mean the
+ * same thing to the parser, so removing one removes the other too, or the
+ * spent model survives and wins.
  *
  * `--fallback-model` is deliberately NOT matched: it is a different setting,
  * it belongs to the operator, and it is not the flag being rotated.
  */
 const MODEL_FLAG = '--model';
-const MODEL_EQUALS = '--model=';
+const MODEL: ReadonlySet<string> = new Set([MODEL_FLAG]);
 
 /**
- * A model name never starts with `-`, so a token that does is the NEXT option,
- * not this flag's value. Swallowing it would quietly drop something like
- * a resume flag and change what the session does.
+ * A model name is never empty and never starts with `-`, so `--model=-c` names
+ * no model. The spaced form never takes a value that starts with `-`: that is
+ * the NEXT option, and swallowing it would quietly drop something like a resume
+ * flag and change what the session does.
  */
 function isValue(token: string | undefined): token is string {
   return typeof token === 'string' && token.length > 0 && !token.startsWith('-');
@@ -39,34 +44,11 @@ function isValue(token: string | undefined): token is string {
  * the first (spent) value winning, or hand the process two conflicting flags.
  */
 export function withModel(args: string[], model: string): string[] {
-  const out: string[] = [];
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i] as string;
-    if (arg === MODEL_FLAG) {
-      if (isValue(args[i + 1])) i += 1; // drop its value too, but only if it HAS one
-      continue;
-    }
-    if (arg.startsWith(MODEL_EQUALS)) continue;
-    out.push(arg);
-  }
-  out.push(MODEL_FLAG, model);
-  return out;
+  return withOptions(withoutOptions(args, MODEL), [MODEL_FLAG, model]);
 }
 
-/** The value of `--model` in `args`, in either spelling, or null when absent. */
+/** The value of the first `--model` in `args`, in either spelling, or null when absent. */
 export function modelInArgs(args: string[]): string | null {
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i] as string;
-    if (arg === MODEL_FLAG) {
-      const next = args[i + 1];
-      return isValue(next) ? next : null;
-    }
-    if (arg.startsWith(MODEL_EQUALS)) {
-      // Same test as the spaced form, so one spelling cannot accept a value the
-      // other rejects and get mistaken for a real pin.
-      const value = arg.slice(MODEL_EQUALS.length);
-      return isValue(value) ? value : null;
-    }
-  }
-  return null;
+  const option = readCommandLine(args).options.find((o) => o.long === MODEL_FLAG);
+  return option !== undefined && isValue(option.value) ? option.value : null;
 }

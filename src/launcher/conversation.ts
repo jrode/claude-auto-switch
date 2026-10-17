@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readCommandLine, withOptions, withoutOptions } from './claude-args.js';
 
 /**
  * Staying in the SAME conversation across an account swap.
@@ -17,10 +18,10 @@ import { randomUUID } from 'node:crypto';
  * Nothing then depends on which conversation happens to have been touched last.
  */
 
-/** Flags that mean "carry on the most recent conversation", with no id. */
-const CONTINUE_FLAGS = new Set(['--continue', '-c']);
-/** Flags that take a conversation id, or open a picker when given none. */
-const RESUME_FLAGS = new Set(['--resume', '-r']);
+/** "Carry on the most recent conversation", with no id; `-c` too. */
+const CONTINUE_FLAG = '--continue';
+/** Takes a conversation id, or opens a picker when given none; `-r` too. */
+const RESUME_FLAG = '--resume';
 const SESSION_ID_FLAG = '--session-id';
 /**
  * Resume into a COPY of the conversation instead of continuing it.
@@ -40,30 +41,21 @@ export function looksLikeConversationId(value: string | undefined): boolean {
 }
 
 /**
- * A long option and the value written inside it, if any.
- *
- * Claude reads `--resume=<id>` exactly as it reads `--resume <id>` (Claude
- * Desktop launches it in the first form). Comparing whole arguments missed that
- * spelling entirely, so ccx treated `--resume=<id>` as a fresh start and added
- * `--session-id`, which Claude refuses to combine with a resume.
+ * Every reader here takes the options as Claude does (see claude-args): in any
+ * spelling, `--resume=<id>` (Claude Desktop launches that way), `-r<id>` and a
+ * cluster such as `-pc` included, and never anything after `--`.
  */
-function splitOption(arg: string): { flag: string; inline?: string } {
-  if (!arg.startsWith('--')) return { flag: arg };
-  const eq = arg.indexOf('=');
-  return eq === -1 ? { flag: arg } : { flag: arg.slice(0, eq), inline: arg.slice(eq + 1) };
-}
 
 /** Whether `args` already asks for some existing conversation. */
 export function wantsExistingConversation(args: string[]): boolean {
-  return args.some((a) => {
-    const { flag } = splitOption(a);
-    return CONTINUE_FLAGS.has(flag) || RESUME_FLAGS.has(flag);
-  });
+  return readCommandLine(args).options.some(
+    (o) => o.long === CONTINUE_FLAG || o.long === RESUME_FLAG,
+  );
 }
 
 /** Whether `args` resume into a copy rather than the conversation itself. */
 export function forksConversation(args: string[]): boolean {
-  return args.some((a) => splitOption(a).flag === FORK_FLAG);
+  return readCommandLine(args).options.some((o) => o.long === FORK_FLAG);
 }
 
 /**
@@ -74,13 +66,9 @@ export function forksConversation(args: string[]): boolean {
  * be read as the picker's search term, so that does not count.
  */
 export function startsByResuming(args: string[]): boolean {
-  for (let i = 0; i < args.length; i++) {
-    const { flag, inline } = splitOption(args[i] as string);
-    if (CONTINUE_FLAGS.has(flag)) return true;
-    if (!RESUME_FLAGS.has(flag)) continue;
-    if (inline !== undefined ? inline !== '' : isOperand(args[i + 1])) return true;
-  }
-  return false;
+  return readCommandLine(args).options.some(
+    (o) => o.long === CONTINUE_FLAG || (o.long === RESUME_FLAG && (o.value ?? '') !== ''),
+  );
 }
 
 /**
@@ -88,14 +76,8 @@ export function startsByResuming(args: string[]): boolean {
  * the flag is there with no value, or undefined when it is not there at all.
  */
 function valueOf(args: string[], wanted: string): string | undefined {
-  for (let i = 0; i < args.length; i++) {
-    const { flag, inline } = splitOption(args[i] as string);
-    if (flag !== wanted) continue;
-    if (inline !== undefined) return inline;
-    const next = args[i + 1];
-    return isOperand(next) ? (next as string) : '';
-  }
-  return undefined;
+  const option = readCommandLine(args).options.find((o) => o.long === wanted);
+  return option === undefined ? undefined : (option.value ?? '');
 }
 
 /**
@@ -106,13 +88,9 @@ function valueOf(args: string[], wanted: string): string | undefined {
  * swallow an unrelated flag and hand Claude a nonsense id.
  */
 export function conversationIdIn(args: string[]): string | null {
-  for (let i = 0; i < args.length; i++) {
-    const { flag, inline } = splitOption(args[i] as string);
-    if (!RESUME_FLAGS.has(flag) && flag !== SESSION_ID_FLAG) continue;
-    // A value written inside the flag is the whole of it; the next argument
-    // then belongs to something else.
-    const value = inline ?? args[i + 1];
-    if (looksLikeConversationId(value)) return value as string;
+  for (const option of readCommandLine(args).options) {
+    if (option.long !== RESUME_FLAG && option.long !== SESSION_ID_FLAG) continue;
+    if (looksLikeConversationId(option.value)) return option.value as string;
   }
   return null;
 }
@@ -142,11 +120,6 @@ export function reportedSessionId(stdout: string): string | null {
   return null;
 }
 
-/** Anything that is a value rather than another flag. */
-function isOperand(value: string | undefined): boolean {
-  return typeof value === 'string' && !value.startsWith('-');
-}
-
 /**
  * Flags that say which conversation a run is in, or put it where ccx keeps no
  * record: a resume, a continue, an id, a fork, and the flags that resume or
@@ -156,8 +129,8 @@ function isOperand(value: string | undefined): boolean {
  * used with --continue or --resume if --fork-session is also specified").
  */
 const NAMING_FLAGS = new Set([
-  '--resume',
-  '--continue',
+  RESUME_FLAG,
+  CONTINUE_FLAG,
   SESSION_ID_FLAG,
   FORK_FLAG,
   '--from-pr',
@@ -165,66 +138,36 @@ const NAMING_FLAGS = new Set([
   '--cloud',
   '--remote',
 ]);
-/** The short ones: `-r` and `-c`. */
-const NAMING_LETTERS = new Set(['r', 'c']);
-/** Claude's short options that take a value, which takes the rest of a cluster with it (`-rID`). */
-const VALUE_LETTERS = new Set(['d', 'n', 'r', 'w']);
 
-/**
- * Whether `args` say which conversation the run is in, in any spelling
- * Claude's parser takes: a long flag with its value after it or inside it
- * (`--resume=<id>`), or a short one alone, in a cluster (`-pc`) or with its
- * value attached (`-r<id>`). An option's value is never read as a flag, and
- * nothing after `--` is one.
- */
+/** Whether `args` say which conversation the run is in, in any spelling Claude's parser takes. */
 export function namesConversation(args: string[]): boolean {
-  for (const token of optionTokens(args)) {
-    if (token.startsWith('--')) {
-      if (NAMING_FLAGS.has(splitOption(token).flag)) return true;
-      continue;
-    }
-    for (const letter of token.slice(1)) {
-      if (NAMING_LETTERS.has(letter)) return true;
-      // The rest of the cluster is this option's value, or not options at all.
-      if (VALUE_LETTERS.has(letter) || !/[A-Za-z]/.test(letter)) break;
-    }
-  }
-  return false;
+  return readCommandLine(args).options.some((o) => NAMING_FLAGS.has(o.long));
 }
 
-/**
- * `args` with `--session-id <id>` added: before a `--`, after which Claude
- * reads everything as the prompt, and at the end otherwise.
- */
+/** `args` with `--session-id <id>` added among the options, before any `--`. */
 export function withConversationId(args: string[], id: string): string[] {
-  const end = args.indexOf('--');
-  if (end === -1) return [...args, SESSION_ID_FLAG, id];
-  return [...args.slice(0, end), SESSION_ID_FLAG, id, ...args.slice(end)];
+  return withOptions(args, [SESSION_ID_FLAG, id]);
 }
 
 /**
- * Strip every conversation flag, including whatever value it carries, and the
- * fork flag, which only ever applies to the launch that made the copy.
+ * Every conversation flag, which a relaunch replaces with its own, and the fork
+ * flag, which only ever applies to the launch that made the copy.
+ */
+const CONVERSATION_FLAGS: ReadonlySet<string> = new Set([
+  CONTINUE_FLAG,
+  RESUME_FLAG,
+  SESSION_ID_FLAG,
+  FORK_FLAG,
+]);
+
+/**
+ * Strip every conversation flag, with whatever value it carries. `--resume`
+ * accepts a session name or a search term as well as an id, and leaving one of
+ * those behind turns it into a stray positional argument to Claude. A BARE
+ * `--resume` (a picker) carries nothing, so the argument after it stays.
  */
 export function withoutConversationFlags(args: string[]): string[] {
-  const out: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
-    const { flag, inline } = splitOption(arg);
-    if (CONTINUE_FLAGS.has(flag) || flag === FORK_FLAG) continue;
-    if (RESUME_FLAGS.has(flag) || flag === SESSION_ID_FLAG) {
-      // Take the value with the flag, whatever shape it is. `--resume` accepts
-      // a session name or a search term as well as an id, and leaving one of
-      // those behind turns it into a stray positional argument to Claude.
-      // A BARE `--resume` (a picker) carries nothing, and eating the next
-      // argument there would remove a flag the operator meant to pass. Neither
-      // does `--resume=<id>`, whose value is already inside it.
-      if (inline === undefined && isOperand(args[i + 1])) i += 1;
-      continue;
-    }
-    out.push(arg);
-  }
-  return out;
+  return withoutOptions(args, CONVERSATION_FLAGS);
 }
 
 export interface ConversationPlan {
@@ -260,13 +203,13 @@ export function planConversation(args: string[], newId: () => string = randomUUI
     const own = valueOf(args, SESSION_ID_FLAG);
     if (own !== undefined) return { args, id: looksLikeConversationId(own) ? own : null };
     const id = newId();
-    return { args: [...args, SESSION_ID_FLAG, id], id };
+    return { args: withConversationId(args, id), id };
   }
   const named = conversationIdIn(args);
   if (named) return { args, id: named };
   if (wantsExistingConversation(args)) return { args, id: null };
   const id = newId();
-  return { args: [...args, SESSION_ID_FLAG, id], id };
+  return { args: withConversationId(args, id), id };
 }
 
 /**
@@ -277,8 +220,7 @@ export function planConversation(args: string[], newId: () => string = randomUUI
  * answer when nothing has told us which conversation this is.
  */
 export function relaunchArgs(args: string[], id: string | null): string[] {
-  const bare = withoutConversationFlags(args);
-  return id ? [...bare, '--resume', id] : [...bare, '--continue'];
+  return withOptions(withoutConversationFlags(args), id ? [RESUME_FLAG, id] : [CONTINUE_FLAG]);
 }
 
 export type ResumePromptPlacement =
@@ -286,108 +228,11 @@ export type ResumePromptPlacement =
   | { applied: false; args: string[]; reason: string };
 
 /**
- * Claude's options that take a value, as `claude --help` lists them. Those
- * shown as `<value>` or `[value]` take the next operand; those shown as
- * `<values...>` take every operand up to the next flag.
- *
- * Every other option takes nothing, so an operand after it is the prompt:
- * `--dangerously-skip-permissions "fix the flaky test"` has one. An option Claude
- * adds later that does take a value is read the same way, which errs toward "this
- * run has a prompt of its own", and the armed prompt then stands aside instead of
- * becoming a second prompt.
+ * Whether `args` carry a prompt: an operand that is not some option's value,
+ * anything after `--` included, even text that starts with a dash.
  */
-const ONE_VALUE_FLAGS = new Set([
-  '--agent',
-  '--agents',
-  '--append-system-prompt',
-  '--append-system-prompt-file',
-  '--autocompact',
-  '--cloud',
-  '-d',
-  '--debug',
-  '--debug-file',
-  '--effort',
-  '--environment',
-  '--fallback-model',
-  '--from-pr',
-  '--input-format',
-  '--json-schema',
-  '--max-budget-usd',
-  '--max-turns',
-  '--model',
-  '-n',
-  '--name',
-  '--output-format',
-  '--permission-mode',
-  '--permission-prompt-tool',
-  '--permission-prompts',
-  '--plugin-dir',
-  '--plugin-url',
-  '--prompt-suggestions',
-  '--remote-control',
-  '--remote-control-session-name-prefix',
-  '-r',
-  '--resume',
-  '--session-id',
-  '--setting-sources',
-  '--settings',
-  '--system-prompt',
-  '--system-prompt-file',
-  '--system-prompt-snapshot',
-  '--teleport',
-  '-w',
-  '--worktree',
-]);
-const MANY_VALUE_FLAGS = new Set([
-  '--add-dir',
-  '--allowedTools',
-  '--allowed-tools',
-  '--betas',
-  '--disallowedTools',
-  '--disallowed-tools',
-  '--file',
-  '--mcp-config',
-  '--tools',
-]);
-
-/**
- * The options in `args` as Claude's parser reads them, without their values,
- * so a value is never mistaken for an option of its own. Nothing after `--`
- * is an option.
- */
-export function optionTokens(args: string[]): string[] {
-  const tokens: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
-    if (arg === '--') break;
-    if (isOperand(arg)) continue;
-    tokens.push(arg);
-    if (arg.includes('=')) continue;
-    if (ONE_VALUE_FLAGS.has(arg)) {
-      if (isOperand(args[i + 1])) i += 1;
-    } else if (MANY_VALUE_FLAGS.has(arg)) {
-      while (isOperand(args[i + 1])) i += 1;
-    }
-  }
-  return tokens;
-}
-
-/** Whether `args` carry a prompt: an operand that is not some option's value. */
 export function hasOwnPrompt(args: string[]): boolean {
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
-    // Everything after `--` is an operand, even text that starts with a dash.
-    if (arg === '--') return i + 1 < args.length;
-    if (isOperand(arg)) return true;
-    // `--model=opus` carries its value inside itself.
-    if (arg.includes('=')) continue;
-    if (ONE_VALUE_FLAGS.has(arg)) {
-      if (isOperand(args[i + 1])) i += 1;
-    } else if (MANY_VALUE_FLAGS.has(arg)) {
-      while (isOperand(args[i + 1])) i += 1;
-    }
-  }
-  return false;
+  return readCommandLine(args).operands.length > 0;
 }
 
 /**
@@ -396,18 +241,7 @@ export function hasOwnPrompt(args: string[]): boolean {
  * `--add-dir ../shared` or `--allowedTools "Bash(npm test:*)"`.
  */
 export function endsInManyValues(args: string[]): boolean {
-  let taking = false;
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
-    // Everything after `--` is an operand, and so is anything added after it.
-    if (arg === '--') return false;
-    if (isOperand(arg)) continue;
-    // `--add-dir=../shared` carries its value inside itself and takes no more.
-    const inline = arg.includes('=');
-    taking = !inline && MANY_VALUE_FLAGS.has(arg);
-    if (!inline && ONE_VALUE_FLAGS.has(arg) && isOperand(args[i + 1])) i += 1;
-  }
-  return taking;
+  return readCommandLine(args).endsInList;
 }
 
 /**
@@ -471,5 +305,5 @@ export function freshStartArgs(
   // Always an id, never null: a fresh start is the one case where we are the
   // ones creating the conversation, so there is nothing to be unsure about.
   const id = newId();
-  return { args: [...withoutConversationFlags(args), SESSION_ID_FLAG, id], id };
+  return { args: withConversationId(withoutConversationFlags(args), id), id };
 }

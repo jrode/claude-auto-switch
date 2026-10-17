@@ -26,6 +26,11 @@ Its behavior is driven by a **scenario** JSON, resolved in this order:
 - anything else (a "run", e.g. `-p "..."`): if the scenario is `capped`, prints
   `capMessage` to stderr and exits `capExitCode`; otherwise records the
   invocation to `<CLAUDE_CONFIG_DIR>/fake-last-run.json` and exits 0.
+- a run reads its arguments the way the real CLI's parser does (short options
+  in clusters, option values, nothing after `--` as an option). With
+  `FAKE_CLAUDE_RUNS_LOG` set, each launch logs what it applied (`applied`) and
+  whether it ran in a terminal (`tty`). Like 2.1.302, it refuses `--session-id`
+  beside `--continue` or `--resume` without `--fork-session`.
 
 ## Scenario shape
 

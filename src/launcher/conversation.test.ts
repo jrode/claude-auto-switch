@@ -396,6 +396,83 @@ describe('a fork', () => {
   });
 });
 
+describe('a `--`, after which Claude reads everything as the prompt', () => {
+  const PROMPT = '-x marks the spot';
+
+  it('gets every flag ccx adds before it, and a command line without one gets them at the end as before', () => {
+    expect(planConversation(['--effort', 'max', '--', PROMPT], ids(ID)).args).toEqual([
+      '--effort',
+      'max',
+      '--session-id',
+      ID,
+      '--',
+      PROMPT,
+    ]);
+    expect(planConversation(['--resume', OTHER, '--fork-session', '--', PROMPT], ids(ID)).args).toEqual([
+      '--resume',
+      OTHER,
+      '--fork-session',
+      '--session-id',
+      ID,
+      '--',
+      PROMPT,
+    ]);
+    expect(relaunchArgs(['--session-id', OTHER, '--', PROMPT], ID)).toEqual(['--resume', ID, '--', PROMPT]);
+    expect(relaunchArgs(['--continue', '--', PROMPT], null)).toEqual(['--continue', '--', PROMPT]);
+    expect(freshStartArgs(['--resume', OTHER, '--', PROMPT], ids(ID)).args).toEqual([
+      '--session-id',
+      ID,
+      '--',
+      PROMPT,
+    ]);
+
+    expect(planConversation(['--effort', 'max'], ids(ID)).args).toEqual(['--effort', 'max', '--session-id', ID]);
+    expect(relaunchArgs(['--session-id', OTHER, '--effort', 'max'], ID)).toEqual([
+      '--effort',
+      'max',
+      '--resume',
+      ID,
+    ]);
+    expect(relaunchArgs(['--effort', 'max'], null)).toEqual(['--effort', 'max', '--continue']);
+    expect(freshStartArgs(['--resume', OTHER, '--effort', 'max'], ids(ID)).args).toEqual([
+      '--effort',
+      'max',
+      '--session-id',
+      ID,
+    ]);
+  });
+
+  it('reads nothing after it as a conversation flag, and strips nothing there', () => {
+    const asked = ['--', '--continue', '--resume', OTHER];
+    expect(wantsExistingConversation(asked)).toBe(false);
+    expect(conversationIdIn(asked)).toBeNull();
+    expect(startsByResuming(asked)).toBe(false);
+    expect(withoutConversationFlags(['--effort', 'max', ...asked])).toEqual(['--effort', 'max', ...asked]);
+    expect(planConversation(asked, ids(ID))).toEqual({ args: ['--session-id', ID, ...asked], id: ID });
+  });
+});
+
+describe('short options in a cluster, as Claude reads them', () => {
+  it('sees a continue or a resume there, so ccx adds no --session-id Claude would refuse', () => {
+    // `-cd api` is --continue with --debug "api"; `-r<id>` is --resume <id>.
+    expect(planConversation(['-cd', 'api'], ids(ID))).toEqual({ args: ['-cd', 'api'], id: null });
+    expect(planConversation([`-r${OTHER}`], ids(ID))).toEqual({ args: [`-r${OTHER}`], id: OTHER });
+    expect(startsByResuming(['-cd', 'api'])).toBe(true);
+    expect(hasOwnPrompt(['-cd', 'api'])).toBe(false);
+    // `-dc` is --debug with the filter "c", which names no conversation.
+    expect(planConversation(['-dc'], ids(ID))).toEqual({ args: ['-dc', '--session-id', ID], id: ID });
+  });
+
+  it('takes only the conversation letters out of a cluster, and their values with them', () => {
+    expect(withoutConversationFlags(['-pc', 'hi'])).toEqual(['-p', 'hi']);
+    expect(relaunchArgs(['-cdapi'], ID)).toEqual(['-dapi', '--resume', ID]);
+    expect(relaunchArgs(['-cd', 'api'], ID)).toEqual(['-d', 'api', '--resume', ID]);
+    expect(relaunchArgs(['-pr', OTHER, 'hi'], ID)).toEqual(['-p', 'hi', '--resume', ID]);
+    expect(relaunchArgs([`-r${OTHER}`, '--effort', 'max'], ID)).toEqual(['--effort', 'max', '--resume', ID]);
+    expect(relaunchArgs(['-dc'], ID)).toEqual(['-dc', '--resume', ID]);
+  });
+});
+
 describe('whether a launch picks a conversation back up by itself', () => {
   it('does for --continue and for a resume that names one', () => {
     for (const args of [['--continue'], ['-c'], ['--resume', ID], ['-r', ID], [`--resume=${ID}`]]) {

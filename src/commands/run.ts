@@ -4,6 +4,7 @@ import { probeAll } from '../health/prober.js';
 import { select } from '../selector/selector.js';
 import { launchWatched, launchPassthrough } from '../launcher/launcher.js';
 import { claudeSubcommandIn } from '../launcher/subcommand.js';
+import { isPrintMode } from '../launcher/claude-args.js';
 import { autoRotateHeadless } from '../launcher/rotating-run.js';
 import {
   loadLedger,
@@ -63,11 +64,6 @@ function recordRunChange(context: CliContext, change: LedgerChange): void {
   }
 }
 
-/** True for headless requests (`-p` / `--print`), where output can be captured. */
-function isHeadless(args: string[]): boolean {
-  return args.includes('-p') || args.includes('--print');
-}
-
 /**
  * Launch claude on the pinned/healthiest account. Headless requests auto-rotate
  * past capped accounts; interactive sessions launch once (mid-session rotation
@@ -111,9 +107,12 @@ export async function runCommand(
     return 1;
   }
 
+  // Headless requests (print mode, however it is written: `-p`, `--print`,
+  // `-pc`), where output can be captured.
+  const headless = isPrintMode(passthroughArgs);
   // Interactive sessions with stored tokens get transparent hot-swap: the token
   // selects the account, so we skip the slow per-account health probe.
-  if (!isHeadless(passthroughArgs) && hasAnyUsableAccount(context)) {
+  if (!headless && hasAnyUsableAccount(context)) {
     const code = await runInteractiveHotSwap(context, passthroughArgs, options);
     maybeHintShim(context); // one-time tip after the session, if the shim is off
     return code;
@@ -136,7 +135,7 @@ export async function runCommand(
   const healths = await probeAll(accounts, { claude });
   const loggedIn = signedInAndNotRejected(healths, accounts, context.ctx);
 
-  if (isHeadless(passthroughArgs) && context.config.rotation.autoRotateHeadless) {
+  if (headless && context.config.rotation.autoRotateHeadless) {
     const result = await autoRotateHeadless(passthroughArgs, {
       claude,
       accounts,

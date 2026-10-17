@@ -69,6 +69,28 @@ describe('withModel', () => {
     withModel(args, 'opus');
     expect(args).toEqual(['--model', 'fable']);
   });
+
+  it('sets the model before a `--`, after which Claude reads everything as the prompt', () => {
+    // A model added after `--` is words of the prompt, never applied, and the
+    // words there are the prompt, so they stay as written.
+    expect(withModel(['-p', '--model', 'fable', '--', '-x marks the spot'], 'opus')).toEqual([
+      '-p',
+      '--model',
+      'opus',
+      '--',
+      '-x marks the spot',
+    ]);
+    expect(withModel(['-p', '--', '--model', 'fable'], 'opus')).toEqual([
+      '-p',
+      '--model',
+      'opus',
+      '--',
+      '--model',
+      'fable',
+    ]);
+    // With no `--`, at the end, as it always went.
+    expect(withModel(['-p', '--model', 'fable', 'hi'], 'opus')).toEqual(['-p', 'hi', '--model', 'opus']);
+  });
 });
 
 describe('modelInArgs', () => {
@@ -100,5 +122,10 @@ describe('modelInArgs', () => {
   it('is not fooled by --fallback-model', () => {
     expect(modelInArgs(['--fallback-model', 'sonnet'])).toBeNull();
     expect(modelInArgs(['--fallback-model=sonnet'])).toBeNull();
+  });
+
+  it('reads nothing after `--`, which is the prompt', () => {
+    expect(modelInArgs(['-p', '--', '--model', 'fable'])).toBeNull();
+    expect(modelInArgs(['-p', '--model', 'opus', '--', '--model', 'fable'])).toBe('opus');
   });
 });

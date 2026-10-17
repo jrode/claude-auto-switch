@@ -10,6 +10,116 @@ import path from 'node:path';
 const args = process.argv.slice(2);
 const configDir = process.env.CLAUDE_CONFIG_DIR ?? process.cwd();
 
+// The options as the real CLI's parser (commander, in the 2.1.302 binary)
+// reads them, written here on its own rather than taken from ccx, so a test
+// sees what Claude would do with what ccx passed. Everything after `--` is an
+// operand. An option that requires a value takes the next argument, whatever
+// it is; an optional one takes it only when it is not another option; a list
+// takes every argument up to the next option. Short options cluster (`-pc` is
+// `-p -c`) up to one that takes a value, which takes the rest (`-dp` is
+// `--debug p`).
+const SHORT_OPTIONS = {
+  p: '--print',
+  c: '--continue',
+  h: '--help',
+  v: '--version',
+  d: '--debug',
+  r: '--resume',
+  w: '--worktree',
+  n: '--name',
+};
+const REQUIRED_VALUE = new Set([
+  '--output-format',
+  '--input-format',
+  '--session-id',
+  '--agent',
+  '--model',
+  '--permission-mode',
+  '--max-turns',
+  '--append-system-prompt',
+  '--system-prompt',
+  '--settings',
+  '--effort',
+  '--fallback-model',
+  '--name',
+]);
+const OPTIONAL_VALUE = new Set(['--resume', '--debug', '--worktree', '--from-pr', '--teleport', '--cloud', '--remote']);
+const LIST_VALUE = new Set([
+  '--add-dir',
+  '--allowedTools',
+  '--allowed-tools',
+  '--disallowedTools',
+  '--disallowed-tools',
+  '--tools',
+  '--mcp-config',
+  '--betas',
+  '--file',
+]);
+const looksLikeOption = (arg) => arg.length > 1 && arg.startsWith('-');
+/** Each option by its long name (true when it took no value; a later one wins), and the operands. */
+function parseCommandLine(argv) {
+  const options = new Map();
+  const operands = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--') {
+      operands.push(...argv.slice(i + 1));
+      break;
+    }
+    if (!looksLikeOption(arg)) {
+      operands.push(arg);
+      continue;
+    }
+    const take = (name, attached) => {
+      if (attached !== undefined && attached !== '') return options.set(name, attached);
+      if (REQUIRED_VALUE.has(name) && i + 1 < argv.length) return options.set(name, argv[++i]);
+      if (OPTIONAL_VALUE.has(name) && i + 1 < argv.length && !looksLikeOption(argv[i + 1])) {
+        return options.set(name, argv[++i]);
+      }
+      if (LIST_VALUE.has(name)) {
+        const values = [];
+        while (i + 1 < argv.length && !looksLikeOption(argv[i + 1])) values.push(argv[++i]);
+        return options.set(name, values);
+      }
+      return options.set(name, true);
+    };
+    if (arg.startsWith('--')) {
+      const eq = arg.indexOf('=');
+      const name = eq === -1 ? arg : arg.slice(0, eq);
+      if (eq === -1) take(arg);
+      // Only an option that takes a value takes one this way; `--print=x` is
+      // an option the real CLI does not know.
+      else if (REQUIRED_VALUE.has(name) || OPTIONAL_VALUE.has(name) || LIST_VALUE.has(name)) {
+        options.set(name, arg.slice(eq + 1));
+      } else options.set(arg, true);
+      continue;
+    }
+    for (let j = 1; j < arg.length; j++) {
+      const name = SHORT_OPTIONS[arg[j]];
+      if (name === undefined) break; // the real CLI refuses an option it does not know
+      if (REQUIRED_VALUE.has(name) || OPTIONAL_VALUE.has(name)) {
+        take(name, arg.slice(j + 1));
+        break;
+      }
+      options.set(name, true);
+    }
+  }
+  return { options, operands };
+}
+const parsed = parseCommandLine(args);
+/** An option's value as Claude would read it: a string, or null when absent or given none. */
+const valueOf = (name) => (typeof parsed.options.get(name) === 'string' ? parsed.options.get(name) : null);
+/** What this run applies, as the real CLI would read its arguments. */
+const applied = {
+  print: parsed.options.has('--print'),
+  continue: parsed.options.has('--continue'),
+  resume: valueOf('--resume') ?? (parsed.options.has('--resume') ? true : null),
+  sessionId: valueOf('--session-id'),
+  fork: parsed.options.has('--fork-session'),
+  model: valueOf('--model'),
+  prompt: parsed.operands[0] ?? null,
+};
+
 function loadScenario() {
   const explicit = process.env.FAKE_CLAUDE_SCENARIO;
   const perDir = path.join(configDir, 'fake-scenario.json');
@@ -87,58 +197,19 @@ const readObject = (file) => {
     return {};
   }
 };
-// Print mode with an output format, as a worker runs it. The prompt is read
-// the way Claude's own parser reads it: the first operand that is not some
-// option's value, where an option such as --allowedTools takes EVERY operand
-// up to the next option. With no operand, it is standard input, and with
-// neither, Claude refuses, as the real one does.
-const printMode = args.includes('-p') || args.includes('--print');
-const formatAt = args.indexOf('--output-format');
-const outputFormat = printMode && formatAt >= 0 ? args[formatAt + 1] : null;
+// Print mode with an output format, as a worker runs it. The prompt is the
+// first operand (see parseCommandLine). With no operand, it is standard input,
+// and with neither, Claude refuses, as the real one does.
+const printMode = applied.print;
+const outputFormat = printMode ? valueOf('--output-format') : null;
 // Print mode answering as text, with no format or `--output-format text`: the
 // 2.1.302 binary prints the result once, on standard output, a refused turn's
 // own words included, and draws nothing before it.
 const textAnswer = printMode && (!outputFormat || outputFormat === 'text');
-const VALUE_FLAGS = new Set([
-  '--output-format',
-  '--session-id',
-  '--resume',
-  '--agent',
-  '--model',
-  '--permission-mode',
-  '--max-turns',
-  '--append-system-prompt',
-  '--settings',
-  '--effort',
-  '--fallback-model',
-  '--input-format',
-]);
-const MANY_VALUE_FLAGS = new Set([
-  '--add-dir',
-  '--allowedTools',
-  '--allowed-tools',
-  '--disallowedTools',
-  '--disallowed-tools',
-  '--tools',
-  '--mcp-config',
-  '--betas',
-  '--file',
-]);
-const operandPrompt = () => {
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--') return args[i + 1] ?? null;
-    if (!arg.startsWith('-')) return arg;
-    if (arg.includes('=')) continue;
-    if (VALUE_FLAGS.has(arg)) i += 1;
-    else if (MANY_VALUE_FLAGS.has(arg)) while (i + 1 < args.length && !args[i + 1].startsWith('-')) i += 1;
-  }
-  return null;
-};
 let printPrompt = null;
 let promptVia = null;
 if (outputFormat) {
-  const operand = operandPrompt();
+  const operand = applied.prompt;
   if (operand !== null) {
     printPrompt = operand.trim();
     promptVia = 'arg';
@@ -162,6 +233,10 @@ if (runsLog) {
       marker: readMarker(),
       settingsModel,
       ...(outputFormat ? { prompt: printPrompt, via: promptVia, cwd: process.cwd() } : {}),
+      // What the real CLI would make of the arguments, and whether ccx gave it
+      // a terminal (a session) or pipes (a print-mode run it reads).
+      applied,
+      tty: Boolean(process.stdout.isTTY),
       pid: process.pid,
       // What it would sign in with, besides the session folder.
       oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
@@ -170,14 +245,20 @@ if (runsLog) {
     'utf8',
   );
 }
+// The real CLI's refusal of a conversation id beside a resume or a continue
+// that makes no copy (2.1.299 and 2.1.302), before it does anything else.
+if (applied.sessionId !== null && (applied.continue || applied.resume !== null) && !applied.fork) {
+  process.stderr.write(
+    'Error: --session-id can only be used with --continue or --resume if --fork-session is also specified.\n',
+  );
+  process.exit(1);
+}
 /** The conversation this run is in, which print mode reports as Claude does, flag or none. */
-const printSession = () => {
-  for (const flag of ['--session-id', '--resume']) {
-    const i = args.indexOf(flag);
-    if (i >= 0 && args[i + 1]) return args[i + 1];
-  }
-  return process.env.FAKE_CLAUDE_LANDS_ON ?? '00000000-0000-4000-8000-000000000000';
-};
+const printSession = () =>
+  applied.sessionId ??
+  valueOf('--resume') ??
+  process.env.FAKE_CLAUDE_LANDS_ON ??
+  '00000000-0000-4000-8000-000000000000';
 /**
  * The answer a print-mode run gives as it ends normally, then `done`. Only
  * once it is written out: a pipe on macOS takes writes asynchronously, and
@@ -218,7 +299,7 @@ if (outputFormat && !printPrompt) {
   process.stderr.write('Error: Input must be provided either through stdin or as a prompt argument when using --print\n');
   process.exit(1);
 }
-const firstLaunch = !args.includes('--resume');
+const firstLaunch = applied.resume === null;
 // A process Claude started (a test run, a dev server) that would run on after
 // it: its pid goes to the named file. Holding Claude's own output open, when
 // asked, as one that inherited it would. On Windows it is outside the job
@@ -262,8 +343,7 @@ if (process.env.FAKE_CLAUDE_SAY) process.stdout.write(`${process.env.FAKE_CLAUDE
 
 // The real CLI's answer to resuming a conversation that was never written (a
 // swap before the first message): a message on stderr and exit 1, at once.
-const resumeAt = args.indexOf('--resume');
-const resumed = resumeAt >= 0 ? args[resumeAt + 1] : undefined;
+const resumed = valueOf('--resume');
 if (process.env.FAKE_CLAUDE_NOTHING_TO_RESUME && resumed) {
   process.stderr.write(`No conversation found with session ID: ${resumed}\n`);
   process.exit(1);
@@ -274,9 +354,8 @@ if (process.env.FAKE_CLAUDE_NOTHING_TO_RESUME && resumed) {
 // nothing, as with the real CLI when a swap lands before that message.
 if (process.env.FAKE_CLAUDE_UNSAVED_FORKS) {
   const unsaved = path.join(configDir, 'unsaved-forks.txt');
-  const sessionAt = args.indexOf('--session-id');
-  if (args.includes('--fork-session') && sessionAt >= 0) {
-    appendFileSync(unsaved, `${args[sessionAt + 1]}\n`, 'utf8');
+  if (applied.fork && applied.sessionId !== null) {
+    appendFileSync(unsaved, `${applied.sessionId}\n`, 'utf8');
   } else if (resumed && existsSync(unsaved) && readFileSync(unsaved, 'utf8').split('\n').includes(resumed)) {
     process.stderr.write(`No conversation found with session ID: ${resumed}\n`);
     process.exit(1);
@@ -289,10 +368,6 @@ if (process.env.FAKE_CLAUDE_UNSAVED_FORKS) {
 // Measured against the real binary: a fork records its --session-id, a resume
 // the resumed id, --continue or the picker whatever it lands on.
 if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
-  const valueAfter = (flag) => {
-    const i = args.indexOf(flag);
-    return i >= 0 && args[i + 1] && !args[i + 1].startsWith('-') ? args[i + 1] : null;
-  };
   const record = path.join(configDir, 'sessions', `${process.pid}.json`);
   const startedAt = Date.now();
   // What Claude says it is doing, as 2.1.296 keeps it (measured): "idle" at
@@ -309,8 +384,8 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
       ? { status: resting, statusUpdatedAt: Date.now() }
       : {};
   let recordedId =
-    valueAfter('--session-id') ??
-    valueAfter('--resume') ??
+    applied.sessionId ??
+    valueOf('--resume') ??
     process.env.FAKE_CLAUDE_LANDS_ON ??
     '00000000-0000-4000-8000-000000000000';
   // When this process started, as Claude 2.1.302 records it off Windows
@@ -707,7 +782,7 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
 // Simulate a resume that has nothing to resume. Only on --continue, exactly as
 // the real CLI does, so the fresh retry that follows does NOT emit it again and
 // the test cannot loop.
-if (process.env.FAKE_CLAUDE_NO_CONVERSATION && (args.includes('--continue') || args.includes('-c'))) {
+if (process.env.FAKE_CLAUDE_NO_CONVERSATION && applied.continue) {
   process.stdout.write('No conversation found to continue\n');
 }
 
@@ -748,11 +823,7 @@ if (capEvery > 0) {
 // PreToolUse hook (the person's own) refuses the call after ccx's has run, as a
 // permission rule or plan mode can, so no after-hook runs for it.
 if (process.env.FAKE_CLAUDE_ARTIFACT && firstLaunch) {
-  const valueAfter = (flag) => {
-    const i = args.indexOf(flag);
-    return i >= 0 && args[i + 1] && !args[i + 1].startsWith('-') ? args[i + 1] : null;
-  };
-  const sessionId = valueAfter('--session-id') ?? valueAfter('--resume') ?? '00000000-0000-4000-8000-000000000000';
+  const sessionId = applied.sessionId ?? valueOf('--resume') ?? '00000000-0000-4000-8000-000000000000';
   const transcript = path.join(configDir, 'projects', 'fake-project', `${sessionId}.jsonl`);
   const note = (entry) => {
     if (runsLog) appendFileSync(runsLog, `${JSON.stringify(entry)}\n`, 'utf8');

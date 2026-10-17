@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.14]
+
+### Fixed
+
+- **ccx reads Claude's command line the way Claude does (#151).** Two
+  misreadings made Claude refuse a run or drop what ccx added:
+  - **`-p` in a cluster.** `claude -pc "..."` is print mode with `--continue`
+    to Claude, but ccx saw print mode only in a separate `-p` or `--print`, so
+    it ran the command as a terminal session and added `--session-id`, which
+    Claude refuses beside a continue. Print mode is now read in any spelling
+    (`-pc`, `-cp`), and `-dp` is still `--debug p`, not print mode. The same
+    reading finds `-c` and `-r` in a cluster for a terminal session (`-cd api`,
+    `-r<id>`), and a swap takes only those letters out of the cluster.
+  - **Flags after `--`.** Claude reads everything after `--` as the prompt.
+    The model fallback (`--model`), the conversation flags a session or a
+    swap adds (`--session-id`, `--resume`, `--continue`), the worker's
+    `--session-id` and the arguments handed to a newer ccx went at the end, so
+    with a `--` they became words of the prompt and were never applied. Each
+    now goes before the `--`, and nothing after it is read or removed as a
+    flag.
+  - A command line with no `--` and no cluster gets exactly the arguments it
+    did before. Claude's short options and which take a value were read from
+    the 2.1.302 binary: `-d`, `-r`, `-w` and `-n` take one; `-p`, `-c`, `-h`
+    and `-v` do not.
+
 ## [2.6.13]
 
 ### Fixed

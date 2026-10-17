@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import type { Command } from 'commander';
 import { listAccounts } from '../accounts/registry.js';
 import type { CliContext } from '../context.js';
-import { optionTokens } from '../launcher/conversation.js';
+import { readCommandLine, withOptions } from '../launcher/claude-args.js';
 import { handleInterruption, type SignalSource } from '../launcher/interruption.js';
 import { runInteractiveHotSwap } from './session.js';
 
@@ -53,48 +53,31 @@ const MAX_TIMER_MS = 2_147_483_647;
 type Output = (typeof OUTPUTS)[number];
 
 /**
- * Claude flags a worker sets itself. Given again after `--`, Claude takes the
- * later one: a second --output-format turns the answer into something the
- * worker cannot read, and a conversation flag points a move at the wrong
- * conversation. Each has a worker option or no meaning for a worker.
+ * Claude flags a worker sets itself, by the long name Claude knows each by
+ * (`-p` is `--print`). Given again after `--`, Claude takes the later one: a
+ * second --output-format turns the answer into something the worker cannot
+ * read, and a conversation flag points a move at the wrong conversation. Each
+ * has a worker option or no meaning for a worker.
  */
 const WORKER_OWNED_FLAGS = new Set([
-  '-p',
   '--print',
   '--output-format',
   '--input-format',
   '--session-id',
-  '-r',
   '--resume',
-  '-c',
   '--continue',
   '--fork-session',
 ]);
 
-/** Claude's short options that take a value, which takes the rest of a cluster with it (`-rID`). */
-const SHORT_VALUE_FLAGS = new Set(['-d', '-n', '-r', '-w']);
-
 /**
- * The first of the worker's own flags among Claude's flags, however it is
- * spelled: `--name`, `--name=value`, or a short option on its own, in a
- * cluster (`-pc` is `-p -c`) or with its value attached (`-rID`). An option's
- * value is never read as an option.
+ * The first of the worker's own flags among Claude's flags, as it is spelled
+ * there: `--name`, `--name=value`, or a short option on its own, in a cluster
+ * (`-pc` is `-p -c`) or with its value attached (`-rID`). An option's value is
+ * never read as an option.
  */
 export function ownedFlagIn(passthrough: string[]): string | null {
-  for (const token of optionTokens(passthrough)) {
-    if (token.startsWith('--')) {
-      const name = token.split('=')[0] ?? token;
-      if (WORKER_OWNED_FLAGS.has(name)) return name;
-      continue;
-    }
-    for (const letter of token.slice(1)) {
-      const flag = `-${letter}`;
-      if (WORKER_OWNED_FLAGS.has(flag)) return flag;
-      // The rest of the cluster is this option's value, or not options at all.
-      if (SHORT_VALUE_FLAGS.has(flag) || !/[A-Za-z]/.test(letter)) break;
-    }
-  }
-  return null;
+  const owned = readCommandLine(passthrough).options.find((o) => WORKER_OWNED_FLAGS.has(o.long));
+  return owned?.name ?? null;
 }
 
 /** Which accounts a worker ran on, in order, for its report. */
@@ -320,23 +303,24 @@ export async function workerCommand(
   }
 
   // Named here rather than by the session, so the report can say which
-  // conversation to look in, and so a move resumes exactly this one. Last, so
-  // it also ends any option among Claude's flags that takes every value after
-  // it, and the brief after it is read as the brief.
+  // conversation to look in, and so a move resumes exactly this one. Last of
+  // the options, so it also ends any option among Claude's flags that takes
+  // every value after it, and the brief after it is read as the brief.
   let sessionId: string | null = randomUUID();
-  const args = [
-    '-p',
-    '--output-format',
-    output,
-    // Claude requires it for stream-json in print mode.
-    ...(output === 'stream-json' ? ['--verbose'] : []),
-    ...(options.agent ? ['--agent', options.agent] : []),
-    ...(options.model ? ['--model', options.model] : []),
-    ...(options.permissionMode ? ['--permission-mode', options.permissionMode] : []),
-    ...passthrough,
-    '--session-id',
-    sessionId,
-  ];
+  const args = withOptions(
+    [
+      '-p',
+      '--output-format',
+      output,
+      // Claude requires it for stream-json in print mode.
+      ...(output === 'stream-json' ? ['--verbose'] : []),
+      ...(options.agent ? ['--agent', options.agent] : []),
+      ...(options.model ? ['--model', options.model] : []),
+      ...(options.permissionMode ? ['--permission-mode', options.permissionMode] : []),
+      ...passthrough,
+    ],
+    ['--session-id', sessionId],
+  );
 
   const accountsRun: string[] = [];
   /** What the launch running now printed: only the one that finished is the answer. */

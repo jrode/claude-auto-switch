@@ -64,6 +64,8 @@ describe("the worker's own flags among Claude's", () => {
     expect(ownedFlagIn(['-rabc'])).toBe('-r');
     expect(ownedFlagIn(['-pc'])).toBe('-p');
     expect(ownedFlagIn(['-vp'])).toBe('-p');
+    // A letter Claude does not know yet is read as one that takes no value.
+    expect(ownedFlagIn(['-xp'])).toBe('-p');
     expect(ownedFlagIn(['--add-dir', 'x', '-c'])).toBe('-c');
   });
 
