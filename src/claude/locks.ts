@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   closeSync,
   mkdirSync,
@@ -157,8 +158,8 @@ export interface OwnedLockOptions {
   maxHoldMs?: number;
   now?: () => number;
   isRunning?: (pid: number) => boolean;
-  /** Creates the lock file, failing if it exists, and names this process in it. */
-  create?: (file: string) => void;
+  /** Creates the lock file, failing if it exists, with `content` in it: this process's pid and a token. */
+  create?: (file: string, content: string) => void;
   platform?: NodeJS.Platform;
 }
 
@@ -182,10 +183,13 @@ export function acquireOwnedLock(lockFile: string, options: OwnedLockOptions): L
   const abandoned = (): boolean =>
     isAbandoned(lockFile, now(), options.staleMs, options.maxHoldMs ?? 60_000, options.isRunning ?? isRunning);
 
+  // The pid names the holder; the token tells this acquisition from any other
+  // of the same process.
+  const content = `${process.pid} ${randomUUID()}`;
   for (;;) {
     try {
-      create(lockFile);
-      return ownedHandle(lockFile);
+      create(lockFile, content);
+      return ownedHandle(lockFile, content);
     } catch (err) {
       if (!busy.includes((err as NodeJS.ErrnoException).code ?? '')) return { held: false, release: () => {} };
     }
@@ -195,10 +199,10 @@ export function acquireOwnedLock(lockFile: string, options: OwnedLockOptions): L
   }
 }
 
-function createOwnedLockFile(file: string): void {
+function createOwnedLockFile(file: string, content: string): void {
   const fd = openSync(file, 'wx', 0o600);
   try {
-    writeSync(fd, String(process.pid));
+    writeSync(fd, content);
   } catch {
     /* held all the same; with no holder named it is judged by its age */
   } finally {
@@ -206,24 +210,50 @@ function createOwnedLockFile(file: string): void {
   }
 }
 
-function ownedHandle(lockFile: string): LockHandle {
+function ownedHandle(lockFile: string, content: string): LockHandle {
   let released = false;
   return {
     held: true,
     release: () => {
       if (released) return;
       released = true;
-      // Only while it still names this process: a holder that ran past the
-      // longest hold may have had its lock taken over, and the lock it would
-      // remove is then the new holder's.
-      if (lockHolder(lockFile) !== process.pid) return;
+      // Only while the lock is still this acquisition's: a holder that ran past
+      // the longest hold may have been taken over, by another process or by
+      // another task of this one, and the lock is then the new holder's. Under
+      // the takeover guard where it can be had, so no takeover removes this lock
+      // and makes its own between the look and the removal; where it cannot, a
+      // takeover holds it, and makes no lock of its own until it lets go.
+      const guard = `${lockFile}.takeover`;
+      let guarded = false;
       try {
-        rmSync(lockFile, { force: true });
+        mkdirSync(guard);
+        guarded = true;
+      } catch {
+        /* see above */
+      }
+      try {
+        if (readLock(lockFile) === content) rmSync(lockFile, { force: true });
       } catch {
         /* already gone */
+      } finally {
+        if (guarded) {
+          try {
+            rmdirSync(guard);
+          } catch {
+            /* already gone */
+          }
+        }
       }
     },
   };
+}
+
+function readLock(lockFile: string): string | null {
+  try {
+    return readFileSync(lockFile, 'utf8').trim();
+  } catch {
+    return null;
+  }
 }
 
 function isAbandoned(
@@ -243,7 +273,8 @@ function isAbandoned(
 
 function lockHolder(lockFile: string): number | null {
   try {
-    const pid = Number(readFileSync(lockFile, 'utf8').trim());
+    // The pid comes first; older builds wrote it alone.
+    const pid = Number(readFileSync(lockFile, 'utf8').trim().split(/\s+/)[0]);
     return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
   } catch {
     return null; // a directory from an older build, or unreadable

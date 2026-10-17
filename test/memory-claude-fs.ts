@@ -1,8 +1,28 @@
 import path from 'node:path';
 import type { RepairFs } from '../src/launcher/claude-repair.js';
 
-/** How a Windows program starts, which is what the resolver reads to tell one. */
-export const WINDOWS_PROGRAM = 'MZ, a Windows program';
+/**
+ * A Windows program as small as one can be and still say how long it is: an
+ * MZ header, a PE header with one section, and that section's bytes. Cut to
+ * `length`, it is one npm is still writing.
+ */
+export function windowsProgram(declared = 1024, length = declared): string {
+  const bytes = Buffer.alloc(Math.max(declared, length));
+  bytes.write('MZ', 0, 'latin1');
+  bytes.writeUInt32LE(0x40, 0x3c); // where the PE header is
+  bytes.writeUInt32LE(0x00004550, 0x40); // "PE" and two zero bytes
+  bytes.writeUInt16LE(1, 0x46); // one section
+  bytes.writeUInt16LE(240, 0x54); // the optional header's size
+  bytes.writeUInt16LE(0x20b, 0x58); // PE32+
+  bytes.writeUInt32LE(16, 0x58 + 108); // sixteen data directories, none of them a signature
+  bytes.writeUInt32LE(declared - 0x200, 0x148 + 16); // the section's size
+  bytes.writeUInt32LE(0x200, 0x148 + 20); // and where it starts
+  bytes.write(', a Windows program', 0x200, 'latin1');
+  return bytes.subarray(0, length).toString('latin1');
+}
+
+/** A whole Windows program, which is what the resolver reads to tell one. */
+export const WINDOWS_PROGRAM = windowsProgram();
 
 /** The first lines of the bin/claude.exe that Claude Code's npm package ships. */
 export const NPM_PLACEHOLDER = [
@@ -153,6 +173,10 @@ export function memoryWindowsFs(layout: Record<string, string | null>, options: 
       return [...names];
     },
     modifiedAt: (f) => (exists(f) ? (times.get(key(f)) ?? 0) : null),
+    size: (f) => {
+      const content = files.get(key(f));
+      return content === undefined ? null : Buffer.byteLength(content, 'latin1');
+    },
     // A link is the same file, so it changed when its source did.
     link: (from, to) => place(from, to, options.refuse?.link, 'link', times.get(key(from)) ?? 0),
     copyNew: (from, to) => place(from, to, options.refuse?.copy, 'copy', Date.now()),

@@ -2,7 +2,13 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { findRealClaude, resolveRealClaude, whereItIsUsuallyInstalled, type ClaudeFs } from './real-claude.js';
+import {
+  declaredProgramSize,
+  findRealClaude,
+  resolveRealClaude,
+  whereItIsUsuallyInstalled,
+  type ClaudeFs,
+} from './real-claude.js';
 import { RealClaudeError } from '../util/errors.js';
 import {
   memoryWindowsFs,
@@ -12,6 +18,7 @@ import {
   NPM_PS1_SHIM,
   NPM_SH_SHIM,
   WINDOWS_PROGRAM,
+  windowsProgram,
   type MemoryFs,
 } from '../../test/memory-claude-fs.js';
 
@@ -365,6 +372,31 @@ describe('an install npm may still be writing (Windows)', () => {
     const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
     expect(search.bin).toBe(NESTED);
     expect(search.broken[0]).toMatchObject({ busy: true, settlesInMs: 160_000 });
+  });
+
+  it('never takes a platform program shorter than its own headers say, however long ago it changed', () => {
+    // Windows may not move a file's change time while the handle writing it is
+    // still open, so the time alone is no proof the program is whole.
+    const fs = memoryWindowsFs({
+      [CMD]: NPM_CMD_SHIM,
+      [PKG_JSON]: PACKAGE_JSON,
+      [BIN]: NPM_PLACEHOLDER,
+      [NESTED]: windowsProgram(4096, 2048),
+    });
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.bin).toBeNull();
+    expect(search.broken[0]?.platformProgram).toBeNull();
+  });
+
+  it('reads how long a program is from its sections, and from its signature when it has one', () => {
+    const whole = Buffer.from(windowsProgram(1024), 'latin1');
+    expect(declaredProgramSize(whole)).toBe(1024);
+    const signed = Buffer.from(whole);
+    signed.writeUInt32LE(1024, 0x58 + 112 + 4 * 8); // the certificate table starts where the section ends
+    signed.writeUInt32LE(512, 0x58 + 112 + 4 * 8 + 4);
+    expect(declaredProgramSize(signed)).toBe(1536);
+    expect(declaredProgramSize(Buffer.from(NPM_PLACEHOLDER, 'latin1'))).toBeNull();
+    expect(declaredProgramSize(whole.subarray(0, 0x100))).toBeNull();
   });
 
   it('believes no change time from a clock that was ahead', () => {

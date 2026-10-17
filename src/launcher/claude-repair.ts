@@ -13,6 +13,7 @@ import {
   findRealClaude,
   SETTLED_MS,
   inspectNpmInstall,
+  isWholeWindowsProgram,
   isWindowsProgram,
   nodeClaudeFs,
   type BrokenNpmInstall,
@@ -251,7 +252,11 @@ function repairOne(install: BrokenNpmInstall, deps: LaunchDeps & RepairDeps, mem
     }
     deps.say(`ccx: ${why}; repairing it anyway, as ccx doctor --fix asks`);
   }
-  const result = install.platformProgram ? placeProgram(install, deps) : reinstallWithNpm(install, deps);
+  // When Claude starts anyway, what the repair says is kept back unless it worked.
+  const heldBack: string[] = [];
+  const repairDeps = options.quiet ? { ...deps, say: (line: string) => void heldBack.push(line) } : deps;
+  const result = install.platformProgram ? placeProgram(install, repairDeps) : reinstallWithNpm(install, repairDeps);
+  if (result.repaired) heldBack.forEach((line) => deps.say(line));
   // ccx's own changes are finished, so nothing here is still being written.
   const after = inspectNpmInstall(install.folder, fs, deps.arch, { settledMs: 0 });
   if (result.repaired || after === null) {
@@ -344,8 +349,8 @@ export function placeProgram(install: BrokenNpmInstall, deps: Pick<RepairDeps, '
   const fs = deps.fs ?? nodeRepairFs;
   const from = install.platformProgram;
   const to = install.program;
-  if (!from || isWindowsProgram(fs, from) !== true) {
-    return { repaired: false, reason: `the platform package has no program to put in place for ${install.folder}` };
+  if (!from || isWindowsProgram(fs, from) !== true || !isWholeWindowsProgram(fs, from)) {
+    return { repaired: false, reason: `the platform package has no whole program to put in place for ${install.folder}` };
   }
   const isPlaceholder = (file: string): boolean => fs.isFile(file) && isWindowsProgram(fs, file) === false;
   const occupied = fs.exists(to);

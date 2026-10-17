@@ -60,7 +60,8 @@ describe('acquireOwnedLock', () => {
     const then = new Date(Date.now() - minutes * 60_000);
     utimesSync(lock, then, then);
   };
-  const owner = (lock: string): string => readFileSync(lock, 'utf8');
+  /** The pid a lock names, which comes before its token. */
+  const owner = (lock: string): string => readFileSync(lock, 'utf8').trim().split(/\s+/)[0] ?? '';
 
   it('takes a free lock, names its holder in it, and releases it', () => {
     const lock = path.join(dir(), 'x.lock');
@@ -76,10 +77,28 @@ describe('acquireOwnedLock', () => {
     // A holder that ran past the longest hold can have its lock taken over;
     // removing the lock then would remove the new holder's.
     const lock = path.join(dir(), 'x.lock');
+    const other = String(process.pid + 1);
     const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000 });
-    writeFileSync(lock, '4242', 'utf8');
+    writeFileSync(lock, other, 'utf8');
     h.release();
-    expect(owner(lock)).toBe('4242');
+    expect(owner(lock)).toBe(other);
+  });
+
+  it('leaves, on release, a lock another task of this same process has taken over', () => {
+    // The pid is the same; only the token tells the two acquisitions apart.
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000 });
+    writeFileSync(lock, `${process.pid} the-new-holder`, 'utf8');
+    h.release();
+    expect(readFileSync(lock, 'utf8')).toBe(`${process.pid} the-new-holder`);
+  });
+
+  it('removes its own lock on release, and the takeover guard with it', () => {
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000 });
+    h.release();
+    expect(existsSync(lock)).toBe(false);
+    expect(existsSync(`${lock}.takeover`)).toBe(false);
   });
 
   it('never takes over a running holder for age alone', () => {
@@ -147,10 +166,10 @@ describe('acquireOwnedLock', () => {
   it("waits through Windows' refusals while the last holder's lock is still being removed", () => {
     const lock = path.join(dir(), 'x.lock');
     let attempts = 0;
-    const create = (file: string): void => {
+    const create = (file: string, content: string): void => {
       attempts += 1;
       if (attempts < 3) throw Object.assign(new Error('delete pending'), { code: 'EPERM' });
-      writeFileSync(file, String(process.pid), { flag: 'wx' });
+      writeFileSync(file, content, { flag: 'wx' });
     };
     const h = acquireOwnedLock(lock, { waitMs: 10_000, staleMs: 5_000, create, platform: 'win32' });
     expect(h.held).toBe(true);

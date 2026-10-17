@@ -29,6 +29,8 @@ export interface ClaudeFs {
   list(dir: string): string[];
   /** When a file or folder last changed, in milliseconds, or null when it is not there. */
   modifiedAt(file: string): number | null;
+  /** A file's length in bytes, or null when it is not there. */
+  size(file: string): number | null;
 }
 
 export const nodeClaudeFs: ClaudeFs = {
@@ -91,6 +93,13 @@ export const nodeClaudeFs: ClaudeFs = {
   modifiedAt: (file) => {
     try {
       return statSync(file).mtimeMs;
+    } catch {
+      return null;
+    }
+  },
+  size: (file) => {
+    try {
+      return statSync(file).size;
     } catch {
       return null;
     }
@@ -339,6 +348,61 @@ export function isWindowsProgram(fs: ClaudeFs, file: string): boolean | null {
   return start.length === 2 && start[0] === 0x4d && start[1] === 0x5a;
 }
 
+/**
+ * Whether a Windows program is all there: at least as long as its own headers
+ * say. npm writes the platform program from its start to its end, so one still
+ * being written is shorter than the extent its sections and its signature
+ * give. A change time cannot show this: Windows may not move a file's change
+ * time while the handle writing it is still open.
+ */
+export function isWholeWindowsProgram(fs: ClaudeFs, file: string): boolean {
+  const size = fs.size(file);
+  const head = fs.readStart(file, 64 * 1024);
+  if (size === null || head === null) return false;
+  const declared = declaredProgramSize(head);
+  return declared !== null && size >= declared;
+}
+
+/**
+ * The extent a program's PE headers declare, from the start of the file: the
+ * end of its last section, or of its signature (the certificate table, which
+ * sits after everything else in a signed program such as Claude Code's).
+ * Null when the headers cannot be read from `head`.
+ */
+export function declaredProgramSize(head: Uint8Array): number | null {
+  const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+  const u16 = (at: number): number | null => (at >= 0 && at + 2 <= head.length ? view.getUint16(at, true) : null);
+  const u32 = (at: number): number | null => (at >= 0 && at + 4 <= head.length ? view.getUint32(at, true) : null);
+  if (u16(0) !== 0x5a4d) return null; // "MZ"
+  const pe = u32(0x3c);
+  if (pe === null || u32(pe) !== 0x00004550) return null; // "PE\0\0"
+  const sections = u16(pe + 6);
+  const optionalSize = u16(pe + 20);
+  if (sections === null || optionalSize === null) return null;
+  const optional = pe + 24;
+  const magic = u16(optional);
+  // The data directories, after the optional header's fixed part (PE32+ or PE32).
+  const directories = magic === 0x20b ? optional + 112 : magic === 0x10b ? optional + 96 : null;
+  if (directories === null) return null;
+  let end = 0;
+  const directoryCount = u32(directories - 4);
+  if (directoryCount !== null && directoryCount > 4) {
+    // Directory 4 is the certificate table, whose address is a file offset.
+    const signatureAt = u32(directories + 4 * 8);
+    const signatureSize = u32(directories + 4 * 8 + 4);
+    if (signatureAt === null || signatureSize === null) return null;
+    if (signatureSize > 0) end = signatureAt + signatureSize;
+  }
+  const table = optional + optionalSize;
+  for (let i = 0; i < sections; i++) {
+    const rawSize = u32(table + i * 40 + 16);
+    const rawAt = u32(table + i * 40 + 20);
+    if (rawSize === null || rawAt === null) return null;
+    end = Math.max(end, rawAt + rawSize);
+  }
+  return end > 0 ? end : null;
+}
+
 const NPM_PACKAGE = ['node_modules', '@anthropic-ai', 'claude-code'];
 
 /** The platform package npm installs for each processor, as install.cjs names them. */
@@ -376,11 +440,12 @@ function brokenNpmInstalls(candidates: string[], fs: ClaudeFs, arch: string, now
 export const SETTLED_MS = 3 * 60_000;
 
 /**
- * How long the platform program itself must have gone unchanged before ccx
- * starts Claude from it. npm writes it as fast as the download arrives, so a
- * file still being written changes many times a second; half a minute without
- * a change is a stall far longer than a working download has, and short enough
- * that someone who just ran npm with install scripts off barely waits.
+ * How long the platform program itself must have gone unchanged, besides being
+ * whole by its own headers, before ccx starts Claude from it. npm writes it as
+ * fast as the download arrives, so where Windows moves the change time as it
+ * writes, half a minute without a change is a stall far longer than a working
+ * download has, and short enough that someone who just ran npm with install
+ * scripts off barely waits.
  */
 export const PROGRAM_QUIET_MS = 30_000;
 
@@ -468,11 +533,15 @@ export function inspectNpmInstall(
     prefix,
     program,
     state,
-    // Judged on its own: complete once npm has stopped writing it, even while
-    // the rest of the install is still settling.
+    // Judged on its own, even while the rest of the install is still settling:
+    // whole by its own headers, and left alone for a while besides.
     platformProgram:
       places.find(
-        (exe) => fs.isFile(exe) && isWindowsProgram(fs, exe) === true && changedWithin(exe, quietMs) === null,
+        (exe) =>
+          fs.isFile(exe) &&
+          isWindowsProgram(fs, exe) === true &&
+          isWholeWindowsProgram(fs, exe) &&
+          changedWithin(exe, quietMs) === null,
       ) ?? null,
     version: versionOf(folder, fs),
     ...settling([folder, program, ...places]),

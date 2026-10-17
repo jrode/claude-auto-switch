@@ -30,6 +30,7 @@ import {
   NPM_PLACEHOLDER,
   NPM_SH_SHIM,
   WINDOWS_PROGRAM,
+  windowsProgram,
   type MemoryFs,
 } from '../../test/memory-claude-fs.js';
 
@@ -234,7 +235,19 @@ describe('repairing an npm install from its platform package (no network)', () =
     expect(resolveClaudeForLaunch(h.deps).bin).toBe(NESTED);
     expect(fs.content(BIN)).toBe(NPM_PLACEHOLDER);
     expect(fs.changes).toEqual([]);
-    expect(h.said.at(-1)).toContain('in use');
+    // Claude starts anyway, so the launch keeps quiet about the repair it could not make.
+    expect(h.said).toEqual([]);
+    const said: string[] = [];
+    expect(placeProgram(brokenAt(fs), { fs, say: (line) => said.push(line) })).toMatchObject({ repaired: false });
+    expect(said.at(-1)).toContain('in use');
+  });
+
+  it('never puts in place a platform program shorter than its own headers say', () => {
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }));
+    const install = brokenAt(fs);
+    fs.put(NESTED, windowsProgram(4096, 2048), 0);
+    expect(placeProgram(install, { fs, say: () => {} }).repaired).toBe(false);
+    expect(fs.content(BIN)).toBe(NPM_PLACEHOLDER);
   });
 
   it('puts the placeholder back when neither a link nor a copy can be made', () => {
