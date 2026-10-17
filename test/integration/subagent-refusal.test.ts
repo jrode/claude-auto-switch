@@ -3,6 +3,7 @@ import {
   FAKE_ENV,
   PROMPT,
   PTY_AVAILABLE,
+  carryOnEnded,
   launches,
   live,
   prompts,
@@ -29,12 +30,15 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
       for (const name of FAKE_ENV) delete process.env[name];
     });
 
-    // Subagent refused at 0.8 s, main thread at 2 s; Claude ends by itself at
-    // 20 s, which the log shows as a "reread" the tests require to be absent.
+    // A subagent is refused at 0.8 s, and the main thread as the account is
+    // asked about that (refuseMainWhenAsked), so ccx has always read the
+    // subagent's first. Answered at once, the main thread's comes after the
+    // check; answered in 3 s, inside it, since ccx reads the record every
+    // 1.2 s. Claude ends by itself at 40 s, four times what the slowest case
+    // takes, which the log shows as a "reread" the tests require to be absent.
     const env = {
-      FAKE_CLAUDE_IDLE_MS: '20000',
+      FAKE_CLAUDE_IDLE_MS: '40000',
       FAKE_CLAUDE_SUBAGENT_REFUSE_AFTER_MS: '800',
-      FAKE_CLAUDE_REFUSE_AFTER_MS: '2000',
     };
 
     for (const [speed, verifyDelayMs] of [
@@ -51,6 +55,7 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
           const session = live({
             env,
             verifyDelayMs,
+            refuseMainWhenAsked: true,
             verify: () => true,
             decide: (context) => (context.sidechain ? { kind: 'left' } : { kind: 'restart' }),
           });
@@ -71,6 +76,7 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
           const session = live({
             env,
             verifyDelayMs,
+            refuseMainWhenAsked: true,
             verify: (asked) => asked > 1,
             decide: (context) => (context.sidechain ? { kind: 'left' } : { kind: 'restart' }),
           });
@@ -91,6 +97,7 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
           const session = live({
             env: { ...env, FAKE_CLAUDE_STATUS: '' },
             verifyDelayMs,
+            refuseMainWhenAsked: true,
             verify: () => true,
           });
           expect(await session.outcome).toMatchObject({ kind: 'switch', switchTo: 'B' });
@@ -147,8 +154,9 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)("a subagent's refusal starts 
           FAKE_CLAUDE_IDLE_MS: '20000',
           FAKE_CLAUDE_STATUS: '',
           FAKE_CLAUDE_SUBAGENT_REFUSE_AFTER_MS: '800',
-          FAKE_CLAUDE_REFUSE_AFTER_MS: '2700',
         },
+        // After the subagent's refusal is read, so never in the same read as it.
+        refuseMainWhenAsked: true,
         timing: { blockedMs: 4000 },
       });
       expect(await session.outcome).toMatchObject({ kind: 'switch', switchTo: 'B' });
@@ -194,14 +202,19 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)("a subagent's refusal starts 
   );
 
   it('is one limit when the main thread then meets it too', { timeout: 60_000 }, async () => {
-    // The main thread's own request was already on its way on the old login.
+    // The main thread's own request was already on its way on the old login,
+    // and is refused once the subagent's refusal has been read. The prompt
+    // waits long enough after the move for ccx, reading every 1.2 s, to have
+    // read that refusal first: read together with the prompt, it would count
+    // as the prompt's own and the prompt would be typed again.
     const session = live({
       env: {
         FAKE_CLAUDE_IDLE_MS: '20000',
         FAKE_CLAUDE_SUBAGENT_REFUSE_AFTER_MS: '800',
-        FAKE_CLAUDE_REFUSE_AFTER_MS: '2700',
         FAKE_CLAUDE_EXIT_AFTER_PROMPTS: '1',
       },
+      refuseMainWhenAsked: true,
+      timing: { pickupMs: 3000 },
     });
     expect((await session.outcome).kind).toBe('ok');
 
@@ -221,10 +234,13 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)("a subagent's refusal starts 
       // stalled on the limit would be relaunched to be told; this one is
       // working, and is left as it is.
       const session = live({
-        env: { FAKE_CLAUDE_IDLE_MS: '6500', FAKE_CLAUDE_SUBAGENT_REFUSE_AFTER_MS: '1500' },
+        env: { FAKE_CLAUDE_IDLE_MS: '20000', FAKE_CLAUDE_SUBAGENT_REFUSE_AFTER_MS: '1500' },
       });
       await waitFor('the launch', session.log, (log) => launches(log).length === 1);
       session.press('half a thought');
+      // Once ccx has said what became of the prompt, nothing more can come of it.
+      await waitFor('the carry-on prompt to be seen through', () => session.events, carryOnEnded);
+      session.end();
 
       expect((await session.outcome).kind).toBe('ok');
       expect(session.decisions).toHaveLength(1);

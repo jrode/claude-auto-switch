@@ -191,9 +191,12 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
         const { home, runsLog, context, asked } = await twoAccounts('cas-429-words-', {
           A: [TURNED_AWAY],
         });
+        const endNow = path.join(home, 'end-now');
         Object.assign(process.env, {
           FAKE_CLAUDE_RUNS_LOG: runsLog,
-          FAKE_CLAUDE_IDLE_MS: '6000',
+          // Ended once ccx has said what it made of the words; this is a backstop.
+          FAKE_CLAUDE_IDLE_MS: '30000',
+          FAKE_CLAUDE_EXIT_WHEN: endNow,
           // Claude says what it is doing, but keeps no record of the
           // conversation to read, so the screen stands in for it.
           FAKE_CLAUDE_SESSION_RECORD: '1',
@@ -201,10 +204,30 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
           FAKE_CLAUDE_CAP_EVERY_MS: '1000',
         });
 
-        expect(await runCommand(context, [])).toBe(0);
+        const started = Date.now();
+        let ended = false;
+        const running = runCommand(context, []).finally(() => {
+          ended = true;
+        });
+        const decided = (): boolean => {
+          try {
+            return eventsIn(home).some((e) => e.kind === 'cap-verify' || e.kind === 'cap-relief');
+          } catch {
+            return false; // not written yet, or caught mid-line
+          }
+        };
+        await waitFor('ccx to judge the limit words', () => ended || decided(), (done) => done, 30_000);
+        writeFileSync(endNow, '', 'utf8');
+        const code = await running;
+        // Printed with each check, so a session that ended early says how.
+        const story =
+          `ran ${Date.now() - started} ms; events: ` +
+          (existsSync(path.join(home, 'events.jsonl')) ? JSON.stringify(eventsIn(home)) : 'none') +
+          `; runs log: ${JSON.stringify(readLog(runsLog))}`;
+        expect(launches(readLog(runsLog)).map((l) => l.marker), story).toEqual(['A']);
+        expect(code, story).toBe(0);
         // Asked, turned away, and not moved.
-        expect(asked).toContain('A');
-        expect(launches(readLog(runsLog)).map((l) => l.marker)).toEqual(['A']);
+        expect(asked, story).toContain('A');
         expect(capsIn(home)).toEqual([]);
         const events = eventsIn(home);
         expect(events.filter((e) => e.kind === 'cap-relief')).toEqual([]);

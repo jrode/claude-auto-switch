@@ -202,6 +202,7 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a runnin
     delete process.env.FAKE_CLAUDE_IDLE_STATUS;
     delete process.env.FAKE_CLAUDE_TRANSCRIPT;
     delete process.env.FAKE_CLAUDE_SUBAGENT_WRITES_UNTIL_MS;
+    delete process.env.FAKE_CLAUDE_EXIT_WHEN;
   });
 
   it('replayed cap text is refuted by the API check: no false cap, no cascade', async () => {
@@ -456,13 +457,15 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a runnin
   }): Promise<{ runs: RunEntry[]; home: string }> {
     const home = mkdtempSync(path.join(tmpdir(), 'cas-switch-busy-'));
     const runsLog = path.join(home, 'runs.jsonl');
+    const endNow = path.join(home, 'end-now');
     Object.assign(process.env, {
       FAKE_CLAUDE_RUNS_LOG: runsLog,
       FAKE_CLAUDE_SESSION_RECORD: '1',
       FAKE_CLAUDE_IDLE_MS: options.silent ? '4000' : '9000',
-      // The relaunch ends at once, unless the first launch resumes too, as
-      // the fake tells the two apart only by that.
-      ...(options.resume ? {} : { FAKE_CLAUDE_RESUMED_IDLE_MS: '600' }),
+      // The relaunch ends at once. When the first launch resumes too, the
+      // fake cannot tell the two apart, so the relaunch is ended once it has
+      // started (below) rather than left to wait out the first one's stay.
+      ...(options.resume ? { FAKE_CLAUDE_EXIT_WHEN: endNow } : { FAKE_CLAUDE_RESUMED_IDLE_MS: '600' }),
       ...(options.silent
         ? {}
         : options.idleAlready
@@ -490,6 +493,19 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a runnin
     await firstLaunch(runsLog);
     if (options.draft) process.stdin.emit('data', Buffer.from(options.draft));
     writeSwitchRequest('B', Date.now(), 'seamless', context.ctx, options.targeted ? process.pid : undefined);
+    if (options.resume) {
+      // The first Claude is gone by the time the second is logged.
+      const launched = (): number => {
+        try {
+          return readRuns(runsLog).filter((r) => r.type === 'launch').length;
+        } catch {
+          return 0; // caught mid-line: looked at again in a moment
+        }
+      };
+      void waitFor('the relaunch', launched, (n) => n >= 2, 60_000)
+        .then(() => writeFileSync(endNow, '', 'utf8'))
+        .catch(() => {});
+    }
     expect(await running).toBe(0);
     return { runs: readRuns(runsLog), home };
   }

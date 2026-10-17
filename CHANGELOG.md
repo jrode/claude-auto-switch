@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.15]
+
+### Fixed
+
+- **ccx waits for a slow Windows PowerShell to name its execution policy
+  (#152).** To set up the `claude` shim, ccx asks each PowerShell where its
+  profiles are and what its execution policy is, and it gave up after 15 s.
+  Windows PowerShell started cold loads the module that answers the policy
+  last, and on the Windows CI runner that took longer than 15 s: the answer
+  was cut off after the profiles, the policy read as Unknown, and a
+  Restricted or AllSigned policy, which stops the shim from running, would
+  have gone unreported. ccx now gives each PowerShell a minute before taking
+  it to be stuck. A PowerShell that answers in under a second, as one usually
+  does, is not waited on any longer than before.
+- **The tests that failed now and then on Windows wait for what they check
+  (#152).** They waited on lengths of time: a refusal written 1.2 s after
+  another, as long as ccx takes between two reads of Claude's record; a
+  carry-on prompt called delivered 0.3 s after it was typed, before ccx's next
+  read could show it refused; and a fake Claude that left after a fixed stay.
+  They now wait for the event instead, with time only as a backstop.
+
 ## [2.6.14]
 
 ### Fixed

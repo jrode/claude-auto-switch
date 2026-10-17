@@ -3,6 +3,7 @@ import {
   FAKE_ENV,
   PROMPT,
   PTY_AVAILABLE,
+  carryOnEnded,
   launches,
   live,
   prompts,
@@ -34,13 +35,14 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
       { timeout: 60_000 },
       async () => {
         const session = live({
-          env: {
-            FAKE_CLAUDE_IDLE_MS: '20000',
-            FAKE_CLAUDE_REFUSE_AFTER_MS: '800',
-            FAKE_CLAUDE_EXIT_AFTER_PROMPTS: '1',
-            FAKE_CLAUDE_EXIT_DELAY_MS: '3500',
-          },
+          env: { FAKE_CLAUDE_IDLE_MS: '20000', FAKE_CLAUDE_REFUSE_AFTER_MS: '800' },
+          // Nothing refuses the typed prompt here, so it can be called
+          // delivered as soon as Claude has taken it.
+          timing: { answerMs: 300 },
         });
+        // Claude stays until ccx has said what became of the prompt.
+        await waitFor('the carry-on prompt to be seen through', () => session.events, carryOnEnded);
+        session.end();
         expect((await session.outcome).kind).toBe('ok');
 
         const log = session.log();
@@ -133,7 +135,7 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
       { timeout: 60_000 },
       async () => {
         const session = live({
-          env: { FAKE_CLAUDE_IDLE_MS: '5000', FAKE_CLAUDE_REFUSE_AFTER_MS: '800' },
+          env: { FAKE_CLAUDE_IDLE_MS: '20000', FAKE_CLAUDE_REFUSE_AFTER_MS: '800' },
           // Long enough to press a key before it would be typed.
           timing: { pickupMs: 2500 },
         });
@@ -143,6 +145,8 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
           (n) => n === 1,
         );
         session.press('x');
+        await waitFor('the carry-on prompt to be seen through', () => session.events, carryOnEnded);
+        session.end();
 
         expect((await session.outcome).kind).toBe('ok');
         expect(prompts(session.log())).toEqual([]);
@@ -240,10 +244,12 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
             FAKE_CLAUDE_REFUSE_AFTER_MS: '800',
             FAKE_CLAUDE_LIMIT_MENU: '1',
             FAKE_CLAUDE_SUBAGENT_WRITES_UNTIL_MS: '15000',
-            FAKE_CLAUDE_EXIT_AFTER_PROMPTS: '1',
-            FAKE_CLAUDE_EXIT_DELAY_MS: '1500',
           },
+          // Nothing refuses the typed prompt here either.
+          timing: { answerMs: 300 },
         });
+        await waitFor('the carry-on prompt to be seen through', () => session.events, carryOnEnded);
+        session.end();
         expect((await session.outcome).kind).toBe('ok');
 
         const log = session.log();

@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from 'node:child_process';
 import type { PathCtx } from '../config/paths.js';
 
 /** What one PowerShell edition says about itself. */
@@ -81,19 +81,33 @@ export function envForPowerShell(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 /**
+ * How long one edition may take to answer before it is taken to be stuck.
+ * Usually under a second, but Windows PowerShell started cold loads its
+ * security module last: on the Windows CI runner that took more than 15 s,
+ * and a query cut off there had the profiles but no policy.
+ */
+export const POWERSHELL_ANSWER_MS = 60_000;
+
+/** How a query starts PowerShell: spawnSync, or a stand-in in tests. */
+export type StartPowerShell = (
+  exe: string,
+  args: string[],
+  options: SpawnSyncOptionsWithStringEncoding,
+) => SpawnSyncReturns<string>;
+
+/**
  * Ask one edition where its profiles are and what its execution policy is.
  * Asked rather than computed: OneDrive often moves the Documents folder, and
  * only PowerShell knows where it ended up. Null when the edition is not
  * installed or did not answer in time.
  */
-export function queryPowerShell(exe: PowerShellExe): PowerShellFacts | null {
+export function queryPowerShell(exe: PowerShellExe, start: StartPowerShell = spawnSync): PowerShellFacts | null {
   // Judged by what it printed rather than by its exit code: the paths are
   // what ccx uses, and they either parse or they do not.
-  const r = spawnSync(exe, FACTS_ARGS, {
+  const r = start(exe, FACTS_ARGS, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
-    // Usually under a second; a slow start that is cut short loses the policy.
-    timeout: 15_000,
+    timeout: POWERSHELL_ANSWER_MS,
     windowsHide: true,
     env: envForPowerShell(process.env),
   });

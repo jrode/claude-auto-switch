@@ -2,12 +2,14 @@ import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import {
   FACTS_ARGS,
+  POWERSHELL_ANSWER_MS,
   envForPowerShell,
   parsePowerShellFacts,
   queryPowerShell,
   shouldAskPowerShell,
   utf8Base64,
   type PowerShellExe,
+  type StartPowerShell,
 } from './profile-path.js';
 
 describe('shouldAskPowerShell', () => {
@@ -84,17 +86,42 @@ describe('parsePowerShellFacts', () => {
   });
 });
 
+describe('queryPowerShell, given a PowerShell that is slow to start', () => {
+  it('waits for the policy that comes 16 s after the profiles, as a cold start on the CI runner did', () => {
+    // A stand-in that prints the profiles at once and the policy after 16 s:
+    // a query that gave up at 15 s read that PowerShell's policy as Unknown.
+    const docs = 'C:\\Users\\me\\Documents\\WindowsPowerShell';
+    const lines = (...l: string[]) => JSON.stringify(l.join('\n'));
+    const script =
+      `console.log(${lines(`allHosts=${b64(`${docs}\\profile.ps1`)}`, `currentHost=${b64(`${docs}\\Microsoft.PowerShell_profile.ps1`)}`)});` +
+      `setTimeout(() => console.log(${lines('policy=RemoteSigned', 'machinePolicy=Undefined', 'userPolicy=Undefined')}), 16_000);`;
+    const slow: StartPowerShell = (_exe, _args, options) => spawnSync(process.execPath, ['-e', script], options);
+
+    const started = Date.now();
+    const facts = queryPowerShell('powershell', slow);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(16_000);
+    expect(facts).toEqual({
+      allHosts: `${docs}\\profile.ps1`,
+      currentHost: `${docs}\\Microsoft.PowerShell_profile.ps1`,
+      policy: 'RemoteSigned',
+      policyFromGroupPolicy: false,
+    });
+  }, 60_000);
+});
+
 // The real PowerShells, on the Windows runner only. They are asked where
 // their profiles are; no profile is read or written.
 const onWindowsCi = process.platform === 'win32' && Boolean(process.env.CI);
 
 describe.runIf(onWindowsCi)('queryPowerShell, asking the real PowerShells', () => {
+  // Each test asks at most twice, and each ask has queryPowerShell's own limit.
+  const TWO_ASKS_MS = 2 * POWERSHELL_ANSWER_MS + 30_000;
   /** What PowerShell itself said, stderr included, for when the answer did not parse. */
   const said = (exe: string): string => {
     const started = Date.now();
     const r = spawnSync(exe, FACTS_ARGS, {
       encoding: 'utf8',
-      timeout: 60_000,
+      timeout: POWERSHELL_ANSWER_MS,
       windowsHide: true,
       env: envForPowerShell(process.env),
     });
@@ -117,12 +144,15 @@ describe.runIf(onWindowsCi)('queryPowerShell, asking the real PowerShells', () =
       const facts = queryPowerShell(exe);
       const took = Date.now() - started;
       const why = facts && facts.policy !== 'Unknown' ? '' : `query took ${took} ms; again: ${said(exe)}`;
+      // First, so a query that read nothing still prints why: toMatch on
+      // undefined throws before it shows the message.
+      expect(facts, why).not.toBeNull();
       expect(facts?.allHosts, why).toMatch(new RegExp(`\\\\${folder}\\\\profile\\.ps1$`));
       expect(facts?.currentHost, why).toMatch(
         new RegExp(`\\\\${folder}\\\\Microsoft\\.PowerShell_profile\\.ps1$`),
       );
       expect(facts?.policy, why).toMatch(/^(Restricted|AllSigned|RemoteSigned|Unrestricted|Bypass|Undefined)$/);
-    }, 120_000);
+    }, TWO_ASKS_MS);
 
     it(`reads ${exe}'s policy as a new window gets it, whatever the session ccx runs in set`, () => {
       const fresh = queryPowerShell(exe)?.policy;
@@ -134,7 +164,7 @@ describe.runIf(onWindowsCi)('queryPowerShell, asking the real PowerShells', () =
         if (before === undefined) delete process.env.PSExecutionPolicyPreference;
         else process.env.PSExecutionPolicyPreference = before;
       }
-    }, 120_000);
+    }, TWO_ASKS_MS);
   }
 
   it('brings back a name outside ASCII whole, from both editions', () => {
@@ -142,11 +172,11 @@ describe.runIf(onWindowsCi)('queryPowerShell, asking the real PowerShells', () =
     for (const exe of ['powershell', 'pwsh']) {
       const r = spawnSync(exe, ['-NoProfile', '-NoLogo', '-NonInteractive', '-Command', utf8Base64(expr)], {
         encoding: 'utf8',
-        timeout: 60_000,
+        timeout: POWERSHELL_ANSWER_MS,
       });
       expect(Buffer.from(r.stdout.trim(), 'base64').toString('utf8'), r.stderr).toBe(
         String.fromCharCode(0xe9, 0x7530),
       );
     }
-  }, 60_000);
+  }, TWO_ASKS_MS);
 });

@@ -645,6 +645,18 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
       const t = setTimeout(refuse, again);
       if (t.unref) t.unref();
     }
+    // Refused once a file the test names appears, rather than at a set time:
+    // after something the test waits for has happened, however slow the
+    // machine is to get there.
+    const refuseWhen = process.env.FAKE_CLAUDE_REFUSE_WHEN;
+    if (refuseWhen) {
+      const t = setInterval(() => {
+        if (!existsSync(refuseWhen)) return;
+        clearInterval(t);
+        refuse();
+      }, 50);
+      if (t.unref) t.unref();
+    }
 
     // A subagent's turn refused, in the record Claude 2.1.296 keeps for each
     // subagent beside the conversation's own (measured). Only on an account
@@ -1030,7 +1042,18 @@ if (idleMs > 0) {
 } else {
   printResult(() => process.exit(endCode));
 }
-
+// Ended once a file the test names appears, the stay above being only a
+// backstop then: a test that must see something happen before Claude goes
+// ends it once it has, however slow the machine was to get there.
+const exitWhen = process.env.FAKE_CLAUDE_EXIT_WHEN;
+if (exitWhen && idleMs > 0) {
+  const t = setInterval(() => {
+    if (!existsSync(exitWhen)) return;
+    clearInterval(t);
+    printResult(() => process.exit(endCode));
+  }, 50);
+  if (t.unref) t.unref();
+}
 
 // Ordinary output with no limit in it. Used to prove a single cap message does
 // not keep re-matching from the rolling buffer as later output arrives.

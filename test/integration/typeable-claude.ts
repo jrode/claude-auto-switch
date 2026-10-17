@@ -102,6 +102,7 @@ export const FAKE_ENV = [
   'FAKE_CLAUDE_SESSION_RECORD',
   'FAKE_CLAUDE_TRANSCRIPT',
   'FAKE_CLAUDE_REFUSE_AFTER_MS',
+  'FAKE_CLAUDE_REFUSE_WHEN',
   'FAKE_CLAUDE_REFUSE_ON',
   'FAKE_CLAUDE_SUBAGENT_REFUSE_AFTER_MS',
   'FAKE_CLAUDE_SUBAGENT_REFUSE_AGAIN_AFTER_MS',
@@ -113,6 +114,7 @@ export const FAKE_ENV = [
   'FAKE_CLAUDE_OLD_LOGIN_REQUESTS',
   'FAKE_CLAUDE_EXIT_AFTER_PROMPTS',
   'FAKE_CLAUDE_EXIT_DELAY_MS',
+  'FAKE_CLAUDE_EXIT_WHEN',
   'FAKE_CLAUDE_GRANDCHILD',
   'FAKE_CLAUDE_LIMIT_MENU',
 ];
@@ -126,14 +128,24 @@ export const TYPEABLE = {
   FAKE_CLAUDE_REFUSE_ON: 'A',
 };
 
-/** Seconds in a test, where production waits half a minute and more. */
+/**
+ * Seconds in a test, where production waits half a minute and more. ccx reads
+ * Claude's record of the conversation every 1.2 s, so a wait that ends on
+ * something not having shown up there (a refusal of the typed prompt, a
+ * subagent's write) stays well above that, as production's do. Shorter, it
+ * could end between Claude writing the thing and ccx reading it.
+ */
 export const QUICK = {
   pickupMs: 300,
   settleMs: 100,
   submitMs: 3000,
-  answerMs: 300,
-  blockedMs: 1500,
+  answerMs: 5000,
+  blockedMs: 4000,
 };
+
+/** Whether ccx has said what became of a carry-on prompt: over, or handed over by relaunch. */
+export const carryOnEnded = (events: CarryOnEvent[]): boolean =>
+  events.some((e) => e.kind === 'done' || e.kind === 'relaunch');
 
 export const prompts = (log: Entry[]): Entry[] => log.filter((e) => e.type === 'prompt');
 export const launches = (log: Entry[]): Entry[] => log.filter((e) => e.type === 'launch');
@@ -219,6 +231,12 @@ export function live(options: {
   /** How long the account takes to answer each check; at once when not given. */
   verifyDelayMs?: number;
   /**
+   * Refuse the main thread's turn as the account is first asked about a
+   * refusal, rather than at a set time. So it always comes after ccx has read
+   * the refusal it asks about, however late the machine let it read that.
+   */
+  refuseMainWhenAsked?: boolean;
+  /**
    * Answer each check by the login in the session's folder at that moment, as
    * the real check does (it asks the folder's own login), instead of `verify`.
    */
@@ -237,6 +255,8 @@ export function live(options: {
   decisions: CapContext[];
   asked: () => number;
   press: (text: string) => void;
+  /** End Claude now, as it ends by itself (FAKE_CLAUDE_IDLE_MS is then only a backstop). */
+  end: () => void;
   outcome: Promise<SessionOutcome>;
 } {
   const dir = mkdtempSync(path.join(tmpdir(), 'cas-carry-on-'));
@@ -257,7 +277,15 @@ export function live(options: {
     }
   };
   moveTo('A');
-  Object.assign(process.env, { FAKE_CLAUDE_RUNS_LOG: runsLog, ...TYPEABLE, ...options.env });
+  const refuseNow = path.join(dir, 'refuse-now');
+  const endNow = path.join(dir, 'end-now');
+  Object.assign(process.env, {
+    FAKE_CLAUDE_RUNS_LOG: runsLog,
+    FAKE_CLAUDE_EXIT_WHEN: endNow,
+    ...TYPEABLE,
+    ...(options.refuseMainWhenAsked ? { FAKE_CLAUDE_REFUSE_WHEN: refuseNow } : {}),
+    ...options.env,
+  });
   const events: CarryOnEvent[] = [];
   const decisions: CapContext[] = [];
   let asked = 0;
@@ -270,6 +298,7 @@ export function live(options: {
     onConversation: () => {},
     verifyCap: () => {
       asked += 1;
+      if (asked === 1 && options.refuseMainWhenAsked) writeFileSync(refuseNow, '', 'utf8');
       // A is out; B, where it moves, has room.
       const answer = options.verifyLogin
         ? options.verifyLogin(loginInFolder())
@@ -303,6 +332,7 @@ export function live(options: {
     decisions,
     asked: () => asked,
     press: keys.press,
+    end: () => writeFileSync(endNow, '', 'utf8'),
     outcome,
   };
 }
