@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.11]
+
+### Fixed
+
+- **A limit one session records is no longer erased by another (#143).**
+  Every change to the limits ledger read the whole file and wrote it back,
+  with nothing to stop two processes doing that at once, so the second write
+  erased the first one's limit and that account went back into rotation while
+  it was still out. A `claude -p` run through ccx was the worst case: it read
+  the ledger as it started and wrote that copy back as it ended, minutes
+  later, erasing every limit recorded meanwhile. Now:
+  - Every change to the ledger (a session or worker meeting a limit, a
+    `claude -p` run, the editor launcher, `ccx cap`, renaming an account)
+    reads, changes and writes it as one step under a lock beside it,
+    `ledger.json.lock`, held only for that step. A lock left by a ccx that
+    has exited is taken over at once. One still held after 5 seconds is
+    written past rather than waited on, since waiting would freeze the
+    session asking, and the event log says so (`ledger-unlocked`).
+  - A `claude -p` run records each limit as it confirms it, so other
+    sessions see it while the run goes on, and the account it ends on is
+    cleared only of limits recorded before its attempt began: one another
+    session recorded while it ran is kept.
+  - An older ccx that is still running does not take the lock, so its
+    changes can still collide until it is running this version.
+
 ## [2.6.10]
 
 ### Fixed
