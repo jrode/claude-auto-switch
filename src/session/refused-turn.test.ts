@@ -46,10 +46,15 @@ describe('what a refused turn in the record proves on its own', () => {
   it("proves one model's limit as that model's, so the account goes on with the others", async () => {
     expect(await judge(recorded({ limitType: 'seven_day_opus' }))).toMatchObject({ proves: true, model: 'Opus' });
     expect(await judge(recorded({ limitType: 'seven_day_sonnet' }))).toMatchObject({ proves: true, model: 'Sonnet' });
+    // What Claude 2.1.302 calls the "Fable limit".
+    expect(await judge(recorded({ limitType: 'seven_day_overage_included' }))).toMatchObject({
+      proves: true,
+      model: 'Fable',
+    });
   });
 
   it('proves nothing for a limit it cannot name, or none', async () => {
-    for (const limitType of ['seven_day_overage_included', 'seven_day_someday', undefined]) {
+    for (const limitType of ['overage', 'seven_day_someday', undefined]) {
       const proof = await judge(recorded({ limitType }));
       expect(proof.proves, String(limitType)).toBe(false);
       expect(proof.why).toContain('does not say which limit it is');

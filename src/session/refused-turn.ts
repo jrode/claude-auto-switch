@@ -48,11 +48,16 @@ const LIMIT_REACHED = 'usage_limit_reached';
 /**
  * Claude's names for its limits (`rate_limit_info.rateLimitType`), as the
  * 2.1.302 binary sorts them: the whole account's, or one model's, by the
- * usage check's name for that model. Any other name ("seven_day_overage_included",
- * or one added later) is not taken as either.
+ * usage check's name for that model. The binary calls
+ * `seven_day_overage_included` the "Fable limit". Any other name, such as one
+ * added later, is not taken as either.
  */
 const ACCOUNT_LIMITS = new Set(['five_hour', 'seven_day']);
-const MODEL_LIMITS: Record<string, string> = { seven_day_opus: 'Opus', seven_day_sonnet: 'Sonnet' };
+const MODEL_LIMITS: Record<string, string> = {
+  seven_day_opus: 'Opus',
+  seven_day_sonnet: 'Sonnet',
+  seven_day_overage_included: 'Fable',
+};
 
 /** A refused turn from the record, with what tells whether it is the session's own turn now. */
 export interface RecordedRefusal {

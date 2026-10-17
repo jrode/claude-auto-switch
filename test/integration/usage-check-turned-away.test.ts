@@ -6,6 +6,7 @@ import { addCommand } from '../../src/commands/add.js';
 import { runCommand } from '../../src/commands/run.js';
 import { setActive } from '../../src/state/active.js';
 import { loadConfig } from '../../src/config/config.js';
+import { processIsAlive } from '../../src/session/lease.js';
 import type { CliContext } from '../../src/context.js';
 import type { LimitProbeResult } from '../../src/usage/limit-probe.js';
 import {
@@ -120,6 +121,9 @@ async function twoAccounts(
     config: loadConfig(ctx),
     claude: { bin: process.execPath, prefixArgs: [fakeClaude] },
     capProbe: usage.probe,
+    // The fake claude runs as `node`: counted as a Claude, so its own
+    // per-process record is weighed exactly as a real one's is.
+    isClaudeProcess: processIsAlive,
     carryOn: QUICK,
     out: () => {},
     err: () => {},
@@ -397,6 +401,27 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
         expect(capsIn(home)).toEqual([
           expect.objectContaining({ account: 'A', model: 'Opus', capUntil: resetsAt * 1000 }),
         ]);
+      },
+    );
+
+    it(
+      'changes model rather than account on the Fable limit',
+      { timeout: 60_000 },
+      async () => {
+        // Claude 2.1.302 calls seven_day_overage_included the "Fable limit",
+        // and Fable comes first in the default model order.
+        const { home, runsLog, context } = await twoAccounts('cas-429-fable-', { A: [TURNED_AWAY] });
+        Object.assign(process.env, refusedOnA(runsLog), {
+          FAKE_CLAUDE_LIMIT_TYPE: 'seven_day_overage_included',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A', model: 'Fable' })]);
+        const events = eventsIn(home);
+        // Not moved to another account in place, which only an account-wide limit does.
+        expect(events.filter((e) => e.kind === 'cap-relief')).toEqual([]);
+        expect(events.map((e) => e.msg)).toContain('"A" is out of Fable; staying here on another model...');
       },
     );
 

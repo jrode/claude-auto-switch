@@ -4,7 +4,7 @@
 // Behavior is driven by a scenario JSON, resolved from FAKE_CLAUDE_SCENARIO or
 // <CLAUDE_CONFIG_DIR>/fake-scenario.json. No network, no model spend, no logins.
 import { readFileSync, writeFileSync, writeSync, existsSync, mkdirSync, appendFileSync, rmSync, statSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 
 const args = process.argv.slice(2);
@@ -309,9 +309,33 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
     valueAfter('--resume') ??
     process.env.FAKE_CLAUDE_LANDS_ON ??
     '00000000-0000-4000-8000-000000000000';
+  // When this process started, as Claude 2.1.302 records it off Windows
+  // (`LC_ALL=C TZ=UTC ps -o lstart= -p <pid>`), to tell it from a later
+  // process given the same pid.
+  let procStart;
+  if (process.platform !== 'win32') {
+    try {
+      const ps = spawnSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], {
+        encoding: 'utf8',
+        timeout: 1000,
+        env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
+      });
+      if (ps.status === 0 && ps.stdout.trim() !== '') procStart = ps.stdout.trim();
+    } catch {
+      /* written without one, as an older Claude does */
+    }
+  }
   const writeRecord = (sessionId) => {
     recordedId = sessionId;
-    writeJson(record, { pid: process.pid, sessionId, cwd: process.cwd(), startedAt, kind: 'interactive', ...doing });
+    writeJson(record, {
+      pid: process.pid,
+      sessionId,
+      cwd: process.cwd(),
+      startedAt,
+      ...(procStart ? { procStart } : {}),
+      kind: 'interactive',
+      ...doing,
+    });
   };
   const setStatus = (status) => {
     if (!status) return;

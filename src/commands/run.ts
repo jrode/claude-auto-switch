@@ -134,6 +134,7 @@ export async function runCommand(
                               recorded.conversation,
                               { sessionDir: null, claudePid: null, configDirs: accounts.map((a) => a.dir) },
                               context.ctx,
+                              context.isClaudeProcess ? { isClaude: context.isClaudeProcess } : {},
                             ),
                     },
                     0,

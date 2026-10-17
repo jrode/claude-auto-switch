@@ -60,6 +60,12 @@ export interface CliContext {
    * switch tries it again. Production waits 20 s.
    */
   moveRenewalRetryMs?: number;
+  /**
+   * Injected in tests: whether a pid is a live Claude process, for telling
+   * another Claude on a conversation (session/other-writers). The fake claude
+   * runs as `node`, which the real check would never count.
+   */
+  isClaudeProcess?: (pid: number) => boolean;
   /** Injected in tests: overrides the API lookup of who a stored login belongs to. */
   lookupOwner?: (dir: string) => Promise<string | null>;
   /** Injected in tests: a newer ccx installed under this one (update/newer-install). */

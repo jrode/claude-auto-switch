@@ -719,6 +719,7 @@ export async function runInteractiveHotSwap(
           recorded.conversation,
           { sessionDir, claudePid: recorded.claudePid, configDirs: accounts.map((a) => a.dir) },
           context.ctx,
+          context.isClaudeProcess ? { isClaude: context.isClaudeProcess } : {},
         );
 
   /**

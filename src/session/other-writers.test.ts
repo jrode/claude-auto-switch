@@ -68,4 +68,31 @@ describe('another live Claude on the same conversation', () => {
       otherLiveWriter(ID, { sessionDir: editor.mine, claudePid: null, configDirs: [editor.account] }, editor.ctx, deps),
     ).toBe('another Claude (pid 21)');
   });
+
+  it("is not a record a killed Claude left behind, once its pid belongs to a process started later", () => {
+    // Claude removes its record only on a clean exit, and writes when it
+    // started, as `ps -o lstart` says, to tell the next owner of the pid apart.
+    const { home, ctx, mine } = folders();
+    const own = { sessionDir: mine, claudePid: null, configDirs: [] };
+    claudeRecord(path.join(home, '.claude'), 31, ID, { procStart: 'Sat Oct 17 00:07:17 2026' });
+    const alive = { leases: () => [], isClaude: () => true };
+    const started = (start: string | null) => ({ ...alive, startOf: () => start });
+    expect(otherLiveWriter(ID, own, ctx, started('Sat Oct 17 03:41:02 2026'))).toBeNull();
+    // The same process, however the columns are spaced.
+    expect(otherLiveWriter(ID, own, ctx, started('Sat Oct 17  00:07:17 2026'))).toBe('another Claude (pid 31)');
+    // When its start cannot be read, a live Claude holding the pid is what there is to go on.
+    expect(otherLiveWriter(ID, own, ctx, started(null))).toBe('another Claude (pid 31)');
+    expect(otherLiveWriter(ID, own, ctx, { leases: () => [], isClaude: () => false, startOf: () => null })).toBeNull();
+  });
+
+  it("counts the session's own config folder, where its own Claude keeps its record", () => {
+    const { ctx, mine } = folders();
+    claudeRecord(mine, 41, ID);
+    const deps = { leases: () => [], isClaude: () => true, startOf: () => null };
+    // Its own Claude is not another writer; any other Claude there is.
+    expect(otherLiveWriter(ID, { sessionDir: mine, claudePid: 41, configDirs: [] }, ctx, deps)).toBeNull();
+    expect(otherLiveWriter(ID, { sessionDir: mine, claudePid: 40, configDirs: [] }, ctx, deps)).toBe(
+      'another Claude (pid 41)',
+    );
+  });
 });

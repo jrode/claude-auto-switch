@@ -10,7 +10,7 @@ import { runCommand } from '../../src/commands/run.js';
 import { workerCommand, WORKER_CARRY_ON, type WorkerIo } from '../../src/commands/worker.js';
 import { getActive, setActive } from '../../src/state/active.js';
 import { loadConfig } from '../../src/config/config.js';
-import { leasePath } from '../../src/session/lease.js';
+import { leasePath, processIsAlive } from '../../src/session/lease.js';
 import { sessionDirFor } from '../../src/session/session-dir.js';
 import { saveLedger } from '../../src/ledger/ledger.js';
 import { writeSwitchRequest } from '../../src/state/switch-request.js';
@@ -51,6 +51,9 @@ function makeContext(home: string, verifyCap: () => Promise<Verdict>, said: stri
     config: loadConfig(ctx),
     claude: { bin: process.execPath, prefixArgs: [fakeClaude] },
     verifyCap,
+    // The fake claude runs as `node`: counted as a Claude, so its own
+    // per-process record is weighed exactly as a real one's is.
+    isClaudeProcess: processIsAlive,
     out: (m) => said.push(m),
     err: (m) => said.push(m),
     json: false,
