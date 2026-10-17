@@ -68,10 +68,12 @@ export interface DoctorCheck {
 
 /** A folder as git sees it from inside. */
 export interface GitTracked {
-  /** The top folder of the repository the folder is in. */
+  /** The top folder of the repository the folder is in, symbolic links resolved as git does. */
   repo: string;
   /** The files git tracks under the folder, relative to it, with forward slashes. */
   files: string[];
+  /** Why git found the repository but could not list its files, so nothing there was checked. */
+  unreadable?: string;
 }
 
 export interface DoctorDeps {
@@ -155,9 +157,15 @@ export function auditGitSafety(context: CliContext, deps: DoctorDeps = {}): Doct
   // tracking ccx's folder), so each is reported only where it is first found.
   const reported = new Set<string>();
   const findings: string[] = [];
+  const unchecked: string[] = [];
   for (const place of places) {
     const inGit = tracked(place.folder);
     if (!inGit) continue;
+    if (inGit.unreadable) {
+      const message = `could not check the git repository at ${inGit.repo}: ${inGit.unreadable}`;
+      if (!unchecked.includes(message)) unchecked.push(message);
+      continue;
+    }
     const base = realFolder(place.folder);
     const files = inGit.files.filter((file) => {
       const key = pathKey(path.join(base, file));
@@ -165,15 +173,21 @@ export function auditGitSafety(context: CliContext, deps: DoctorDeps = {}): Doct
       reported.add(key);
       return true;
     });
-    if (files.length > 0) findings.push(describeTracked(place, realFolder(inGit.repo), files));
+    if (files.length > 0) findings.push(describeTracked(place, inGit.repo, files));
   }
+  if (findings.length === 0 && unchecked.length === 0) {
+    return {
+      name: 'git-safety',
+      ok: true,
+      detail: "ccx's folders and Claude's logins are not tracked in git",
+    };
+  }
+  // A repository git cannot list is worth knowing about, but is no failure.
   return {
     name: 'git-safety',
     ok: findings.length === 0,
-    detail:
-      findings.length === 0
-        ? "ccx's folders and Claude's logins are not tracked in git"
-        : findings.join('; '),
+    detail: [...findings, ...unchecked].join('; '),
+    ...(findings.length === 0 ? { note: true } : {}),
   };
 }
 
@@ -233,7 +247,11 @@ const REPOSITORY_VARIABLES = [
   'GIT_PREFIX',
 ];
 
-/** Asks git from inside the folder. Null when it is in no work tree, is missing, or git cannot run. */
+/**
+ * Asks git from inside the folder. Null when it is in no work tree, is
+ * missing, or git cannot run; a repository whose files git cannot list says
+ * so, since passing it would vouch for files nobody read.
+ */
 export function gitTrackedUnder(folder: string): GitTracked | null {
   if (!existsSync(folder)) return null;
   const env = { ...process.env };
@@ -244,20 +262,25 @@ export function gitTrackedUnder(folder: string): GitTracked | null {
       env,
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 15_000,
-      // Past Node's default of 1 MiB the call fails, which reads as no
-      // repository at all, so a large repository would pass unchecked.
+      // Node's default, 1 MiB, is shorter than a large repository's list of files.
       maxBuffer: 64 * 1024 * 1024,
       windowsHide: true,
     });
+  let top: string;
   try {
-    const repo = git('rev-parse', '--show-toplevel').trim();
-    if (repo.length === 0) return null;
+    top = git('rev-parse', '--show-toplevel').trim();
+  } catch {
+    return null;
+  }
+  if (top.length === 0) return null;
+  const repo = path.resolve(top);
+  try {
     const files = git('ls-files', '-z')
       .split('\0')
       .filter((file) => file.length > 0);
-    return { repo: path.resolve(repo), files };
+    return { repo, files };
   } catch {
-    return null;
+    return { repo, files: [], unreadable: 'git could not list its files' };
   }
 }
 

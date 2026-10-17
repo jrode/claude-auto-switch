@@ -240,7 +240,7 @@ describe('git safety', () => {
   });
 
   it('reads a list of tracked files longer than Node lets a command print by default', async () => {
-    // Past 1 MiB of output, Node ends the command, which read as no repository.
+    // Past 1 MiB of output Node stops the command, and the list goes unread.
     // Index entries alone, without files on disk, keep this quick.
     const home = repoTracking([]);
     mkdirSync(path.join(home, '.claude-auto-switch'));
@@ -251,6 +251,17 @@ describe('git safety', () => {
     );
     git(home, ['update-index', '--add', '--index-info'], `${entries.join('\n')}\n`);
     expect((await gitSafety(machine(home))).detail).toContain('which tracks 20000 of its files');
+  });
+
+  it('says a repository whose files git cannot list was not checked, once, instead of passing it', async () => {
+    const home = repoTracking(['.claude-auto-switch/accounts.json', '.claude/settings.json']);
+    writeFileSync(path.join(home, '.git', 'index'), 'not an index\n', 'utf8');
+    // ccx's folder, ~/.claude and the working folder all lead to this one repository.
+    expect(await gitSafety(machine(home), home)).toMatchObject({
+      ok: true,
+      note: true,
+      detail: `could not check the git repository at ${real(home)}: git could not list its files`,
+    });
   });
 
   it("asks about each folder's own repository while a git hook's variables point elsewhere", async () => {

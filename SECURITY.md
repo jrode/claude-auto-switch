@@ -29,6 +29,8 @@ account.
   `config.json`. It names the folder, the repository, and the files. In
   `~/.claude` and in the repository it is run from, it looks only for login
   files by name (`.credentials.json`, `.credentials.prev.json`, `oauth-token`).
+  A repository whose files git cannot list (a damaged index, or a list of
+  files over 64 MiB) is reported as not checked, never passed.
 
 ## How rotation handles credentials
 

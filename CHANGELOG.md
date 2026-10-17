@@ -24,8 +24,9 @@ semantic versioning.
     files, by exact name: `.credentials.json`, `.credentials.prev.json` and
     `oauth-token`. Your CLAUDE.md, settings and skills in git are fine.
   - A repository whose list of files was over 1 MiB passed without being
-    read: Node stopped git partway, and that read as no repository. The
-    whole list is read now.
+    read: Node stopped git partway, and that read as no repository. Lists
+    up to 64 MiB are read now, and a repository whose files git still
+    cannot list is reported as not checked instead of passing.
 
 ## [2.6.11]
 
