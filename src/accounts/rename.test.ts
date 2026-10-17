@@ -5,7 +5,7 @@ import path from 'node:path';
 import { renameAccount } from './rename.js';
 import { addAccount, getAccount, listAccounts } from './registry.js';
 import { getActive, setActive } from '../state/active.js';
-import { loadLedger, saveLedger } from '../ledger/ledger.js';
+import { loadLedger, updateLedger } from '../ledger/ledger.js';
 import { readUsageSnapshot, writeUsageSnapshot } from '../usage/usage-store.js';
 import { takeLease } from '../session/lease.js';
 import { loadConfigFile, saveConfig } from '../config/config.js';
@@ -41,9 +41,7 @@ describe('renameAccount', () => {
   it('carries the limit history and usage numbers across', () => {
     // Leaving these behind under the old name reads as "my usage reset itself".
     const { c } = setup(['old']);
-    const ledger = loadLedger(c);
-    ledger.caps.push({ account: 'old', capUntil: 123, reason: 'test', at: 1 });
-    saveLedger(ledger, c);
+    updateLedger(c, (ledger) => ({ caps: [...ledger.caps, { account: 'old', capUntil: 123, reason: 'test', at: 1 }] }));
     const usage = readUsageSnapshot(c);
     usage.accounts['old'] = { fiveHour: 0.4, sevenDay: 0.5, fiveHourReset: null, sevenDayReset: null, at: 9 };
     writeUsageSnapshot(usage, c);
@@ -53,6 +51,12 @@ describe('renameAccount', () => {
     expect(loadLedger(c).caps.map((x) => x.account)).toEqual(['new']);
     expect(readUsageSnapshot(c).accounts['new']?.fiveHour).toBe(0.4);
     expect(readUsageSnapshot(c).accounts['old']).toBeUndefined();
+  });
+
+  it('writes no ledger when no limit is recorded under the old name', () => {
+    const { c, home } = setup(['old']);
+    renameAccount('old', 'new', config, c);
+    expect(existsSync(path.join(home, 'ledger.json'))).toBe(false);
   });
 
   it('carries its pages and the page home setting across', () => {
