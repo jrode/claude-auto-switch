@@ -6,17 +6,20 @@ import type { RepairFs } from '../src/launcher/claude-repair.js';
  * MZ header, a PE header with one section, and that section's bytes. Cut to
  * `length`, it is one npm is still writing.
  */
-export function windowsProgram(declared = 1024, length = declared): string {
+export function windowsProgram(declared = 1024, length = declared, kind: 'PE32+' | 'PE32' = 'PE32+'): string {
   const bytes = Buffer.alloc(Math.max(declared, length));
+  // A PE32 optional header is 224 bytes, its directory count at 92; PE32+'s is 240, at 108.
+  const optionalSize = kind === 'PE32' ? 224 : 240;
+  const table = 0x58 + optionalSize;
   bytes.write('MZ', 0, 'latin1');
   bytes.writeUInt32LE(0x40, 0x3c); // where the PE header is
   bytes.writeUInt32LE(0x00004550, 0x40); // "PE" and two zero bytes
   bytes.writeUInt16LE(1, 0x46); // one section
-  bytes.writeUInt16LE(240, 0x54); // the optional header's size
-  bytes.writeUInt16LE(0x20b, 0x58); // PE32+
-  bytes.writeUInt32LE(16, 0x58 + 108); // sixteen data directories, none of them a signature
-  bytes.writeUInt32LE(declared - 0x200, 0x148 + 16); // the section's size
-  bytes.writeUInt32LE(0x200, 0x148 + 20); // and where it starts
+  bytes.writeUInt16LE(optionalSize, 0x54); // the optional header's size
+  bytes.writeUInt16LE(kind === 'PE32' ? 0x10b : 0x20b, 0x58);
+  bytes.writeUInt32LE(16, 0x58 + (kind === 'PE32' ? 92 : 108)); // sixteen data directories, none of them a signature
+  bytes.writeUInt32LE(declared - 0x200, table + 16); // the section's size
+  bytes.writeUInt32LE(0x200, table + 20); // and where it starts
   bytes.write(', a Windows program', 0x200, 'latin1');
   return bytes.subarray(0, length).toString('latin1');
 }

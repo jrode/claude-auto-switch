@@ -1,7 +1,13 @@
 import path from 'node:path';
 import { loadConfig } from './config/config.js';
 import { resolveRealClaude } from './launcher/real-claude.js';
-import { REPAIR_LOCK, REPAIR_MEMORY, resolveClaudeForLaunch, type LaunchDeps } from './launcher/claude-repair.js';
+import {
+  REPAIR_LOCK,
+  REPAIR_MEMORY,
+  REPAIR_SIZES,
+  resolveClaudeForLaunch,
+  type LaunchDeps,
+} from './launcher/claude-repair.js';
 import type { Config } from './config/config.schema.js';
 import { configHome, type PathCtx } from './config/paths.js';
 import type { ClaudeInvoker } from './invoker.js';
@@ -122,12 +128,14 @@ export function claudeRepairDeps(context: CliContext): {
   platform: NodeJS.Platform | undefined;
   lockFile: () => string;
   memoryFile: () => string;
+  sizesFile: () => string;
   say: (message: string) => void;
 } {
   return {
     platform: context.ctx.platform,
     lockFile: () => path.join(configHome(context.ctx), REPAIR_LOCK),
     memoryFile: () => path.join(configHome(context.ctx), REPAIR_MEMORY),
+    sizesFile: () => path.join(configHome(context.ctx), REPAIR_SIZES),
     say: context.err ?? ((message) => void process.stderr.write(`${message}\n`)),
   };
 }

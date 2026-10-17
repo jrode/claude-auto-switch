@@ -86,7 +86,8 @@ which npm may still be writing, though it starts Claude from the second
 package once that has been left alone for half a minute. It does not repeat a
 repair that failed for an hour, or until the install changes. `ccx worker`
 never repairs. `ccx doctor` reports such an install and `ccx doctor --fix`
-repairs it at once. If the repair cannot help, close
+repairs it, though never with npm while npm may still be at work on it. If the
+repair cannot help, close
 every Claude window, then run
 `npm i -g @anthropic-ai/claude-code`, or install the
 [native build](https://code.claude.com/docs/en/setup). To point ccx at a Claude

@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   acquireLockDir,
   acquireOwnedLock,
+  createOwnedLockFile,
   withCredentialLock,
   withCredentialLockIfFree,
   CREDENTIALS_LOCK_DIR,
@@ -85,12 +86,49 @@ describe('acquireOwnedLock', () => {
   });
 
   it('leaves, on release, a lock another task of this same process has taken over', () => {
-    // The pid is the same; only the token tells the two acquisitions apart.
+    // The pid is the same; which acquisition holds the lock now is kept in memory.
+    const lock = path.join(dir(), 'x.lock');
+    const first = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    minutesAgo(lock, 2); // past the longest hold, so it is taken over though its pid runs
+    const second = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    expect(second.held).toBe(true);
+    first.release();
+    expect(existsSync(lock)).toBe(true);
+    second.release();
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('writes a bare pid, which an older ccx reads as the holder', () => {
+    // ccx 2.6.7 and older read Number(content), and a pid with anything after it
+    // reads as no holder, so a live repair would be taken over after a minute.
     const lock = path.join(dir(), 'x.lock');
     const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000 });
-    writeFileSync(lock, `${process.pid} the-new-holder`, 'utf8');
+    expect(Number(readFileSync(lock, 'utf8').trim())).toBe(process.pid);
     h.release();
-    expect(readFileSync(lock, 'utf8')).toBe(`${process.pid} the-new-holder`);
+  });
+
+  it('leaves no lock, and holds none, when the pid cannot be written', () => {
+    // A full disk: an empty lock names no holder and would never be released.
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, {
+      waitMs: 0,
+      staleMs: 5_000,
+      create: (file, content) =>
+        createOwnedLockFile(file, content, () => {
+          throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+        }),
+    });
+    expect(h.held).toBe(false);
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('leaves a lock just past half the longest hold, on release, when the takeover guard is held', () => {
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    minutesAgo(lock, 31 / 60); // 31 seconds of a 60-second longest hold
+    mkdirSync(`${lock}.takeover`);
+    h.release();
+    expect(existsSync(lock)).toBe(true);
   });
 
   it('leaves a lock held past the longest hold, on release, when the takeover guard is held', () => {

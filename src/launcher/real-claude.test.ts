@@ -388,6 +388,53 @@ describe('an install npm may still be writing (Windows)', () => {
     expect(search.broken[0]?.platformProgram).toBeNull();
   });
 
+  it('notes a platform program cut short, for the repair to watch its size', () => {
+    const fs = memoryWindowsFs({
+      [CMD]: NPM_CMD_SHIM,
+      [PKG_JSON]: PACKAGE_JSON,
+      [BIN]: NPM_PLACEHOLDER,
+      [NESTED]: windowsProgram(4096, 2048),
+    });
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.broken[0]?.partialProgram).toEqual({ file: NESTED, size: 2048 });
+  });
+
+  it('never starts a bin\\claude.exe cut short of its own headers, which is half copied', () => {
+    const fs = memoryWindowsFs({ [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: windowsProgram(4096, 2048) });
+    expect(findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW }).bin).toBeNull();
+  });
+
+  it('starts a bin\\claude.exe whose headers it cannot read, as before', () => {
+    // Only a program shown to be short is refused, so an unusual one still starts.
+    const fs = memoryWindowsFs({ [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: 'MZ, headers of some other shape' });
+    expect(findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW }).bin).toBe(BIN);
+  });
+
+  it('counts a change time a moment ahead of the clock as recent, and one further ahead as not', () => {
+    const at = (ms: number) =>
+      findRealClaude({
+        findCandidates: () => [CMD],
+        platform: 'win32',
+        fs: memoryWindowsFs(
+          { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER },
+          { modified: { [SCOPE]: NOW + ms } },
+        ),
+        arch: 'x64',
+        now: () => NOW,
+      }).broken[0]?.busy;
+    expect(at(1_000)).toBe(true);
+    expect(at(3_000)).toBe(false);
+  });
+
+  it('reads how long a PE32 program is, whose data directories sit elsewhere', () => {
+    const pe32 = Buffer.from(windowsProgram(2048, 2048, 'PE32'), 'latin1');
+    expect(declaredProgramSize(pe32)).toBe(2048);
+    // A signature, found only where PE32 keeps its directories (96 bytes into its optional header).
+    pe32.writeUInt32LE(2048, 0x58 + 96 + 4 * 8);
+    pe32.writeUInt32LE(512, 0x58 + 96 + 4 * 8 + 4);
+    expect(declaredProgramSize(pe32)).toBe(2560);
+  });
+
   it('reads how long a program is from its sections, and from its signature when it has one', () => {
     const whole = Buffer.from(windowsProgram(1024), 'latin1');
     expect(declaredProgramSize(whole)).toBe(1024);

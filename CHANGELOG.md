@@ -13,10 +13,16 @@ semantic versioning.
   last three minutes, since npm may still be writing it, and that hold also
   kept ccx from starting Claude from the second package, so running npm again
   only started the three minutes over. ccx now judges the second package's
-  program on its own: once it has gone half a minute without changing, Claude
-  starts from it while the rest settles. The message says how long the hold
-  has left, and `ccx doctor --fix` repairs at once, after saying npm may still
-  be at work.
+  program on its own: once it is as long as its own headers say and has gone
+  half a minute without changing, Claude starts from it while the rest
+  settles, without waiting on another ccx's repair. The message says how long
+  the hold has left. `ccx doctor --fix` puts that program in place at once,
+  after saying npm may still be at work, but never starts npm while the
+  install may be busy, since a second npm would work against the first.
+- **A platform program still downloading is never reinstalled over.** One
+  shorter than its own headers say is left while its size changes, and only
+  reinstalled once it has stayed one size for ten minutes, as a dead npm's
+  leftover. A `bin\claude.exe` cut short the same way is not started.
 - **A clock that was ahead no longer holds a repair off for hours.** A change
   time more than two seconds in the future is not taken as a recent change.
 - **A repair that failed once is tried again by itself.** Being offline, a
@@ -26,9 +32,11 @@ semantic versioning.
 - **A launch that starts Claude from the second package says nothing about a
   repair it did not make.** It used to print why on every launch; `ccx
   doctor` reports it.
-- **Releasing a lock no longer removes another process's.** A holder whose
+- **Releasing a lock no longer removes another holder's.** A holder whose
   lock was taken over after it ran past the longest hold removed the new
-  holder's lock when it finished.
+  holder's lock when it finished, whether the new holder was another process
+  or another task of the same one. A lock whose holder could not be written
+  (a full disk) is no longer left behind.
 
 ## [2.6.7]
 

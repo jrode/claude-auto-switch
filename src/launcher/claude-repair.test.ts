@@ -19,6 +19,8 @@ import {
   type LaunchDeps,
   type NpmRun,
   type RepairMemory,
+  type SizeMemory,
+  type SizeSeen,
 } from './claude-repair.js';
 import { inspectNpmInstall, type BrokenNpmInstall } from './real-claude.js';
 import { RealClaudeError } from '../util/errors.js';
@@ -96,6 +98,18 @@ function memoryOfRepairs(): RepairMemory & { all: Map<string, FailedRepair> } {
   };
 }
 
+/** Sizes of cut-short platform programs, kept in memory as the file in ccx's folder keeps them. */
+function sizesSeen(): SizeMemory {
+  const all = new Map<string, SizeSeen>();
+  return {
+    get: (file) => all.get(file.toLowerCase()) ?? null,
+    set: (file, seen) => {
+      if (seen) all.set(file.toLowerCase(), seen);
+      else all.delete(file.toLowerCase());
+    },
+  };
+}
+
 /**
  * Everything the repair talks to, on a Windows disk in memory. npm is a stand-in
  * that never runs: `npm` decides what it leaves on the disk and how it exits.
@@ -131,6 +145,7 @@ function harness(
     },
     say: (line) => said.push(line),
     memory,
+    sizes: sizesSeen(),
     run: { repairTried: false },
   };
   return { deps, said, npmCalls, locks, memory };
@@ -718,7 +733,49 @@ describe('when the repair is allowed to run', () => {
     const h = harness(fs);
     expect(repairClaudeInstalls({ ...h.deps, now: () => now }, { force: true })).toEqual([]);
     expect(fs.content(BIN)).toBe(WINDOWS_PROGRAM);
-    expect(h.said.some((line) => line.includes('repairing it anyway'))).toBe(true);
+    expect(h.said.some((line) => line.includes('putting its program in place anyway'))).toBe(true);
+  });
+
+  it('never starts npm while npm may still be writing the install, with doctor --fix or without', () => {
+    // A second npm on the same folder would work against the one still running.
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(missingInstall(), {
+      modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 60_000 },
+    });
+    const h = harness(fs);
+    const failures = repairClaudeInstalls({ ...h.deps, now: () => now }, { force: true });
+    expect(h.npmCalls).toEqual([]);
+    expect(failures.join('\n')).toContain('run ccx doctor --fix again then');
+  });
+
+  it('never starts npm over a platform program still being downloaded, however old its times', () => {
+    // Windows may not move a change time while npm writes, so only the size
+    // shows the download going on: once it holds still long enough, npm left it.
+    const start = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(missingInstall({ [NESTED]: windowsProgram(4096, 2048) }));
+    const h = harness(fs, {
+      npm: (f) => {
+        f.put(BIN, WINDOWS_PROGRAM);
+        return { status: 0 };
+      },
+    });
+    const at = (ms: number): LaunchDeps => ({ ...h.deps, now: () => ms, run: { repairTried: false } });
+    messageOf(() => resolveClaudeForLaunch(at(start)));
+    fs.put(NESTED, windowsProgram(4096, 3072), 0); // it grew
+    messageOf(() => resolveClaudeForLaunch(at(start + 9 * 60_000)));
+    messageOf(() => resolveClaudeForLaunch(at(start + 18 * 60_000)));
+    expect(h.npmCalls).toEqual([]);
+    // The same size for ten minutes and more: a dead npm's leftover, repaired.
+    expect(resolveClaudeForLaunch(at(start + 20 * 60_000)).bin).toBe(BIN);
+    expect(h.npmCalls).toHaveLength(1);
+  });
+
+  it('does not make a launch that starts from the platform program wait for another ccx's repair', () => {
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM, [LOCK]: String(process.pid + 1) }));
+    const h = harness(fs, { lock: () => ({ held: false, release: () => {} }) });
+    expect(resolveClaudeForLaunch(h.deps).bin).toBe(NESTED);
+    expect(h.locks).toEqual([0]);
+    expect(h.said).toEqual([]);
   });
 
   it('by itself again an hour after a repair failed, though the install is as it was', () => {

@@ -150,6 +150,11 @@ export interface BrokenNpmInstall {
   busy: boolean;
   /** While busy: how long until it has gone unchanged for SETTLED_MS. */
   settlesInMs?: number;
+  /**
+   * A platform program shorter than its own headers say: one npm is still
+   * downloading, or one a dead npm left. Its size tells which, over time.
+   */
+  partialProgram?: { file: string; size: number };
 }
 
 export interface ClaudeSearch {
@@ -251,7 +256,7 @@ export function settlingLine(broken: BrokenNpmInstall[]): string {
   const longest = Math.max(0, ...broken.map((install) => (install.busy ? (install.settlesInMs ?? 0) : 0)));
   return (
     `It changed moments ago, so npm may still be installing it. ccx leaves it alone until nothing in it has ` +
-    `changed for ${SETTLED_MS / 60_000} minutes, ${aboutTime(longest)} more; ccx doctor --fix repairs it now.`
+    `changed for ${SETTLED_MS / 60_000} minutes, ${aboutTime(longest)} more; start Claude or run ccx doctor --fix again then.`
   );
 }
 
@@ -291,10 +296,13 @@ function pickOnWindows(
   if (directExe) return { bin: directExe, prefixArgs: [] };
 
   // Prefer the standard npm install layout (a real file) BEFORE trusting text
-  // scraped from a .cmd shim.
+  // scraped from a .cmd shim. That file is the platform program, linked or
+  // copied, so one cut short of its own headers is half copied and not started.
+  const usable = (exe: string): boolean =>
+    fs.isFile(exe) && isWindowsProgram(fs, exe) !== false && !isCutShortWindowsProgram(fs, exe);
   for (const candidate of candidates) {
     const guess = p.join(p.dirname(candidate), ...NPM_PACKAGE, 'bin', 'claude.exe');
-    if (fs.isFile(guess) && isWindowsProgram(fs, guess) !== false) return { bin: guess, prefixArgs: [] };
+    if (usable(guess)) return { bin: guess, prefixArgs: [] };
   }
   for (const candidate of candidates) {
     const folder = p.join(p.dirname(candidate), ...NPM_PACKAGE);
@@ -307,7 +315,7 @@ function pickOnWindows(
   }
   for (const candidate of candidates) {
     const derived = deriveExeFromCmd(candidate, fs);
-    if (derived && fs.isFile(derived) && isWindowsProgram(fs, derived) !== false) return { bin: derived, prefixArgs: [] };
+    if (derived && usable(derived)) return { bin: derived, prefixArgs: [] };
   }
   // Never fall back to a non-.exe on Windows: node-pty cannot launch a .cmd
   // (and routing a .cmd through cmd.exe is an argument-escaping hazard). Failing
@@ -361,6 +369,19 @@ export function isWholeWindowsProgram(fs: ClaudeFs, file: string): boolean {
   if (size === null || head === null) return false;
   const declared = declaredProgramSize(head);
   return declared !== null && size >= declared;
+}
+
+/**
+ * Whether a program is shown to be cut short: its headers read, and it is
+ * shorter than they say. Headers that cannot be read show nothing, so this
+ * never refuses a program it does not understand.
+ */
+export function isCutShortWindowsProgram(fs: ClaudeFs, file: string): boolean {
+  const size = fs.size(file);
+  const head = fs.readStart(file, 64 * 1024);
+  if (size === null || head === null) return false;
+  const declared = declaredProgramSize(head);
+  return declared !== null && size < declared;
 }
 
 /**
@@ -528,23 +549,31 @@ export function inspectNpmInstall(
   if (!state) return null;
   const places = platformPrograms(folder, arch);
   const quietMs = Math.min(settledMs, PROGRAM_QUIET_MS);
+  // Judged on its own, even while the rest of the install is still settling:
+  // whole by its own headers, and left alone for a while besides.
+  const platformProgram =
+    places.find(
+      (exe) =>
+        fs.isFile(exe) &&
+        isWindowsProgram(fs, exe) === true &&
+        isWholeWindowsProgram(fs, exe) &&
+        changedWithin(exe, quietMs) === null,
+    ) ?? null;
+  // Shorter than its headers say: whether npm is still writing it shows in its
+  // size over time, which the repair keeps track of (claude-repair).
+  const partial = platformProgram
+    ? undefined
+    : places.find((exe) => fs.isFile(exe) && isCutShortWindowsProgram(fs, exe));
+  const partialSize = partial ? fs.size(partial) : null;
   return {
     folder,
     prefix,
     program,
     state,
-    // Judged on its own, even while the rest of the install is still settling:
-    // whole by its own headers, and left alone for a while besides.
-    platformProgram:
-      places.find(
-        (exe) =>
-          fs.isFile(exe) &&
-          isWindowsProgram(fs, exe) === true &&
-          isWholeWindowsProgram(fs, exe) &&
-          changedWithin(exe, quietMs) === null,
-      ) ?? null,
+    platformProgram,
     version: versionOf(folder, fs),
     ...settling([folder, program, ...places]),
+    ...(partial && partialSize !== null ? { partialProgram: { file: partial, size: partialSize } } : {}),
   };
 }
 
