@@ -43,7 +43,17 @@ const REQUIRED_VALUE = new Set([
   '--fallback-model',
   '--name',
 ]);
-const OPTIONAL_VALUE = new Set(['--resume', '--debug', '--worktree', '--from-pr', '--teleport', '--cloud', '--remote']);
+const OPTIONAL_VALUE = new Set([
+  '--resume',
+  '--debug',
+  '--worktree',
+  '--from-pr',
+  '--teleport',
+  '--cloud',
+  '--remote',
+  '--remote-control',
+  '--rc',
+]);
 const LIST_VALUE = new Set([
   '--add-dir',
   '--allowedTools',

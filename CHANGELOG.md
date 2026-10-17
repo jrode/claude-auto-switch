@@ -25,9 +25,11 @@ semantic versioning.
     now goes before the `--`, and nothing after it is read or removed as a
     flag.
   - A command line with no `--` and no cluster gets exactly the arguments it
-    did before. Claude's short options and which take a value were read from
-    the 2.1.302 binary: `-d`, `-r`, `-w` and `-n` take one; `-p`, `-c`, `-h`
-    and `-v` do not.
+    did before, with one exception: `--remote` and `--rc`, the other names of
+    `--cloud` and `--remote-control`, now take their value as those do, so
+    the word after them is no longer taken for a prompt. Claude's short
+    options and which take a value were read from the 2.1.302 binary: `-d`,
+    `-r`, `-w` and `-n` take one; `-p`, `-c`, `-h` and `-v` do not.
 
 ## [2.6.13]
 

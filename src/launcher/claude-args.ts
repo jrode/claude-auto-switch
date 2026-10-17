@@ -34,9 +34,11 @@ const SHORT_OPTIONS: ReadonlyMap<string, { long: string; takesValue: boolean }> 
 ]);
 
 /**
- * Claude's long options that take a value, as `claude --help` lists them. Those
- * shown as `<value>` or `[value]` take the next operand; those shown as
- * `<values...>` take every operand up to the next flag.
+ * Claude's long options that take a value, as `claude --help` lists them, and
+ * the other names two of them have in the binary: `--remote`, the old name of
+ * `--cloud`, and `--rc`, short for `--remote-control`. Those shown as `<value>`
+ * or `[value]` take the next operand; those shown as `<values...>` take every
+ * operand up to the next flag.
  *
  * Every other option takes nothing, so an operand after it is the prompt:
  * `--dangerously-skip-permissions "fix the flaky test"` has one. An option Claude
@@ -70,6 +72,8 @@ const ONE_VALUE_FLAGS = new Set([
   '--plugin-dir',
   '--plugin-url',
   '--prompt-suggestions',
+  '--rc',
+  '--remote',
   '--remote-control',
   '--remote-control-session-name-prefix',
   '--resume',

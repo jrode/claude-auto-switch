@@ -247,6 +247,14 @@ describe('the prompt a session armed for its own relaunch', () => {
     expect(withResumePrompt(relaunchArgs(['--debug', 'api'], ID), 'carry on').applied).toBe(true);
   });
 
+  it('reads an option by its other name the way it reads the option', () => {
+    // `--remote` is the old name of `--cloud`, and `--rc` is short for
+    // `--remote-control`; in the 2.1.302 binary each takes a value.
+    for (const flag of ['--cloud', '--remote', '--remote-control', '--rc']) {
+      expect(hasOwnPrompt([flag, 'nightly build'])).toBe(false);
+    }
+  });
+
   it('gives a list-taking flag every value up to the next flag', () => {
     const relaunch = relaunchArgs(['--add-dir', '../lib', '../docs', '--effort', 'max'], ID);
     expect(withResumePrompt(relaunch, 'carry on').applied).toBe(true);
