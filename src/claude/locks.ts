@@ -7,7 +7,7 @@ import {
   rmSync,
   statSync,
   utimesSync,
-  writeSync,
+  writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 
@@ -214,12 +214,17 @@ export function acquireOwnedLock(lockFile: string, options: OwnedLockOptions): L
 export function createOwnedLockFile(
   file: string,
   content: string,
-  write: (fd: number, text: string) => unknown = (fd, text) => writeSync(fd, text),
+  write: (fd: number, text: string) => unknown = (fd, text) => writeFileSync(fd, text),
 ): void {
   const fd = openSync(file, 'wx', 0o600);
   let written = false;
   try {
     write(fd, content);
+    // Read back, since a write can come up short and a lock without its whole
+    // pid names no holder.
+    if (readFileSync(file, 'utf8') !== content) {
+      throw Object.assign(new Error(`could not write all of ${file}`), { code: 'EIO' });
+    }
     written = true;
   } finally {
     closeSync(fd);

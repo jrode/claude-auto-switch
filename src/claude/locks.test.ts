@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, existsSync, utimesSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, utimesSync, readFileSync, writeFileSync, writeSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -117,6 +117,18 @@ describe('acquireOwnedLock', () => {
         createOwnedLockFile(file, content, () => {
           throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
         }),
+    });
+    expect(h.held).toBe(false);
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('leaves no lock, and holds none, when the pid is written only in part', () => {
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, {
+      waitMs: 0,
+      staleMs: 5_000,
+      // Every byte but the last, as a short write leaves it.
+      create: (file, content) => createOwnedLockFile(file, content, (fd, text) => writeSync(fd, text.slice(0, -1))),
     });
     expect(h.held).toBe(false);
     expect(existsSync(lock)).toBe(false);
