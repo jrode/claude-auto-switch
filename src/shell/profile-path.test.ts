@@ -99,13 +99,14 @@ describe('queryPowerShell, given a PowerShell that is slow to start', () => {
 
     const started = Date.now();
     const facts = queryPowerShell('powershell', slow);
-    expect(Date.now() - started).toBeGreaterThanOrEqual(16_000);
     expect(facts).toEqual({
       allHosts: `${docs}\\profile.ps1`,
       currentHost: `${docs}\\Microsoft.PowerShell_profile.ps1`,
       policy: 'RemoteSigned',
       policyFromGroupPolicy: false,
     });
+    // And it really was that slow: the policy did not come early.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(16_000);
   }, 60_000);
 });
 
