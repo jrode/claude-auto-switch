@@ -218,6 +218,8 @@ const TOUCHED = [
   'FAKE_CLAUDE_REFUSAL_ENDS_RUN',
   'FAKE_CLAUDE_REFUSE_AS',
   'FAKE_CLAUDE_SUBAGENT_REFUSE_AFTER_MS',
+  'FAKE_CLAUDE_STREAM_REFUSALS',
+  'FAKE_CLAUDE_RESUMED_IDLE_MS',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'CLAUDE_CODE_ENTRYPOINT',
   'CLAUDECODE',
@@ -720,6 +722,34 @@ describe('ccx worker (against fake-claude)', () => {
     expect(launchesIn(runsLog).map((l) => l.marker)).toEqual(['A', 'B']);
     const answer = JSON.parse(seen.out()) as { is_error: boolean; ccx: { accounts: string[] } };
     expect(answer).toMatchObject({ is_error: false, ccx: { accounts: ['A', 'B'] } });
+  });
+
+  it('moves on a refusal held while another was checked, once the usage check is turned away', { timeout: 60_000 }, async () => {
+    // The first refusal's check is slow and finds room; the second, seen
+    // meanwhile, is held, then checked: turned away, and proved by Claude's
+    // own record and its own output.
+    const { context, runsLog } = await setup(['A', 'B']);
+    delete context.verifyCap;
+    const asked: string[] = [];
+    context.capProbe = async (credentialsFile) => {
+      const account = (JSON.parse(readFileSync(credentialsFile, 'utf8')) as { account?: string }).account ?? '?';
+      asked.push(account);
+      if (account !== 'A') return { verdict: 'allowed' };
+      if (asked.length === 1) {
+        await sleep(2500);
+        return { verdict: 'allowed', fiveHour: 0.5 };
+      }
+      return { verdict: 'unknown', detail: 'status 429' };
+    };
+    Object.assign(process.env, refusing(6000), {
+      FAKE_CLAUDE_REFUSE_ON: 'A',
+      FAKE_CLAUDE_REFUSE_AGAIN_AFTER_MS: '2000',
+      FAKE_CLAUDE_STREAM_REFUSALS: '1',
+      FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+    });
+    expect(await workerCommand(context, ['hi'], { output: 'stream-json' }, [], capture().io)).toBe(0);
+    expect(asked).toEqual(['A', 'A']);
+    expect(launchesIn(runsLog).map((l) => l.marker)).toEqual(['A', 'B']);
   });
 
   it('fails with the answer Claude gave when every account runs out', { timeout: 60_000 }, async () => {

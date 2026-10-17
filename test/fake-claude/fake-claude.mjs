@@ -166,12 +166,13 @@ if (runsLog) {
     'utf8',
   );
 }
+/** The conversation this run is in, which print mode reports as Claude does, flag or none. */
 const printSession = () => {
   for (const flag of ['--session-id', '--resume']) {
     const i = args.indexOf(flag);
     if (i >= 0 && args[i + 1]) return args[i + 1];
   }
-  return null;
+  return process.env.FAKE_CLAUDE_LANDS_ON ?? '00000000-0000-4000-8000-000000000000';
 };
 /**
  * The answer a print-mode run gives as it ends normally, then `done`. Only
@@ -402,14 +403,43 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
     const transcript = path.join(configDir, 'projects', 'fake-project', `${recordedId}.jsonl`);
     mkdirSync(path.dirname(transcript), { recursive: true });
     appendFileSync(transcript, `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' } })}\n`);
+    /**
+     * A limit refusal of its own, shown as Claude shows one: in its terminal,
+     * or, with FAKE_CLAUDE_STREAM_REFUSALS, as an event in stream-json. One
+     * another Claude writes into the same record is never shown here.
+     */
+    const showRefusal = (entry) => {
+      const text = entry.message.content[0].text;
+      if (!outputFormat) process.stdout.write(`${text}\n`);
+      else if (outputFormat === 'stream-json' && process.env.FAKE_CLAUDE_STREAM_REFUSALS) {
+        process.stdout.write(`${JSON.stringify({ type: 'assistant', message: entry.message, session_id: printSession() })}\n`);
+      }
+    };
+    // A prompt somebody typed, recorded at a set time, as Claude records one.
+    const promptAfter = Number(process.env.FAKE_CLAUDE_PROMPT_AFTER_MS) || 0;
+    if (promptAfter > 0) {
+      const t = setTimeout(() => {
+        const prompt = {
+          type: 'user',
+          isSidechain: false,
+          origin: { kind: 'human' },
+          timestamp: new Date().toISOString(),
+          message: { role: 'user', content: 'and one more thing' },
+        };
+        appendFileSync(transcript, `${JSON.stringify(prompt)}\n`);
+      }, promptAfter);
+      if (t.unref) t.unref();
+    }
     // Only on the accounts named, when some are: an account with room does
     // not refuse.
     const refuseOn = process.env.FAKE_CLAUDE_REFUSE_ON;
     const refusesHere = !refuseOn || refuseOn.split(',').includes(readMarker() ?? '');
     const refuse = () => {
       if (!refusesHere) return;
-      const entry = process.env.FAKE_CLAUDE_REFUSE_AS === 'signed-out' ? signedOutEntry() : refusalEntry();
+      const signedOut = process.env.FAKE_CLAUDE_REFUSE_AS === 'signed-out';
+      const entry = signedOut ? signedOutEntry() : refusalEntry();
       appendFileSync(transcript, `${JSON.stringify(entry)}\n`);
+      if (!signedOut) showRefusal(entry);
       // Print mode ends the run on a refused turn, with an error result and
       // exit 1, where the terminal app stays up and waits.
       if (process.env.FAKE_CLAUDE_REFUSAL_ENDS_RUN && outputFormat) {
@@ -522,6 +552,7 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
                 message: { role: 'assistant', content: [{ type: 'text', text: 'carrying on' }] },
               };
           appendFileSync(transcript, `${JSON.stringify(answer)}\n`);
+          if (refused) showRefusal(answer);
           turnRunning = false;
           setStatus(resting);
           if (!refused) answered += 1;

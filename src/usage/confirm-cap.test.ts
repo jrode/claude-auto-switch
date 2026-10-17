@@ -414,8 +414,10 @@ describe('a usage check that gives no answer', () => {
     return dir;
   }
   const TURNED_AWAY: LimitProbeResult = { verdict: 'unknown', detail: 'status 429' };
-  const proves = { proves: true, why: 'Claude recorded the turn as refused (usage_limit_reached)' };
-  const doesNot = { proves: false, why: 'the refusal was recorded before this Claude started' };
+  const proves = () =>
+    Promise.resolve({ proves: true, why: 'Claude recorded the turn as refused (usage_limit_reached)' });
+  const doesNot = () =>
+    Promise.resolve({ proves: false, why: 'the refusal was recorded before this Claude started' });
   /** The usage endpoint's answers in turn, the last one standing; and how often it was asked. */
   const answering = (...answers: LimitProbeResult[]) => {
     let asked = 0;
@@ -451,6 +453,38 @@ describe('a usage check that gives no answer', () => {
       expect(decision).toMatchObject({ limited: false, unanswered: true, detail: 'status 429' });
       expect(decision.byRefusal).toBeUndefined();
     }
+    expect((await ask({ probe: answering(TURNED_AWAY).probe, refusal: doesNot })).refusalWhy).toBe(
+      'the refusal was recorded before this Claude started',
+    );
+  });
+
+  it('judges the record only once the usage check has given no answer', async () => {
+    const order: string[] = [];
+    const judged = () => {
+      order.push('judged');
+      return proves();
+    };
+    const probe = () => {
+      order.push('asked');
+      return Promise.resolve(TURNED_AWAY);
+    };
+    expect((await ask({ probe, refusal: judged })).limited).toBe(true);
+    expect(order).toEqual(['asked', 'judged']);
+    // An answered check never asks it.
+    order.length = 0;
+    await ask({ probe: () => Promise.resolve({ verdict: 'allowed' }), refusal: judged });
+    expect(order).toEqual([]);
+  });
+
+  it('lets the record decide when there is no login to ask the usage check with', async () => {
+    // A check that cannot be asked gives no answer, the same as one turned away.
+    const empty = mkdtempSync(path.join(tmpdir(), 'cas-cap-nologin-'));
+    const decision = await confirmSessionCap({ sessionDir: empty, believedDir: null }, 'limit reached', {
+      probe: () => Promise.reject(new Error('never asked')),
+      refusal: proves,
+    });
+    expect(decision).toMatchObject({ limited: true, byRefusal: true, detail: 'no credential to ask' });
+    expect((await confirmCap(null, 'limit', { refusal: doesNot })).limited).toBe(false);
   });
 
   it('leaves an answered check to the usage endpoint, whatever the record says', async () => {

@@ -4,7 +4,8 @@ import type { IPty } from 'node-pty';
 import { nodePty } from '../util/native-pty.js';
 import { matchesCapText, resetAtIn } from './cap-detect.js';
 import { createRefusalFollower, type Refusal } from '../session/transcript.js';
-import type { RecordedRefusal } from '../session/refused-turn.js';
+import { REFUSAL_MAX_AGE_MS, type RecordedRefusal } from '../session/refused-turn.js';
+import { createOutputLog, SHOWN_WAIT_MS } from '../session/own-output.js';
 import { gateRefusals, type RefusalGate } from '../session/refusal-gate.js';
 import { invokerArgs, type ClaudeInvoker } from '../invoker.js';
 import { writeSecretFile } from '../util/secret-file.js';
@@ -389,9 +390,30 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
         refusal,
       };
     };
+    /**
+     * What this Claude drew on its own screen, kept as long as a refusal can
+     * still be judged. Claude draws a refused turn as it records it, a moment
+     * either side, so it is looked for from a little before the refusal's time.
+     */
+    const screenLog = createOutputLog({ keepMs: REFUSAL_MAX_AGE_MS + 10_000, maxChars: 512_000 });
+    const DRAWN_BEFORE_MS = 3_000;
+    /**
+     * Whether this Claude drew `refusal`, waiting up to SHOWN_WAIT_MS for it:
+     * the record can be read a moment before the screen output arrives.
+     */
+    const drew = async (refusal: Refusal): Promise<boolean> => {
+      const at = refusal.at;
+      if (at === null) return false;
+      const until = Date.now() + SHOWN_WAIT_MS;
+      while (!screenLog.shows(refusal.text, at - DRAWN_BEFORE_MS)) {
+        if (Date.now() >= until) return false;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return true;
+    };
     /** A refusal as the check is given it, with when this Claude started and was last typed at. */
     const recordedOf = (refusal: Refusal | undefined): RecordedRefusal | undefined =>
-      refusal ? { refusal, launchedAt: startedAt, promptAt: lastPromptAt } : undefined;
+      refusal ? { refusal, launchedAt: startedAt, promptAt: lastPromptAt, shown: () => drew(refusal) } : undefined;
 
     /**
      * Hand on each turn the conversation's record says was refused, once. This
@@ -693,6 +715,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
 
     const dataSub = child.onData((data) => {
       process.stdout.write(data);
+      screenLog.add(data, Date.now());
       // The child's own words are the only honest record of which mouse modes
       // it has asked the terminal for, and every byte of them passes here. The
       // input relay uses that to refuse reports this child cannot have wanted.
@@ -1053,6 +1076,8 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
           // exit; the screen only counts while the record could not be read.
           const final = record.poll(lastConversation);
           if (final.readable && !options.ignoreLimits) recordReadable = true;
+          // A prompt read only now still comes after a refusal held before it.
+          if (final.promptAt !== null) lastPromptAt = Math.max(lastPromptAt, final.promptAt);
           // A "Please run /login" written just before the exit is asked about
           // too; finalize waits for the answer.
           if (final.signedOut !== null) onSignedOut(final.signedOut, true);

@@ -1,7 +1,8 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { invokerArgs, type ClaudeInvoker } from '../invoker.js';
 import { createRefusalFollower, type Refusal } from '../session/transcript.js';
-import type { RecordedRefusal } from '../session/refused-turn.js';
+import { REFUSAL_MAX_AGE_MS, type RecordedRefusal } from '../session/refused-turn.js';
+import { createOutputLog, SHOWN_WAIT_MS } from '../session/own-output.js';
 import { gateRefusals, type RefusalGate } from '../session/refusal-gate.js';
 import { matchesCapText, resetAtIn } from './cap-detect.js';
 import { scrubHostEnv } from './child-env.js';
@@ -234,9 +235,15 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
   );
   let recordReadable = false;
   let tail = '';
+  /** This run's own output, to tell its refusals from another Claude's in the same record (session/own-output). */
+  const output = createOutputLog({ keepMs: REFUSAL_MAX_AGE_MS + 10_000, maxChars: 512_000 });
   const keep = (chunk: string): void => {
     tail = (tail + chunk).slice(-TAIL);
+    output.add(chunk, Date.now());
   };
+  /** Claude prints a refused turn as it records it, a moment either side. */
+  const printed = (refusal: Refusal): boolean =>
+    refusal.at !== null && output.shows(refusal.text, refusal.at - 3_000);
   // Decoded as a stream: a character split between two reads arrives whole,
   // where decoding each read alone turns both halves into replacement marks.
   child.stdout?.setEncoding('utf8');
@@ -259,6 +266,13 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
   let verifying: Promise<void> | null = null;
   /** A refusal seen while another was being confirmed: asked about next, not dropped. */
   let held: { text: string; hit: Hit; refusal?: Refusal } | null = null;
+  /**
+   * The last refusal from the record that would have proved the limit but
+   * for this run not having printed it yet. Its output can arrive just after
+   * the record does, so once Claude has exited and all of its output is in,
+   * it is asked about again.
+   */
+  let askedBeforePrinted: { text: string; hit: Hit; refusal: Refusal } | null = null;
   /** What Claude showed when its login was turned away, once confirmed finished; and a check in flight. */
   let signedOut: string | null = null;
   let checkingLogin: Promise<void> | null = null;
@@ -282,9 +296,23 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
       held = { text, hit, ...(refusal ? { refusal } : {}) };
       return;
     }
+    // Asked last, once all else about the refusal holds (session/refused-turn),
+    // so a refusal kept for another look is one its output alone was missing
+    // for. The record can be read a moment before the output arrives.
+    const shown = async (seen: Refusal): Promise<boolean> => {
+      const until = Date.now() + SHOWN_WAIT_MS;
+      while (!printed(seen)) {
+        if (Date.now() >= until || exited) {
+          askedBeforePrinted = { text, hit, refusal: seen };
+          return false;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return true;
+    };
     // Nobody types at a headless Claude, so no prompt can come after a refusal.
     const recorded: RecordedRefusal | undefined = refusal
-      ? { refusal, launchedAt: startedAt, promptAt: 0 }
+      ? { refusal, launchedAt: startedAt, promptAt: 0, shown: () => shown(refusal) }
       : undefined;
     const check = options.verifyCap ? options.verifyCap(text, recorded) : Promise.resolve(true);
     verifying = check
@@ -397,6 +425,9 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
       // A refusal written just before Claude exited is read now, and the
       // output stands in for the record only when there was none to read.
       checkRecord();
+      const again = askedBeforePrinted;
+      askedBeforePrinted = null;
+      if (again && printed(again.refusal)) evidence(again.text, again.hit, again.refusal);
       if (
         !capped &&
         !switchTo &&

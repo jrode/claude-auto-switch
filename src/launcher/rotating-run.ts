@@ -12,6 +12,10 @@ import type { Ledger } from '../ledger/ledger.schema.js';
 import type { CapDecision } from '../usage/confirm-cap.js';
 import { withModel } from '../usage/model-args.js';
 import { launchHeadless, type HeadlessRunner } from './launcher.js';
+import { conversationIdIn, reportedSessionId } from './conversation.js';
+import { refusalsSince } from '../session/transcript.js';
+import { outputShows } from '../session/own-output.js';
+import type { RecordedRefusal } from '../session/refused-turn.js';
 
 /** An account the rotator can run: selectable plus its config dir. */
 export interface RotatableAccount extends SelectableAccount {
@@ -27,11 +31,13 @@ export interface AutoRotateDeps<T extends RotatableAccount> {
   defaultBackoffMinutes: number;
   /**
    * Confirm a cap against the account's OWN usage before recording it.
+   * `recorded`: the refused turn in the run's own record, when there is one,
+   * which may stand in for the usage check when that cannot answer.
    *
    * Required rather than optional: an unverified cap takes an account out for
    * hours, so a call site must not be able to skip this by forgetting it.
    */
-  confirmCap: (account: T, renderedText: string) => Promise<CapDecision>;
+  confirmCap: (account: T, renderedText: string, recorded?: RecordedRefusal) => Promise<CapDecision>;
   /**
    * Model fallback order, the operator's `modelPreference` (default Fable then
    * Opus). Empty disables model fallback and rotates on accounts alone.
@@ -163,21 +169,31 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
       runArgs = withModel(args, plan.model);
       modelInUse = plan.model;
     }
+    // By Claude's clock, which the record's times are in.
+    const launchedAt = Date.now();
     const headless = await launchHeadless(runArgs, account, { claude: deps.claude, run: deps.run });
     const { classification } = headless;
+    const recorded = refusedIn(account, runArgs, headless, launchedAt);
 
-    if (classification.kind === 'capped') {
+    if (classification.kind === 'capped' || recorded) {
       // Cap-looking text is a TRIGGER, never a verdict. This path used to write
       // the cap straight from the text, which meant any output matching the
       // patterns took an account out for hours, and a Fable-only limit took the
-      // whole account out even though it still ran on every other model.
-      const confirmed = await deps.confirmCap(account, classification.reason ?? '');
+      // whole account out even though it still ran on every other model. A
+      // turn the run's own record says was refused is a trigger too, since
+      // Claude's wording for one need not match the text patterns.
+      const confirmed = await deps.confirmCap(
+        account,
+        classification.kind === 'capped' ? (classification.reason ?? '') : (recorded?.refusal.text ?? ''),
+        recorded,
+      );
       if (!confirmed.limited) {
         // Not proven is not a cap. Returning the run's own result is the honest
         // outcome: whatever the text was, this account was not out of room.
+        const why = [confirmed.detail, confirmed.refusalWhy].filter(Boolean).join('; ');
+        const seen = classification.kind === 'capped' ? 'printed limit-looking text' : 'had a turn refused';
         deps.out(
-          `${account.name} printed limit-looking text, but it is not actually capped` +
-            `${confirmed.detail ? ` (${confirmed.detail})` : ''}; not rotating`,
+          `${account.name} ${seen}, but it is not actually capped${why ? ` (${why})` : ''}; not rotating`,
         );
         deps.writeOutput?.(headless.stdout, headless.stderr);
         return { exitCode: headless.exitCode, account: account.name, rotations, ledger };
@@ -187,7 +203,9 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
         now: deps.now(),
         resetAt: confirmed.resetAt ?? classification.resetAt ?? null,
         backoffMinutes: deps.defaultBackoffMinutes,
-        reason: confirmed.detail ?? classification.reason ?? 'usage cap',
+        reason: confirmed.byRefusal
+          ? (recorded?.refusal.apiError ?? 'usage cap')
+          : (confirmed.detail ?? classification.reason ?? 'usage cap'),
         // Carried so a model-scoped limit never blocks the whole account.
         ...(confirmed.model ? { model: confirmed.model } : {}),
       });
@@ -218,4 +236,28 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
 
   deps.out('all accounts are capped; try again later');
   return { exitCode: 1, rotations, ledger };
+}
+
+/**
+ * The refused turn in a finished run's own record, for when it is one Claude
+ * itself recorded: the run failed, its record is found by the conversation
+ * its arguments name or its JSON output reports (never by the newest file in
+ * the folder, which a run beside it may have written), and it printed the
+ * refusal. A plain-text run with no conversation flag reports no conversation,
+ * so it has none.
+ */
+function refusedIn(
+  account: RotatableAccount,
+  args: string[],
+  run: { exitCode: number; stdout: string; stderr: string },
+  launchedAt: number,
+): RecordedRefusal | undefined {
+  if (run.exitCode === 0) return undefined;
+  const id = conversationIdIn(args) ?? reportedSessionId(run.stdout);
+  if (id === null) return undefined;
+  const refusal = refusalsSince(account.dir, id, launchedAt).pop();
+  if (!refusal) return undefined;
+  const output = `${run.stdout}\n${run.stderr}`;
+  // Nobody types at a print-mode run.
+  return { refusal, launchedAt, promptAt: 0, shown: () => Promise.resolve(outputShows(output, refusal.text)) };
 }

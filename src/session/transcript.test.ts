@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createRefusalFollower, findTranscript, refusalIn, signedOutIn } from './transcript.js';
+import { createRefusalFollower, findTranscript, refusalIn, refusalsSince, signedOutIn } from './transcript.js';
 
 const ID = '11111111-2222-4333-8444-555555555555';
 
@@ -438,5 +438,32 @@ describe('a turn refused because the login no longer works', () => {
     const follow = createRefusalFollower(dir);
     expect(follow.poll(ID).signedOut).toBeNull();
     expect(follow.poll(ID).signedOut).toBeNull();
+  });
+});
+
+describe('the refused turns of a run that has ended', () => {
+  it("are the main thread's, written since the run started, oldest first", () => {
+    const { dir, file } = config();
+    mkdirSync(path.dirname(file), { recursive: true });
+    const at = (iso: string) => ({ timestamp: iso });
+    writeFileSync(
+      file,
+      line(refused(at('2026-10-16T10:00:00.000Z'))) +
+        line(answered) +
+        line(refused(at('2026-10-16T12:00:00.000Z'))) +
+        line(refused({ ...at('2026-10-16T12:00:01.000Z'), isSidechain: true })) +
+        line(refused(at('2026-10-16T12:00:02.000Z'))) +
+        // No time: nothing says it is this run's.
+        line(refused()),
+    );
+    const since = Date.parse('2026-10-16T11:00:00.000Z');
+    expect(refusalsSince(dir, ID, since).map((r) => r.at)).toEqual([
+      Date.parse('2026-10-16T12:00:00.000Z'),
+      Date.parse('2026-10-16T12:00:02.000Z'),
+    ]);
+  });
+
+  it('are none for a conversation with no record', () => {
+    expect(refusalsSince(config().dir, ID, 0)).toEqual([]);
   });
 });

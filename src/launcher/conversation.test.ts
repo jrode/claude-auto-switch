@@ -5,6 +5,7 @@ import {
   freshStartArgs,
   wantsExistingConversation,
   conversationIdIn,
+  reportedSessionId,
   withoutConversationFlags,
   looksLikeConversationId,
   withResumePrompt,
@@ -412,5 +413,24 @@ describe('whether a launch picks a conversation back up by itself', () => {
   it('does not for a new conversation, even one ccx named', () => {
     expect(startsByResuming([])).toBe(false);
     expect(startsByResuming(['--session-id', ID])).toBe(false);
+  });
+});
+
+describe('the conversation a print-mode run reports', () => {
+  const ID = '11111111-2222-4333-8444-555555555555';
+  it('is the session_id of its JSON answer, or of the first stream-json event that carries one', () => {
+    expect(reportedSessionId(`${JSON.stringify({ type: 'result', is_error: true, session_id: ID })}\n`)).toBe(ID);
+    const events = [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: ID }),
+      JSON.stringify({ type: 'result', session_id: ID }),
+    ].join('\n');
+    expect(reportedSessionId(events)).toBe(ID);
+  });
+
+  it('is nothing for plain text, for JSON without one, or for an id Claude would not take', () => {
+    expect(reportedSessionId("You've hit your session limit")).toBeNull();
+    expect(reportedSessionId('null')).toBeNull();
+    expect(reportedSessionId(JSON.stringify({ type: 'result' }))).toBeNull();
+    expect(reportedSessionId(JSON.stringify({ session_id: 'not-an-id' }))).toBeNull();
   });
 });

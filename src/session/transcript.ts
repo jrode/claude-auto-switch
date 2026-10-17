@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 /**
@@ -229,6 +229,29 @@ function parsed(line: string): unknown {
   } catch {
     return null; // not a whole entry
   }
+}
+
+/**
+ * The main thread's refused turns in the record of conversation `id` that
+ * were written at or after `since`, oldest first; none when there is no
+ * record. For a run that has ended, so the record is read whole.
+ */
+export function refusalsSince(configDir: string, id: string, since: number): Refusal[] {
+  const file = findTranscript(configDir, id);
+  if (!file) return [];
+  let text: string;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch {
+    return [];
+  }
+  const found: Refusal[] = [];
+  for (const line of text.split('\n')) {
+    if (!line.includes('"isApiErrorMessage":true')) continue;
+    const refusal = refusalIn(parsed(line));
+    if (refusal && !refusal.sidechain && refusal.at !== null && refusal.at >= since) found.push(refusal);
+  }
+  return found;
 }
 
 /** What a conversation's record, and its subagents' records, gained since the last look. */

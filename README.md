@@ -116,8 +116,11 @@ conversation's transcript, with error codes. ccx reads that record, never the
 screen, and confirms against the account's real usage before it acts. When the
 usage check cannot answer (its budget is shared by every session on the
 machine), a refusal Claude recorded for the current turn, with the code for an
-account out of its usage limit, confirms it instead. Text on screen that talks
-about usage limits never moves a session.
+account out of its usage limit, confirms it instead, provided this Claude
+itself showed it: another Claude on the same conversation writes to the same
+record. That covers sessions in the terminal, workers and `claude -p` runs
+whose conversation is named or reported in JSON, not yet the editor launch.
+Text on screen that talks about usage limits never moves a session.
 
 **Moving.** A refused turn has already ended, so the session needs another
 account and to be told to carry on. ccx replaces the login under the running

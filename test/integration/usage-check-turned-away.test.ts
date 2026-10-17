@@ -1,11 +1,20 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { addCommand } from '../../src/commands/add.js';
 import { runCommand } from '../../src/commands/run.js';
 import { setActive } from '../../src/state/active.js';
 import { loadConfig } from '../../src/config/config.js';
+import { sessionDirFor } from '../../src/session/session-dir.js';
 import type { CliContext } from '../../src/context.js';
 import type { LimitProbeResult } from '../../src/usage/limit-probe.js';
 import {
@@ -33,7 +42,25 @@ const TURNED_AWAY: LimitProbeResult = { verdict: 'unknown', detail: 'status 429'
 const ROOM: LimitProbeResult = { verdict: 'allowed', fiveHour: 0.1, sevenDay: 0.1 };
 
 /** Set here and not in FAKE_ENV, so put back here too. */
-const ALSO_SET = ['FAKE_CLAUDE_CAP_AFTER_MS', 'FAKE_CLAUDE_CAP_EVERY_MS', 'FAKE_CLAUDE_REFUSAL_AGE_MS'];
+const ALSO_SET = [
+  'FAKE_CLAUDE_CAP_AFTER_MS',
+  'FAKE_CLAUDE_CAP_EVERY_MS',
+  'FAKE_CLAUDE_REFUSAL_AGE_MS',
+  'FAKE_CLAUDE_REFUSE_AGAIN_AFTER_MS',
+  'FAKE_CLAUDE_PROMPT_AFTER_MS',
+  'FAKE_CLAUDE_REFUSAL_ENDS_RUN',
+];
+/** The usage check answering, with a window this one measured. */
+const OUT = (resetAt: number): LimitProbeResult => ({
+  verdict: 'limited',
+  fiveHour: 1,
+  sevenDay: 0.4,
+  fiveHourReset: resetAt,
+});
+const capVerdicts = (home: string): string[] =>
+  eventsIn(home)
+    .filter((e) => e.kind === 'cap-verify')
+    .map((e) => e.msg);
 
 interface LoggedEvent {
   msg: string;
@@ -275,5 +302,199 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
         ]);
       },
     );
+
+    it(
+      'never moves on a refusal another Claude wrote into the same conversation',
+      { timeout: 60_000 },
+      async () => {
+        // Two Claudes on one conversation (the Desktop handoff in `same` mode,
+        // or two runs resuming one id) write one record. The other one is
+        // refused, stamped now, and this one shows nothing of it.
+        const { home, runsLog, context, asked } = await twoAccounts('cas-429-other-', {
+          A: [TURNED_AWAY],
+        });
+        Object.assign(process.env, {
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '6000',
+          FAKE_CLAUDE_SESSION_RECORD: '1',
+          FAKE_CLAUDE_TRANSCRIPT: '1',
+        });
+
+        const running = runCommand(context, []);
+        const folder = path.join(sessionDirFor(process.pid, context.ctx), 'projects', 'fake-project');
+        const record = await waitFor(
+          'the conversation record',
+          () => (existsSync(folder) ? readdirSync(folder).filter((f) => f.endsWith('.jsonl')) : []),
+          (files) => files.length === 1,
+        );
+        const otherClaudes = {
+          type: 'assistant',
+          isSidechain: false,
+          isApiErrorMessage: true,
+          error: 'rate_limit',
+          apiError: 'usage_limit_reached',
+          apiErrorStatus: 429,
+          timestamp: new Date().toISOString(),
+          message: { role: 'assistant', content: [{ type: 'text', text: 'Out of room on that account for now.' }] },
+        };
+        appendFileSync(path.join(folder, record[0] ?? ''), `${JSON.stringify(otherClaudes)}\n`);
+        expect(await running).toBe(0);
+
+        // Asked about, turned away, and not moved.
+        expect(asked).toContain('A');
+        expect(launches(readLog(runsLog)).map((l) => l.marker)).toEqual(['A']);
+        expect(capsIn(home)).toEqual([]);
+        expect(eventsIn(home).filter((e) => e.kind === 'cap-relief')).toEqual([]);
+        expect(capVerdicts(home)).toContain(
+          'Claude recorded a refused turn, but not switching yet: the usage check could not answer ' +
+            '(status 429), and this Claude did not show the refusal, so another may have written it',
+        );
+      },
+    );
+
+    it(
+      'never moves on a refusal that can be the old login, just after a move',
+      { timeout: 60_000 },
+      async () => {
+        // A is out and confirmed, and the session moves to B in place. The
+        // carry-on prompt still goes out on A, which Claude keeps for a while,
+        // and is refused; B's check is turned away. That refusal says nothing
+        // about B.
+        const { home, runsLog, context, asked } = await twoAccounts('cas-429-moved-', {
+          A: [OUT(Date.now() + 60 * 60_000)],
+          B: [TURNED_AWAY],
+        });
+        // Checked as it comes, rather than held until Claude exits.
+        context.refuteBackoffMs = 300;
+        Object.assign(process.env, refusedOnA(runsLog), { FAKE_CLAUDE_OLD_LOGIN_REQUESTS: '1' });
+
+        expect(await runCommand(context, [])).toBe(0);
+        const log = readLog(runsLog);
+        expect(launches(log).map((l) => l.marker)).toEqual(['A']);
+        // Refused on the login it had, then carried on on B.
+        expect(prompts(log).map((p) => [p.marker, p.refused])).toEqual([
+          ['A', true],
+          ['B', false],
+        ]);
+        expect(asked).toContain('B');
+        expect(capsIn(home).map((c) => c.account)).toEqual(['A']);
+        expect(eventsIn(home).filter((e) => e.kind === 'cap-relief')).toHaveLength(1);
+        expect(capVerdicts(home).join('\n')).toContain(
+          'the refusal came within 40 s of the login changing under Claude, so it may be the old login',
+        );
+      },
+    );
+
+    it(
+      'never moves on a refusal that a prompt was typed after, when it is judged',
+      { timeout: 60_000 },
+      async () => {
+        // The first refusal is checked and the account reports room, so the
+        // second is held and judged as Claude exits. A prompt was typed in
+        // between: that refusal is no longer the turn in front of the session.
+        const { home, runsLog, context, asked } = await twoAccounts('cas-429-prompted-', {
+          A: [ROOM, TURNED_AWAY],
+        });
+        Object.assign(process.env, {
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '6000',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_SESSION_RECORD: '1',
+          FAKE_CLAUDE_TRANSCRIPT: '1',
+          FAKE_CLAUDE_REFUSE_ON: 'A',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1500',
+          FAKE_CLAUDE_REFUSE_AGAIN_AFTER_MS: '3000',
+          FAKE_CLAUDE_PROMPT_AFTER_MS: '4000',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        expect(asked).toEqual(['A', 'A']);
+        expect(launches(readLog(runsLog)).map((l) => l.marker)).toEqual(['A']);
+        expect(capsIn(home)).toEqual([]);
+        expect(capVerdicts(home).join('\n')).toContain('and a prompt was typed after the refusal');
+      },
+    );
+
+    it(
+      'moves on a refusal held while the account reported room, judged as Claude exits',
+      { timeout: 60_000 },
+      async () => {
+        const { home, runsLog, context, asked } = await twoAccounts('cas-429-held-', {
+          A: [ROOM, TURNED_AWAY],
+        });
+        Object.assign(process.env, {
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '5000',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_SESSION_RECORD: '1',
+          FAKE_CLAUDE_TRANSCRIPT: '1',
+          FAKE_CLAUDE_REFUSE_ON: 'A',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1500',
+          FAKE_CLAUDE_REFUSE_AGAIN_AFTER_MS: '3000',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        expect(asked).toEqual(['A', 'A']);
+        // Claude had exited, so it is relaunched, on B.
+        expect(launches(readLog(runsLog)).map((l) => l.marker)).toEqual(['A', 'B']);
+        expect(capsIn(home).map((c) => c.account)).toEqual(['A']);
+      },
+    );
   },
 );
+
+/** Accounts signed in as the fake claude reports it, for a print-mode run's health check. */
+function signInForPrint(home: string, scenario: Record<string, Record<string, unknown>> = {}): void {
+  for (const name of ['A', 'B']) {
+    writeFileSync(
+      path.join(home, 'profiles', name, 'fake-scenario.json'),
+      JSON.stringify({
+        authStatus: { loggedIn: true, authMethod: 'claude.ai', email: `${name}@example.com` },
+        ...scenario[name],
+      }),
+      'utf8',
+    );
+  }
+}
+
+describe('a print-mode run whose limit meets a turned-away usage check (against fake-claude)', () => {
+  afterEach(() => {
+    for (const name of [...FAKE_ENV, ...ALSO_SET]) delete process.env[name];
+  });
+
+  it(
+    "rotates on the run's own record of its refused turn, found by the conversation it reports",
+    { timeout: 60_000 },
+    async () => {
+      const { home, runsLog, context, asked } = await twoAccounts('cas-429-print-', { A: [TURNED_AWAY] });
+      signInForPrint(home);
+      Object.assign(process.env, {
+        FAKE_CLAUDE_RUNS_LOG: runsLog,
+        FAKE_CLAUDE_IDLE_MS: '1500',
+        FAKE_CLAUDE_SESSION_RECORD: '1',
+        FAKE_CLAUDE_TRANSCRIPT: '1',
+        FAKE_CLAUDE_REFUSE_ON: 'A',
+        FAKE_CLAUDE_REFUSE_AFTER_MS: '300',
+        FAKE_CLAUDE_REFUSAL_ENDS_RUN: '1',
+      });
+
+      expect(await runCommand(context, ['-p', '--output-format', 'json', 'hi'])).toBe(0);
+      expect(asked).toContain('A');
+      expect(launches(readLog(runsLog)).map((l) => l.marker)).toEqual(['A', 'B']);
+      expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A', reason: 'usage_limit_reached' })]);
+    },
+  );
+
+  it('never rotates on limit text alone', { timeout: 60_000 }, async () => {
+    const { home, runsLog, context, asked } = await twoAccounts('cas-429-print-words-', { A: [TURNED_AWAY] });
+    // A prints a limit message and fails, with no record of a refused turn.
+    signInForPrint(home, { A: { capped: true, capMessage: 'Usage limit reached. Try again later.' } });
+    Object.assign(process.env, { FAKE_CLAUDE_RUNS_LOG: runsLog, FAKE_CLAUDE_IDLE_MS: '500' });
+
+    expect(await runCommand(context, ['-p', '--output-format', 'json', 'hi'])).toBe(1);
+    expect(asked).toEqual(['A']);
+    // B never ran.
+    expect(launches(readLog(runsLog))).toEqual([]);
+    expect(capsIn(home)).toEqual([]);
+  });
+});

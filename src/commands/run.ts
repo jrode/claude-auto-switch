@@ -15,6 +15,7 @@ import { shellCoverage, shellPlans } from '../shell/shells.js';
 import { configHome } from '../config/paths.js';
 import { signedInAndNotRejected } from '../health/signed-in.js';
 import { confirmCap } from '../usage/confirm-cap.js';
+import { refusalProof } from '../session/refused-turn.js';
 
 /** Show a one-time tip about the transparent shim, after an interactive session. */
 function maybeHintShim(context: CliContext): void {
@@ -113,8 +114,14 @@ export async function runCommand(
       pinned,
       now: () => Date.now(),
       // The account's OWN usage decides, so a limit is never recorded from text
-      // alone and a model-scoped one keeps its scope.
-      confirmCap: (account, renderedText) => confirmCap(account.dir, renderedText),
+      // alone and a model-scoped one keeps its scope. When it cannot answer,
+      // the run's own record of a refused turn can; nothing changes the login
+      // under a print-mode run.
+      confirmCap: (account, renderedText, recorded) =>
+        confirmCap(account.dir, renderedText, {
+          ...(context.capProbe ? { probe: context.capProbe } : {}),
+          ...(recorded ? { refusal: () => refusalProof(recorded, 0) } : {}),
+        }),
       modelPreference: context.config.rotation.modelPreference,
       modelStrategy: context.config.rotation.modelStrategy,
       order: context.config.rotation.accountOrder,

@@ -756,7 +756,6 @@ export async function runInteractiveHotSwap(
     let verdict: string;
     let refusalData: EventDetail['data'];
     let decided: SessionCapDecision | null = null;
-    const proof = recorded ? refusalProof(recorded, loginChangedAt) : undefined;
     if (context.verifyCap) {
       verdict = await context.verifyCap(renderedText);
       // The injected verifier answers yes or no and nothing else, so anything
@@ -777,7 +776,8 @@ export async function runInteractiveHotSwap(
         // a model it is not on is not a limit on it.
         {
           modelInUse: runningModel(),
-          ...(proof ? { refusal: proof } : {}),
+          // Judged after the usage check, so it sees what Claude has drawn by then.
+          ...(recorded ? { refusal: () => refusalProof(recorded, loginChangedAt) } : {}),
           ...(context.capProbe ? { probe: context.capProbe } : {}),
         },
       );
@@ -844,7 +844,7 @@ export async function runInteractiveHotSwap(
           );
         }
       }
-      if (decision.byRefusal && proof) {
+      if (decision.byRefusal) {
         // Nothing measured this limit's window. One already on the ledger for
         // the account, from a check that was answered (another session's,
         // moments ago, when the endpoint is this busy), is the best there is,
@@ -855,7 +855,7 @@ export async function runInteractiveHotSwap(
         limitedResetAt = accountCapEnd(loadLedger(context.ctx), owner, Date.now());
         notice(
           `the usage check could not answer (${usageAnswer(decision)}), ` +
-            `but ${proof.why}, which confirms the limit`,
+            `but ${decision.refusalWhy ?? 'Claude recorded the turn as refused'}, which confirms the limit`,
           { kind: 'cap-verify', data: refusalData },
         );
       }
@@ -875,7 +875,7 @@ export async function runInteractiveHotSwap(
         `${recorded ? 'Claude recorded a refused turn' : 'limit text on screen'}, but not switching` +
           (decided?.unanswered
             ? ` yet: the usage check could not answer (${usageAnswer(decided)}), ` +
-              `and ${proof?.why ?? 'Claude has not recorded the turn as refused'}`
+              `and ${decided.refusalWhy ?? 'Claude has not recorded the turn as refused'}`
             : `: ${refusalReason ?? 'the API reported room'}`),
         { kind: 'cap-verify', ...(refusalData ? { data: refusalData } : {}) },
       );

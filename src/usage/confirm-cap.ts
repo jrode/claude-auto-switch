@@ -48,6 +48,8 @@ export interface CapDecision {
   unanswered?: true;
   /** Proved by Claude's own record of the refused turn, the usage check having given no answer. */
   byRefusal?: true;
+  /** What that record proved, or why it did not, when it was asked. */
+  refusalWhy?: string;
   /** How many times the usage check was asked, when it was more than once. */
   asks?: number;
   /** A back-off the usage endpoint asked for that was longer than a check waits, in ms. */
@@ -74,11 +76,12 @@ export interface ConfirmCapDeps {
    */
   modelInUse?: string | null;
   /**
-   * Claude's own record of the refused turn that started this check, judged
-   * (session/refused-turn). Counts only when the usage check gives no answer,
-   * and then only when it proves the limit on its own.
+   * Judges Claude's own record of the refused turn that started this check
+   * (session/refused-turn). Asked only when the usage check gives no answer,
+   * after it has been asked, so it reads what Claude has shown by then; and it
+   * counts only when it proves the limit on its own.
    */
-  refusal?: RefusalProof;
+  refusal?: () => Promise<RefusalProof>;
   /** Injected in tests: how a back-off the usage endpoint asks for is waited out. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -99,7 +102,8 @@ export async function confirmCap(
 ): Promise<CapDecision> {
   const probe = deps.probe ?? probeLimit;
   const credentials = capProbeCredential(accountDir, deps.sessionCredentials ?? '');
-  if (!credentials) return { limited: false, detail: 'no credential to ask' };
+  // An endpoint that cannot be asked is one that gives no answer.
+  if (!credentials) return unanswered('no credential to ask', deps.refusal);
   return decide(await askUsage(probe, credentials, renderedText, deps.sleep ?? pause), deps);
 }
 
@@ -166,9 +170,12 @@ export function usageAnswer(decision: CapDecision): string {
 }
 
 /** The decision from what the usage check said, and how it was asked. */
-function decide(asked: Asked, deps: ConfirmCapDeps): CapDecision {
+async function decide(asked: Asked, deps: ConfirmCapDeps): Promise<CapDecision> {
+  const { result } = asked;
   return {
-    ...decideFromProbe(asked.result, deps.modelInUse ?? null, deps.refusal),
+    ...(result.verdict === 'unknown'
+      ? await unanswered(result.detail ?? result.verdict, deps.refusal)
+      : decideFromProbe(result, deps.modelInUse ?? null)),
     ...(asked.asks > 1 ? { asks: asked.asks } : {}),
     ...(asked.backOffMs !== undefined ? { backOffMs: asked.backOffMs } : {}),
   };
@@ -232,28 +239,34 @@ export async function confirmSessionCap(
       : input.believedDir
         ? path.join(input.believedDir, CREDENTIALS_FILE)
         : null;
-  if (!credentials) return { limited: false, detail: 'no credential to ask', askedOf };
+  if (!credentials) return { ...(await unanswered('no credential to ask', deps.refusal)), askedOf };
   return {
-    ...decide(await askUsage(probe, credentials, renderedText, deps.sleep ?? pause), deps),
+    ...(await decide(await askUsage(probe, credentials, renderedText, deps.sleep ?? pause), deps)),
     askedOf,
   };
 }
 
-function decideFromProbe(
-  result: LimitProbeResult,
-  modelInUse: string | null,
-  refusal: RefusalProof | undefined,
-): CapDecision {
-  if (result.verdict === 'unknown') {
-    // Account-wide, as the refusal's own code says, and with no window, since
-    // nothing measured one.
-    return {
-      limited: refusal?.proves === true,
-      unanswered: true,
-      ...(refusal?.proves === true ? { byRefusal: true as const } : {}),
-      detail: result.detail ?? result.verdict,
-    };
-  }
+/**
+ * No answer from the usage check: a limit only when Claude's own record of
+ * the refused turn proves it. Account-wide, as the refusal's own code says,
+ * and with no window, since nothing measured one.
+ */
+async function unanswered(
+  detail: string,
+  judge: (() => Promise<RefusalProof>) | undefined,
+): Promise<CapDecision> {
+  // A judgement that fails proves nothing, the same as a probe that does.
+  const proof = judge ? await judge().catch(() => undefined) : undefined;
+  return {
+    limited: proof?.proves === true,
+    unanswered: true,
+    ...(proof?.proves === true ? { byRefusal: true as const } : {}),
+    ...(proof ? { refusalWhy: proof.why } : {}),
+    detail,
+  };
+}
+
+function decideFromProbe(result: LimitProbeResult, modelInUse: string | null): CapDecision {
   if (result.verdict !== 'limited') {
     return { limited: false, detail: result.detail ?? result.verdict };
   }

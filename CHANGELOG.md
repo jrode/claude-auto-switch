@@ -15,20 +15,37 @@ semantic versioning.
   exactly when many sessions are busy, which is also when limits are met. ccx
   then treated the limit as unproven and left the session at Claude's "wait or
   upgrade" menu, although other accounts had room (#140). Now:
-  - When the usage check cannot answer (a 429, another error, or no answer in
-    time), Claude's own record of the refused turn confirms the limit, and the
-    session moves in place as it does for any confirmed limit. A worker moves
-    on to the next account.
+  - When the usage check cannot answer (a 429, another error, no answer in
+    time, or no login to ask with), Claude's own record of the refused turn
+    confirms the limit. A session in the terminal moves in place as it does for
+    any confirmed limit, a worker moves on to the next account, and so does a
+    `claude -p` run through ccx.
   - Only a refusal that speaks for the turn in front of the session counts:
     one recorded with the API's code for an account out of its usage limit
     (`usage_limit_reached`, which Claude writes from 2.1.292 on), after this
-    Claude started, after the last prompt typed at it, and at least 30 seconds
-    after ccx last changed the login under it. A limit on one model carries no
-    such code and still waits for the usage check, since only the check can
-    say how wide it is.
+    Claude started, after the last prompt typed at it, no more than 2 minutes
+    ago, and at least 40 seconds after ccx last changed the login under the
+    running Claude (Claude keeps a login it has read for up to 30 seconds, and
+    a request sent on it is answered a little later). A limit on one model
+    carries no such code and still waits for the usage check, since only the
+    check can say how wide it is.
+  - The refusal must also be one this Claude showed: on its own screen, or in
+    the output of its run. Two Claudes on one conversation (the Desktop
+    handoff in `same` mode, or two runs resuming one id) write one record, and
+    a refusal the other one met never moves this session.
+  - A `claude -p` run's own record is found by the conversation it names
+    (`--session-id`, `--resume`) or reports (`--output-format json` or
+    `stream-json`). A refused turn there now starts the check by itself, since
+    Claude's wording for one ("You've hit your session limit") need not match
+    the limit text ccx looks for. A plain-text run without a conversation flag
+    reports none, and still relies on the usage check.
+  - Not covered yet: the editor launch, a `claude -p` run with headless
+    rotation turned off, and the launch ccx falls back to when no account has
+    a login. None of them lets ccx see what Claude shows, so a refusal there
+    cannot be told from another Claude's.
   - Words on the screen alone still never move a session.
   - When the endpoint asks ccx to back off, ccx waits as long as it asks, up to
-    4 seconds from the start of the check, and asks once more.
+    4 seconds from its first ask, and asks once more.
   - Nothing measured the window of a limit confirmed this way, so it keeps the
     end another session's check already recorded for the account, and
     otherwise lasts the configured backoff.

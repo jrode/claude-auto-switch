@@ -117,6 +117,31 @@ export function conversationIdIn(args: string[]): string | null {
   return null;
 }
 
+/**
+ * The conversation a print-mode run says it ran in: the `session_id` of its
+ * JSON output (`--output-format json`), or of the first event that carries one
+ * (`stream-json`). Null for plain text, which carries none.
+ */
+export function reportedSessionId(stdout: string): string | null {
+  const idIn = (text: string): string | null => {
+    let value: unknown;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    const id = typeof value === 'object' && value !== null ? (value as { session_id?: unknown }).session_id : null;
+    return typeof id === 'string' && looksLikeConversationId(id) ? id : null;
+  };
+  const whole = idIn(stdout.trim());
+  if (whole !== null) return whole;
+  for (const line of stdout.split('\n')) {
+    const id = line.trim() === '' ? null : idIn(line.trim());
+    if (id !== null) return id;
+  }
+  return null;
+}
+
 /** Anything that is a value rather than another flag. */
 function isOperand(value: string | undefined): boolean {
   return typeof value === 'string' && !value.startsWith('-');
