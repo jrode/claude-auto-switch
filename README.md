@@ -81,10 +81,12 @@ cause, not yet confirmed, is an update that ran while Claude was open, since
 Windows can refuse to delete or overwrite the file of a program that is
 running. ccx repairs such an install before it starts Claude: from the second package when it is
 still there, with no download, or else by reinstalling the same version with
-npm. It leaves alone an install that changed in the last few minutes, which
-npm may still be writing, and does not repeat a repair that failed until the
-install changes. `ccx worker` never repairs. `ccx doctor` reports such an
-install and `ccx doctor --fix` repairs it. If the repair cannot help, close
+npm. It does not repair an install that changed in the last three minutes,
+which npm may still be writing, though it starts Claude from the second
+package once that has been left alone for half a minute. It does not repeat a
+repair that failed for an hour, or until the install changes. `ccx worker`
+never repairs. `ccx doctor` reports such an install and `ccx doctor --fix`
+repairs it at once. If the repair cannot help, close
 every Claude window, then run
 `npm i -g @anthropic-ai/claude-code`, or install the
 [native build](https://code.claude.com/docs/en/setup). To point ccx at a Claude

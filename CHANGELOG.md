@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.8]
+
+### Fixed
+
+- **Right after `npm i -g @anthropic-ai/claude-code` with install scripts
+  off, Claude starts.** ccx holds off repairing an install that changed in the
+  last three minutes, since npm may still be writing it, and that hold also
+  kept ccx from starting Claude from the second package, so running npm again
+  only started the three minutes over. ccx now judges the second package's
+  program on its own: once it has gone half a minute without changing, Claude
+  starts from it while the rest settles. The message says how long the hold
+  has left, and `ccx doctor --fix` repairs at once, after saying npm may still
+  be at work.
+- **A clock that was ahead no longer holds a repair off for hours.** A change
+  time more than two seconds in the future is not taken as a recent change.
+- **A repair that failed once is tried again by itself.** Being offline, a
+  registry error or npm's timeout leaves the install as it was, and ccx used
+  to wait for the install to change before trying again. It now tries again
+  an hour later.
+- **A launch that starts Claude from the second package says nothing about a
+  repair it did not make.** It used to print why on every launch; `ccx
+  doctor` reports it.
+- **Releasing a lock no longer removes another process's.** A holder whose
+  lock was taken over after it ran past the longest hold removed the new
+  holder's lock when it finished.
+
 ## [2.6.7]
 
 ### Fixed
@@ -31,10 +57,11 @@ semantic versioning.
     and left behind, if there is one, and is otherwise the current release.
     ccx starts npm as `node.exe` running npm's own script, since Node refuses
     to start `npm.cmd` without a shell.
-  - A launch repairs only the install it is about to start, and only when
-    Claude cannot otherwise start from it; at most once per run, and never
-    while another ccx is repairing, which it waits for instead. `ccx doctor
-    --fix` repairs every broken install it finds.
+  - A launch repairs only the install it is about to start: one Claude could
+    not start from at all, or could start only from the second package. At
+    most once per run, and never while another ccx is repairing, which it
+    waits for instead. `ccx doctor --fix` repairs every broken install it
+    finds.
   - An install that changed in the last few minutes is left alone, since npm
     may still be writing it, and nothing is taken from it.
   - A repair that did not work is written down, and ccx does not run npm for

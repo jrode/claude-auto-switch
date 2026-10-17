@@ -213,6 +213,10 @@ function ownedHandle(lockFile: string): LockHandle {
     release: () => {
       if (released) return;
       released = true;
+      // Only while it still names this process: a holder that ran past the
+      // longest hold may have had its lock taken over, and the lock it would
+      // remove is then the new holder's.
+      if (lockHolder(lockFile) !== process.pid) return;
       try {
         rmSync(lockFile, { force: true });
       } catch {

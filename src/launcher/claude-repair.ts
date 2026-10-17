@@ -7,8 +7,11 @@ import type { ClaudeInvoker } from '../invoker.js';
 import { RealClaudeError } from '../util/errors.js';
 import { writeJsonFile } from '../util/fs-json.js';
 import {
+  aboutTime,
   cannotFindClaude,
+  CLOCK_AHEAD_MS,
   findRealClaude,
+  SETTLED_MS,
   inspectNpmInstall,
   isWindowsProgram,
   nodeClaudeFs,
@@ -96,8 +99,31 @@ export interface RepairMemory {
 export interface RepairOptions {
   /** Repair only this install folder: the one a launch is about to start. */
   only?: string;
-  /** Repair what an earlier repair failed on too, as `ccx doctor --fix` asks. */
+  /**
+   * Repair what an earlier repair failed on, and what npm may still be
+   * writing, as `ccx doctor --fix` asks.
+   */
   force?: boolean;
+  /**
+   * Claude starts anyway (from the platform package): say what is done, not
+   * why something is not. Doctor reports those.
+   */
+  quiet?: boolean;
+}
+
+/**
+ * How long a failed repair holds off the next automatic one while the install
+ * stays as it was. A failure that cannot be fixed by trying again (npm leaving
+ * no program) then costs one npm run an hour of use, where a passing one (no
+ * network, the registry, npm's own timeout) clears within the hour, without
+ * waiting for anyone to run ccx doctor --fix.
+ */
+export const FAILED_REPAIR_HOLD_MS = 60 * 60_000;
+
+/** Whether a failed repair still holds off the next one, by the time it was written. */
+function stillHolds(failed: FailedRepair, now: number): boolean {
+  const age = now - Date.parse(failed.at);
+  return age >= -CLOCK_AHEAD_MS && age < FAILED_REPAIR_HOLD_MS;
 }
 
 const PACKAGE = '@anthropic-ai/claude-code';
@@ -137,7 +163,7 @@ export function resolveClaudeForLaunch(deps: LaunchDeps = {}): ClaudeInvoker {
       ? search.broken[0]
       : undefined;
   if (!target) return launchable(search, platform, []);
-  const failures = repairClaudeInstalls(withFs, { only: target.folder });
+  const failures = repairClaudeInstalls(withFs, { only: target.folder, quiet: search.fromPlatformPackage });
   return launchable(findRealClaude(withFs), platform, failures);
 }
 
@@ -159,7 +185,7 @@ export function repairClaudeInstalls(deps: LaunchDeps, options: RepairOptions = 
   const fs = deps.fs ?? nodeRepairFs;
   const say = deps.say ?? ((line: string) => void process.stderr.write(`${line}\n`));
   const notRepaired = (reason: string): string[] => {
-    say(`ccx: did not repair Claude Code: ${reason}`);
+    if (!options.quiet) say(`ccx: did not repair Claude Code: ${reason}`);
     return [reason];
   };
   let lockFile: string;
@@ -193,7 +219,7 @@ export function repairClaudeInstalls(deps: LaunchDeps, options: RepairOptions = 
     try {
       // Looked at again under the lock: the ccx that held it may have repaired it.
       const install = findRealClaude({ ...deps, fs }).broken.find((found) => same(found.folder, folder));
-      if (install) failures.push(...repairOne(install, { ...deps, fs, say }, memory, options.force === true));
+      if (install) failures.push(...repairOne(install, { ...deps, fs, say }, memory, options));
     } finally {
       handle.release();
     }
@@ -201,22 +227,29 @@ export function repairClaudeInstalls(deps: LaunchDeps, options: RepairOptions = 
   return failures;
 }
 
-function repairOne(install: BrokenNpmInstall, deps: LaunchDeps & RepairDeps, memory: RepairMemory, force: boolean): string[] {
+function repairOne(install: BrokenNpmInstall, deps: LaunchDeps & RepairDeps, memory: RepairMemory, options: RepairOptions): string[] {
   const fs = deps.fs ?? nodeRepairFs;
+  const force = options.force === true;
   const notRepaired = (reason: string): string[] => {
-    deps.say(`ccx: did not repair Claude Code: ${reason}`);
+    if (!options.quiet) deps.say(`ccx: did not repair Claude Code: ${reason}`);
     return [reason];
   };
   // Asked first: what a failed repair of ccx's own left behind is recent too,
   // and is not npm at work.
   const remembered = memory.get(install.folder);
-  if (!force && remembered && remembered.stamp === stampOf(install, fs)) {
+  if (!force && remembered && stillHolds(remembered, (deps.now ?? Date.now)()) && remembered.stamp === stampOf(install, fs)) {
     return notRepaired(
-      `ccx tried on ${remembered.at} and could not (${remembered.reason}); it tries again once the install changes, or when you run ccx doctor --fix`,
+      `ccx tried on ${remembered.at} and could not (${remembered.reason}); it tries again once the install changes or an hour has passed, or when you run ccx doctor --fix`,
     );
   }
   if (install.busy) {
-    return notRepaired(`${install.folder} changed in the last few minutes, so npm may still be installing it; ccx leaves it alone until it settles`);
+    const why = `${install.folder} changed moments ago, so npm may still be installing it`;
+    if (!force) {
+      return notRepaired(
+        `${why}; ccx leaves it alone until nothing in it has changed for ${SETTLED_MS / 60_000} minutes, ${aboutTime(install.settlesInMs ?? 0)} more`,
+      );
+    }
+    deps.say(`ccx: ${why}; repairing it anyway, as ccx doctor --fix asks`);
   }
   const result = install.platformProgram ? placeProgram(install, deps) : reinstallWithNpm(install, deps);
   // ccx's own changes are finished, so nothing here is still being written.

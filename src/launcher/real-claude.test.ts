@@ -331,7 +331,7 @@ describe('an install npm may still be writing (Windows)', () => {
   const NOW = Date.parse('2026-10-16T22:00:00Z');
   const SCOPE = `${PREFIX}\\node_modules\\@anthropic-ai`;
 
-  it('never takes a platform program that changed in the last few minutes, which may be half written', () => {
+  it('never takes a platform program that changed in the last half minute, which may be half written', () => {
     const fs = memoryWindowsFs(
       { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER, [NESTED]: WINDOWS_PROGRAM },
       { modified: { [NESTED]: NOW - 5_000 } },
@@ -345,12 +345,47 @@ describe('an install npm may still be writing (Windows)', () => {
   });
 
   it('counts a moved-aside folder npm is still working in as an update running', () => {
+    // Only the moved-aside folder changed, so the test depends on it being looked at.
+    const retired = `${SCOPE}\\.claude-code-Ab3dE9xQ`;
     const fs = memoryWindowsFs(
-      { [CMD]: NPM_CMD_SHIM, [`${SCOPE}\\.claude-code-Ab3dE9xQ\\package.json`]: PACKAGE_JSON },
-      { modified: { [SCOPE]: NOW - 60_000 } },
+      { [CMD]: NPM_CMD_SHIM, [`${retired}\\package.json`]: PACKAGE_JSON },
+      { modified: { [retired]: NOW - 60_000 } },
     );
     const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
     expect(search.broken[0]).toMatchObject({ state: 'folder-missing', busy: true });
+  });
+
+  it('starts Claude from a platform program left alone for half a minute, while the rest still settles', () => {
+    // Right after `npm i -g` with install scripts off: everything is new, and
+    // the platform program is whole, but nothing put it in place.
+    const fs = memoryWindowsFs(
+      { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER, [NESTED]: WINDOWS_PROGRAM },
+      { modified: { [SCOPE]: NOW - 20_000, [PKG]: NOW - 20_000, [BIN]: NOW - 20_000, [NESTED]: NOW - 45_000 } },
+    );
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.bin).toBe(NESTED);
+    expect(search.broken[0]).toMatchObject({ busy: true, settlesInMs: 160_000 });
+  });
+
+  it('believes no change time from a clock that was ahead', () => {
+    const later = NOW + 2 * 60 * 60_000;
+    const fs = memoryWindowsFs(
+      { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER, [NESTED]: WINDOWS_PROGRAM },
+      { modified: { [SCOPE]: later, [PKG]: later, [BIN]: later, [NESTED]: later } },
+    );
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.bin).toBe(NESTED);
+    expect(search.broken[0]?.busy).toBe(false);
+  });
+
+  it('says how long it holds off', () => {
+    const fs = memoryWindowsFs(
+      { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER },
+      { modified: { [SCOPE]: NOW - 60_000 } },
+    );
+    expect(() =>
+      resolveRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW }),
+    ).toThrow('changed for 3 minutes, about 2 minutes more');
   });
 
   it('takes the platform program once the install has settled', () => {

@@ -11,6 +11,7 @@ import {
   repairClaudeInstalls,
   resolveClaudeForLaunch,
   runNpm,
+  stampOf,
   takeRepairLock,
   LOCK_MAX_HOLD_MS,
   LOCK_WAIT_MS,
@@ -670,16 +671,64 @@ describe('when the repair is allowed to run', () => {
     expect(h.memory.all.size).toBe(0);
   });
 
-  it('never while npm may still be writing the install, and says so', () => {
+  it('never while npm may still be writing the install, and says how long it holds off', () => {
     const now = Date.parse('2026-10-16T22:00:00Z');
-    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }), {
+    const fs = memoryWindowsFs(missingInstall(), {
       modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 60_000 },
     });
     const h = harness(fs);
     const message = messageOf(() => resolveClaudeForLaunch({ ...h.deps, now: () => now }));
     expect(message).toContain('npm may still be installing it');
+    expect(message).toContain('about 2 minutes more');
     expect(fs.changes).toEqual([]);
     expect(h.npmCalls).toEqual([]);
+  });
+
+  it('starts Claude at once from a whole platform program while the rest settles, and says nothing of the repair it holds off', () => {
+    // Right after `npm i -g` with install scripts off: everything is new and
+    // the platform program is whole, but nothing has put it in place.
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }), {
+      modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 10_000, [BIN]: now - 10_000, [NESTED]: now - 40_000 },
+    });
+    const h = harness(fs);
+    expect(resolveClaudeForLaunch({ ...h.deps, now: () => now }).bin).toBe(NESTED);
+    expect(h.said).toEqual([]);
+    expect(fs.changes).toEqual([]);
+  });
+
+  it('with doctor --fix even while npm may still be writing the install, after saying so', () => {
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }), {
+      modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 60_000, [NESTED]: now - 60_000 },
+    });
+    const h = harness(fs);
+    expect(repairClaudeInstalls({ ...h.deps, now: () => now }, { force: true })).toEqual([]);
+    expect(fs.content(BIN)).toBe(WINDOWS_PROGRAM);
+    expect(h.said.some((line) => line.includes('repairing it anyway'))).toBe(true);
+  });
+
+  it('by itself again an hour after a repair failed, though the install is as it was', () => {
+    // No network, the registry or npm's timeout: trying again later can work.
+    const start = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(missingInstall());
+    const h = harness(fs, { npm: () => ({ status: 1 }) });
+    const at = (ms: number): LaunchDeps => ({ ...h.deps, now: () => ms, run: { repairTried: false } });
+    messageOf(() => resolveClaudeForLaunch(at(start)));
+    messageOf(() => resolveClaudeForLaunch(at(start + 30 * 60_000)));
+    expect(h.npmCalls).toHaveLength(1);
+    messageOf(() => resolveClaudeForLaunch(at(start + 61 * 60_000)));
+    expect(h.npmCalls).toHaveLength(2);
+  });
+
+  it('says nothing at a launch that starts from the platform package about a repair that failed before', () => {
+    // Doctor reports it; saying it on every launch of a Claude that starts is noise.
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }));
+    const h = harness(fs);
+    const failed = { stamp: stampOf(brokenAt(fs), fs), version: '2.1.302', at: new Date().toISOString(), reason: 'it was in use' };
+    h.memory.set(PKG, failed);
+    expect(resolveClaudeForLaunch(h.deps).bin).toBe(NESTED);
+    expect(h.said).toEqual([]);
   });
 
   it('never in a worker, which stops at once, naming ccx doctor --fix', () => {

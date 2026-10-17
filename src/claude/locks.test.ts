@@ -72,6 +72,16 @@ describe('acquireOwnedLock', () => {
     h.release(); // idempotent
   });
 
+  it('leaves, on release, a lock another process has taken over', () => {
+    // A holder that ran past the longest hold can have its lock taken over;
+    // removing the lock then would remove the new holder's.
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000 });
+    writeFileSync(lock, '4242', 'utf8');
+    h.release();
+    expect(owner(lock)).toBe('4242');
+  });
+
   it('never takes over a running holder for age alone', () => {
     // A holder working synchronously cannot refresh its lock, so the lock's age
     // says nothing about whether it is still at work.

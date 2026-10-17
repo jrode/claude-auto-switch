@@ -137,8 +137,10 @@ export interface BrokenNpmInstall {
   platformProgram: string | null;
   /** From its package.json, or the one npm left in the folder it moved aside; null when neither names one. */
   version: string | null;
-  /** Changed in the last few minutes, so npm may still be installing it: nothing is taken from it or done to it. */
+  /** Changed in the last few minutes, so npm may still be installing it, and ccx does not repair it. */
   busy: boolean;
+  /** While busy: how long until it has gone unchanged for SETTLED_MS. */
+  settlesInMs?: number;
 }
 
 export interface ClaudeSearch {
@@ -235,14 +237,21 @@ export function describeBrokenInstall(install: BrokenNpmInstall): string {
   return `${install.folder}: the folder is not there, though npm's claude shims in ${install.prefix} still point into it`;
 }
 
+/** What ccx waits for on an install npm may still be writing, and for how long. */
+export function settlingLine(broken: BrokenNpmInstall[]): string {
+  const longest = Math.max(0, ...broken.map((install) => (install.busy ? (install.settlesInMs ?? 0) : 0)));
+  return (
+    `It changed moments ago, so npm may still be installing it. ccx leaves it alone until nothing in it has ` +
+    `changed for ${SETTLED_MS / 60_000} minutes, ${aboutTime(longest)} more; ccx doctor --fix repairs it now.`
+  );
+}
+
 function brokenInstallMessage(broken: BrokenNpmInstall[], repairFailures: string[]): string {
   return [
     "Claude Code's npm install is missing its program, so Claude cannot start:",
     ...broken.map((install) => `  ${describeBrokenInstall(install)}`),
     'This usually happens when an update ran while Claude was open.',
-    ...(broken.some((install) => install.busy)
-      ? ['It changed in the last few minutes, so npm may still be installing it; try again once that has finished.']
-      : []),
+    ...(broken.some((install) => install.busy) ? [settlingLine(broken)] : []),
     ...(repairFailures.length > 0
       ? ['', 'ccx tried to repair it and could not:', ...repairFailures.map((reason) => `  ${reason}`)]
       : []),
@@ -360,11 +369,34 @@ function brokenNpmInstalls(candidates: string[], fs: ClaudeFs, arch: string, now
 }
 
 /**
- * How long an install must have gone unchanged before ccx takes anything from
- * it or repairs it. npm writes the placeholder, then streams the platform
- * package's program of about 290 MB, and a half-written one already starts "MZ".
+ * How long an install must have gone unchanged before ccx repairs it. npm
+ * writes the placeholder, then streams the platform package's program of about
+ * 290 MB, then runs the setup step that puts it in place.
  */
 export const SETTLED_MS = 3 * 60_000;
+
+/**
+ * How long the platform program itself must have gone unchanged before ccx
+ * starts Claude from it. npm writes it as fast as the download arrives, so a
+ * file still being written changes many times a second; half a minute without
+ * a change is a stall far longer than a working download has, and short enough
+ * that someone who just ran npm with install scripts off barely waits.
+ */
+export const PROGRAM_QUIET_MS = 30_000;
+
+/**
+ * How far ahead of the clock a change time is believed. Times on one machine
+ * come from one clock, so one ahead by more than a moment was written while
+ * the clock was set wrong, and says nothing about whether npm is at work now.
+ */
+export const CLOCK_AHEAD_MS = 2_000;
+
+/** A wait, in words: "about 40 seconds", "about 3 minutes". */
+export function aboutTime(ms: number): string {
+  const seconds = Math.max(1, Math.ceil(ms / 1000));
+  if (seconds < 90) return `about ${seconds} second${seconds === 1 ? '' : 's'}`;
+  return `about ${Math.ceil(seconds / 60)} minutes`;
+}
 
 export interface InspectOptions {
   now?: number;
@@ -391,13 +423,21 @@ export function inspectNpmInstall(
   const scope = p.dirname(folder);
   const now = options.now ?? Date.now();
   const settledMs = options.settledMs ?? SETTLED_MS;
+  /** How long ago a file changed, when that was within `withinMs`; null otherwise. */
+  const changedWithin = (file: string, withinMs: number): number | null => {
+    const at = fs.modifiedAt(file);
+    if (at === null) return null;
+    const age = now - at;
+    return age >= -CLOCK_AHEAD_MS && age < withinMs ? Math.max(0, age) : null;
+  };
   // What npm touches while it replaces the package: the scope folder it renames
   // the old package within, the folder it moves aside, and the new package.
-  const changing = (files: string[]): boolean =>
-    [scope, ...retiredFolders(folder, fs), ...files].some((file) => {
-      const at = fs.modifiedAt(file);
-      return at !== null && now - at < settledMs;
-    });
+  const settling = (files: string[]): { busy: boolean; settlesInMs?: number } => {
+    const ages = [scope, ...retiredFolders(folder, fs), ...files]
+      .map((file) => changedWithin(file, settledMs))
+      .filter((age): age is number => age !== null);
+    return ages.length === 0 ? { busy: false } : { busy: true, settlesInMs: settledMs - Math.min(...ages) };
+  };
 
   if (!fs.isDirectory(folder)) {
     if (!shimsPointInto(prefix, fs)) return null;
@@ -409,7 +449,7 @@ export function inspectNpmInstall(
       state: 'folder-missing',
       platformProgram: null,
       version: leftoverVersion(folder, fs),
-      busy: changing([]),
+      ...settling([]),
     };
   }
   // Classed by what the package says it runs, never by the absence of a file
@@ -422,15 +462,20 @@ export function inspectNpmInstall(
       : null;
   if (!state) return null;
   const places = platformPrograms(folder, arch);
-  const busy = changing([folder, program, ...places]);
+  const quietMs = Math.min(settledMs, PROGRAM_QUIET_MS);
   return {
     folder,
     prefix,
     program,
     state,
-    platformProgram: busy ? null : (places.find((exe) => fs.isFile(exe) && isWindowsProgram(fs, exe) === true) ?? null),
+    // Judged on its own: complete once npm has stopped writing it, even while
+    // the rest of the install is still settling.
+    platformProgram:
+      places.find(
+        (exe) => fs.isFile(exe) && isWindowsProgram(fs, exe) === true && changedWithin(exe, quietMs) === null,
+      ) ?? null,
     version: versionOf(folder, fs),
-    busy,
+    ...settling([folder, program, ...places]),
   };
 }
 
