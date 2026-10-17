@@ -131,7 +131,9 @@ interface GitPlace {
  */
 export function auditGitSafety(context: CliContext, deps: DoctorDeps = {}): DoctorCheck {
   const tracked = deps.gitTracked ?? gitTrackedUnder;
-  const settings = configFilePath(context.ctx);
+  // Paths here keep their case: where a filesystem tells `CONFIG.JSON` from
+  // `config.json`, only the second is ccx's settings.
+  const settings = path.resolve(configFilePath(context.ctx));
   const places: GitPlace[] = ccxFolders(context).map((folder, i) => ({
     folder,
     name: `${i === 0 ? "ccx's folder" : "ccx's profile folder"} ${folder}`,
@@ -150,7 +152,7 @@ export function auditGitSafety(context: CliContext, deps: DoctorDeps = {}): Doct
   const counts = (place: GitPlace, file: string): boolean => {
     const name = path.posix.basename(file);
     if (place.loginsOnly) return LOGIN_FILES.has(name);
-    return name !== '.gitignore' && !samePath(path.join(place.folder, file), settings);
+    return name !== '.gitignore' && path.resolve(place.folder, file) !== settings;
   };
 
   // Several places can reach one file (the working repository can be the one
@@ -168,7 +170,7 @@ export function auditGitSafety(context: CliContext, deps: DoctorDeps = {}): Doct
     }
     const base = realFolder(place.folder);
     const files = inGit.files.filter((file) => {
-      const key = pathKey(path.join(base, file));
+      const key = path.resolve(base, file);
       if (!counts(place, file) || reported.has(key)) return false;
       reported.add(key);
       return true;
@@ -199,7 +201,9 @@ function ccxFolders(context: CliContext): string[] {
   } catch {
     /* an unreadable account list is the accounts check's to report */
   }
-  return folders.filter((folder, i) => folders.findIndex((other) => samePath(folder, other)) === i);
+  return folders.filter(
+    (folder, i) => folders.findIndex((other) => path.resolve(other) === path.resolve(folder)) === i,
+  );
 }
 
 function describeTracked(place: GitPlace, repo: string, files: string[]): string {
@@ -235,8 +239,10 @@ function realFolder(folder: string): string {
 }
 
 /**
- * Variables that point git at a repository chosen elsewhere, as a git hook
- * exports them, instead of the one the folder is in.
+ * Variables that change which repository git finds for a folder: those a git
+ * hook exports to point at its own, and the ceiling people with their home
+ * folder in git set so other folders do not look part of it, which would
+ * hide exactly that repository here.
  */
 const REPOSITORY_VARIABLES = [
   'GIT_DIR',
@@ -245,6 +251,7 @@ const REPOSITORY_VARIABLES = [
   'GIT_COMMON_DIR',
   'GIT_OBJECT_DIRECTORY',
   'GIT_PREFIX',
+  'GIT_CEILING_DIRECTORIES',
 ];
 
 /**
@@ -559,12 +566,9 @@ export function auditStatusline(context: CliContext): DoctorCheck {
   };
 }
 
-function pathKey(p: string): string {
-  return path.resolve(p).replace(/\\/g, '/').toLowerCase();
-}
-
 function samePath(a: string, b: string): boolean {
-  return pathKey(a) === pathKey(b);
+  const norm = (p: string) => path.resolve(p).replace(/\\/g, '/').toLowerCase();
+  return norm(a) === norm(b);
 }
 
 /**

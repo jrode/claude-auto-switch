@@ -264,6 +264,43 @@ describe('git safety', () => {
     });
   });
 
+  it("tells files apart by case, so only ccx's own config.json is let through", async () => {
+    // Index entries alone, so a filesystem that ignores case can hold both names.
+    const home = repoTracking([]);
+    mkdirSync(path.join(home, '.claude-auto-switch'));
+    const blob = git(home, ['hash-object', '-w', '--stdin']).trim();
+    const entries = ['CONFIG.JSON', 'Notes.json', 'config.json', 'notes.json'].map(
+      (name) => `100644 ${blob}\t.claude-auto-switch/${name}`,
+    );
+    git(home, ['update-index', '--add', '--index-info'], `${entries.join('\n')}\n`);
+    expect((await gitSafety(machine(home))).detail).toContain(
+      'which tracks 3 of its files: CONFIG.JSON, Notes.json, notes.json',
+    );
+  });
+
+  // Only Linux's filesystem holds two folders whose names differ only in case.
+  it.runIf(process.platform === 'linux')(
+    "asks about a profiles folder whose name differs from ccx's folder only in case",
+    async () => {
+      const home = repoTracking(['.CLAUDE-AUTO-SWITCH/work/.credentials.json']);
+      const context = machine(home);
+      context.config = { ...context.config, profilesDir: path.join(home, '.CLAUDE-AUTO-SWITCH') };
+      expect((await gitSafety(context)).detail).toContain('tracks 1 of its files: work/.credentials.json');
+    },
+  );
+
+  it('finds the repository of a home folder kept in git, past a ceiling that hides it', async () => {
+    const home = repoTracking(['.claude-auto-switch/accounts.json']);
+    const before = process.env.GIT_CEILING_DIRECTORIES;
+    process.env.GIT_CEILING_DIRECTORIES = real(home);
+    try {
+      expect(await gitSafety(machine(home))).toMatchObject({ ok: false });
+    } finally {
+      if (before === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+      else process.env.GIT_CEILING_DIRECTORIES = before;
+    }
+  });
+
   it("asks about each folder's own repository while a git hook's variables point elsewhere", async () => {
     const other = repoTracking(['backup/.credentials.json']);
     const before = process.env.GIT_DIR;
