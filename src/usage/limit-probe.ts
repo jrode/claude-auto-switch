@@ -12,6 +12,8 @@ import { sha256Fingerprint } from '../util/fingerprint.js';
  * Rendered cap text on screen is never trusted directly (a resumed conversation and the
  * resume picker replay old cap messages, and code can mention rate limits); this
  * endpoint is the ground truth used to confirm or refute a cap before switching.
+ * When it cannot answer, only Claude's own record of the refused turn stands
+ * in for it (session/refused-turn).
  */
 
 export type LimitVerdict = 'limited' | 'allowed' | 'unknown';

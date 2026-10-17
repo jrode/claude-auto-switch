@@ -1,6 +1,7 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { invokerArgs, type ClaudeInvoker } from '../invoker.js';
 import { createRefusalFollower, type Refusal } from '../session/transcript.js';
+import type { RecordedRefusal } from '../session/refused-turn.js';
 import { gateRefusals, type RefusalGate } from '../session/refusal-gate.js';
 import { matchesCapText, resetAtIn } from './cap-detect.js';
 import { scrubHostEnv } from './child-env.js';
@@ -39,8 +40,11 @@ export interface HeadlessSessionOptions {
   switchWatch?: (restartBlocker: () => RestartBlocker | null) => string | null;
   /** As runPtySession's: kept running for as long as Claude is (leases, logins). */
   onTick?: () => void;
-  /** Resolves true only when the account is really out (asked of the account). */
-  verifyCap?: (renderedText: string) => Promise<boolean>;
+  /**
+   * Resolves true only when the account is really out (asked of the account).
+   * `recorded`: the refused turn itself, when it was read from the record.
+   */
+  verifyCap?: (renderedText: string, recorded?: RecordedRefusal) => Promise<boolean>;
   /** As runPtySession's: resolves true only when the login is confirmed finished. */
   verifySignedOut?: () => Promise<boolean>;
   ignoreLimits?: boolean;
@@ -254,7 +258,7 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
   /** The confirmation in flight; the outcome waits for it, within VERIFY_WAIT_MS. */
   let verifying: Promise<void> | null = null;
   /** A refusal seen while another was being confirmed: asked about next, not dropped. */
-  let held: { text: string; hit: Hit } | null = null;
+  let held: { text: string; hit: Hit; refusal?: Refusal } | null = null;
   /** What Claude showed when its login was turned away, once confirmed finished; and a check in flight. */
   let signedOut: string | null = null;
   let checkingLogin: Promise<void> | null = null;
@@ -272,13 +276,17 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
    * new question is asked once the worker is being ended; one already asked
    * still counts when it comes back.
    */
-  const evidence = (text: string, hit: Hit): void => {
+  const evidence = (text: string, hit: Hit, refusal?: Refusal): void => {
     if (options.ignoreLimits || capped || switchTo || interruptedBy !== null) return;
     if (verifying) {
-      held = { text, hit };
+      held = { text, hit, ...(refusal ? { refusal } : {}) };
       return;
     }
-    const check = options.verifyCap ? options.verifyCap(text) : Promise.resolve(true);
+    // Nobody types at a headless Claude, so no prompt can come after a refusal.
+    const recorded: RecordedRefusal | undefined = refusal
+      ? { refusal, launchedAt: startedAt, promptAt: 0 }
+      : undefined;
+    const check = options.verifyCap ? options.verifyCap(text, recorded) : Promise.resolve(true);
     verifying = check
       .then((confirmed) => {
         if (confirmed && !switchTo) {
@@ -293,7 +301,7 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
         verifying = null;
         const next = held;
         held = null;
-        if (next) evidence(next.text, next.hit);
+        if (next) evidence(next.text, next.hit, next.refusal);
       });
   };
 
@@ -339,7 +347,7 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
       // own next request, which is the refusal the run ends on.
       if (refusal.sidechain) continue;
       const { text, hit } = hitOf(refusal);
-      evidence(text, hit);
+      evidence(text, hit, refusal);
     }
   };
 

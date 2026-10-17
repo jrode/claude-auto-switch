@@ -7,6 +7,7 @@ import {
   clearAccount,
   modelOnlyLimit,
   activeModelCaps,
+  accountCapEnd,
 } from './ledger.js';
 import type { Ledger } from './ledger.schema.js';
 
@@ -174,5 +175,25 @@ describe('limits scoped to one model', () => {
     const ledger = markCapped({ caps: [] }, { account: 'a', now, resetAt: now - 1, model: 'Fable' });
     expect(modelOnlyLimit(ledger, now)).toBeNull();
     expect(activeModelCaps(ledger, now)).toEqual([]);
+  });
+});
+
+describe('when an account-wide limit already recorded ends', () => {
+  it('is the end of the active one for that account', () => {
+    const l = markCapped(markCapped(empty, { account: 'a', now: 1000, resetAt: 50_000 }), {
+      account: 'b',
+      now: 1000,
+      resetAt: 9_000,
+    });
+    expect(accountCapEnd(l, 'a', 2000)).toBe(50_000);
+    expect(accountCapEnd(l, 'b', 2000)).toBe(9_000);
+  });
+
+  it('is nothing once it has passed, for a limit on one model, or for an account with none', () => {
+    const l = markCapped(empty, { account: 'a', now: 1000, resetAt: 50_000 });
+    expect(accountCapEnd(l, 'a', 50_001)).toBeUndefined();
+    expect(accountCapEnd(l, 'other', 2000)).toBeUndefined();
+    const fable = markCapped(empty, { account: 'a', now: 1000, resetAt: 50_000, model: 'Fable' });
+    expect(accountCapEnd(fable, 'a', 2000)).toBeUndefined();
   });
 });

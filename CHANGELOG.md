@@ -4,6 +4,38 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.9]
+
+### Fixed
+
+- **A session that hits a usage limit moves to another account even when
+  ccx's own usage check is turned away.** ccx confirms a limit with
+  Anthropic's usage endpoint before it moves a session. That endpoint has a
+  small budget shared by every session on the machine, so it answers 429
+  exactly when many sessions are busy, which is also when limits are met. ccx
+  then treated the limit as unproven and left the session at Claude's "wait or
+  upgrade" menu, although other accounts had room (#140). Now:
+  - When the usage check cannot answer (a 429, another error, or no answer in
+    time), Claude's own record of the refused turn confirms the limit, and the
+    session moves in place as it does for any confirmed limit. A worker moves
+    on to the next account.
+  - Only a refusal that speaks for the turn in front of the session counts:
+    one recorded with the API's code for an account out of its usage limit
+    (`usage_limit_reached`, which Claude writes from 2.1.292 on), after this
+    Claude started, after the last prompt typed at it, and at least 30 seconds
+    after ccx last changed the login under it. A limit on one model carries no
+    such code and still waits for the usage check, since only the check can
+    say how wide it is.
+  - Words on the screen alone still never move a session.
+  - When the endpoint asks ccx to back off, ccx waits as long as it asks, up to
+    4 seconds from the start of the check, and asks once more.
+  - Nothing measured the window of a limit confirmed this way, so it keeps the
+    end another session's check already recorded for the account, and
+    otherwise lasts the configured backoff.
+  - `ccx history` says what confirmed the limit, or what the check is still
+    waiting on, for example "the usage check could not answer (status 429),
+    and Claude has not recorded the turn as refused".
+
 ## [2.6.7]
 
 ### Fixed

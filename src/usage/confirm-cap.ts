@@ -3,6 +3,7 @@ import { capProbeCredential } from './cap-probe-credential.js';
 import { normalizeModel } from './model-preference.js';
 import { isUsableCredential, CREDENTIALS_FILE } from '../accounts/credential-vault.js';
 import { probeLimit, type LimitProbeResult } from './limit-probe.js';
+import type { RefusalProof } from '../session/refused-turn.js';
 
 /**
  * Deciding whether limit-looking text has actually earned a cap, and how wide.
@@ -43,6 +44,14 @@ export interface CapDecision {
    * this file refuses is a case where the API positively reported room.
    */
   unverified?: true;
+  /** The usage check gave no answer: turned away, unreachable, or out of time. */
+  unanswered?: true;
+  /** Proved by Claude's own record of the refused turn, the usage check having given no answer. */
+  byRefusal?: true;
+  /** How many times the usage check was asked, when it was more than once. */
+  asks?: number;
+  /** A back-off the usage endpoint asked for that was longer than a check waits, in ms. */
+  backOffMs?: number;
 }
 
 export interface ConfirmCapDeps {
@@ -64,6 +73,14 @@ export interface ConfirmCapDeps {
    * refers to.
    */
   modelInUse?: string | null;
+  /**
+   * Claude's own record of the refused turn that started this check, judged
+   * (session/refused-turn). Counts only when the usage check gives no answer,
+   * and then only when it proves the limit on its own.
+   */
+  refusal?: RefusalProof;
+  /** Injected in tests: how a back-off the usage endpoint asks for is waited out. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -71,7 +88,8 @@ export interface ConfirmCapDeps {
  *
  * Refuses on anything short of a confirmed limit. An unreachable endpoint, a
  * missing token, a 429: all of those mean "not proven", and not proven must
- * never become a cap. A session that keeps hitting a real limit will trigger
+ * never become a cap, unless Claude's own record of the refused turn proves it
+ * (`deps.refusal`). A session that keeps hitting a real limit will trigger
  * this again; a healthy account wrongly capped stays broken for hours.
  */
 export async function confirmCap(
@@ -82,10 +100,78 @@ export async function confirmCap(
   const probe = deps.probe ?? probeLimit;
   const credentials = capProbeCredential(accountDir, deps.sessionCredentials ?? '');
   if (!credentials) return { limited: false, detail: 'no credential to ask' };
-  return decideFromProbe(
-    await probeSafely(probe, credentials, renderedText),
-    deps.modelInUse ?? null,
-  );
+  return decide(await askUsage(probe, credentials, renderedText, deps.sleep ?? pause), deps);
+}
+
+/**
+ * How long one check waits, from its start, for a back-off the usage endpoint
+ * asks for before asking it again. With the second ask's own limit and the
+ * renewal a confirmed limit may add, a check stays within the 10 s a session
+ * gives it (CHECK_BUDGET_MS in commands/session).
+ */
+const BACK_OFF_WAIT_MS = 4_000;
+/** How long the second ask has to answer. */
+const SECOND_ASK_MS = 3_000;
+
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+interface Asked {
+  result: LimitProbeResult;
+  asks: number;
+  /** The back-off the endpoint asked for, when it was too long to wait out. */
+  backOffMs?: number;
+}
+
+/**
+ * Ask the usage endpoint, and ask again after the back-off it asks for when
+ * that fits in BACK_OFF_WAIT_MS. Asking sooner than it says only spends its
+ * budget, which every session on the machine shares, again.
+ */
+async function askUsage(
+  probe: (credentialsFile: string, renderedText: string) => Promise<LimitProbeResult>,
+  credentials: string,
+  renderedText: string,
+  sleep: (ms: number) => Promise<void>,
+): Promise<Asked> {
+  const startedAt = Date.now();
+  const first = await probeSafely(probe, credentials, renderedText);
+  const wait = first.verdict === 'unknown' ? first.retryAfterMs : undefined;
+  if (wait === undefined) return { result: first, asks: 1 };
+  if (Date.now() - startedAt + wait > BACK_OFF_WAIT_MS) {
+    return { result: first, asks: 1, backOffMs: wait };
+  }
+  await sleep(wait);
+  const second = await answerWithin(probeSafely(probe, credentials, renderedText), SECOND_ASK_MS);
+  return { result: second, asks: 2 };
+}
+
+/** What `asked` comes to, or no answer once `ms` have passed first. */
+function answerWithin(asked: Promise<LimitProbeResult>, ms: number): Promise<LimitProbeResult> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<LimitProbeResult>((resolve) => {
+    const noAnswer: LimitProbeResult = { verdict: 'unknown', detail: `no answer in ${ms / 1000} s` };
+    timer = setTimeout(() => resolve(noAnswer), ms);
+    timer.unref?.();
+  });
+  return Promise.race([asked, late]).finally(() => clearTimeout(timer));
+}
+
+/** What the usage check said, in words, and how it was asked when that was more than once. */
+export function usageAnswer(decision: CapDecision): string {
+  const said = decision.detail ?? 'no answer';
+  if (decision.backOffMs !== undefined) {
+    return `${said}; it asked to wait ${Math.round(decision.backOffMs / 100) / 10} s, longer than a check waits`;
+  }
+  return decision.asks !== undefined ? `${said}, asked ${decision.asks} times` : said;
+}
+
+/** The decision from what the usage check said, and how it was asked. */
+function decide(asked: Asked, deps: ConfirmCapDeps): CapDecision {
+  return {
+    ...decideFromProbe(asked.result, deps.modelInUse ?? null, deps.refusal),
+    ...(asked.asks > 1 ? { asks: asked.asks } : {}),
+    ...(asked.backOffMs !== undefined ? { backOffMs: asked.backOffMs } : {}),
+  };
 }
 
 /**
@@ -148,15 +234,26 @@ export async function confirmSessionCap(
         : null;
   if (!credentials) return { limited: false, detail: 'no credential to ask', askedOf };
   return {
-    ...decideFromProbe(
-      await probeSafely(probe, credentials, renderedText),
-      deps.modelInUse ?? null,
-    ),
+    ...decide(await askUsage(probe, credentials, renderedText, deps.sleep ?? pause), deps),
     askedOf,
   };
 }
 
-function decideFromProbe(result: LimitProbeResult, modelInUse: string | null): CapDecision {
+function decideFromProbe(
+  result: LimitProbeResult,
+  modelInUse: string | null,
+  refusal: RefusalProof | undefined,
+): CapDecision {
+  if (result.verdict === 'unknown') {
+    // Account-wide, as the refusal's own code says, and with no window, since
+    // nothing measured one.
+    return {
+      limited: refusal?.proves === true,
+      unanswered: true,
+      ...(refusal?.proves === true ? { byRefusal: true as const } : {}),
+      detail: result.detail ?? result.verdict,
+    };
+  }
   if (result.verdict !== 'limited') {
     return { limited: false, detail: result.detail ?? result.verdict };
   }

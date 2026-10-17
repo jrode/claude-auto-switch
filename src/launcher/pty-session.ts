@@ -4,6 +4,7 @@ import type { IPty } from 'node-pty';
 import { nodePty } from '../util/native-pty.js';
 import { matchesCapText, resetAtIn } from './cap-detect.js';
 import { createRefusalFollower, type Refusal } from '../session/transcript.js';
+import type { RecordedRefusal } from '../session/refused-turn.js';
 import { gateRefusals, type RefusalGate } from '../session/refusal-gate.js';
 import { invokerArgs, type ClaudeInvoker } from '../invoker.js';
 import { writeSecretFile } from '../util/secret-file.js';
@@ -55,6 +56,8 @@ export type CarryOnEvent =
   | { kind: 'relaunch'; why: string };
 
 type Hit = { reason?: string; resetAt?: number };
+/** A refused turn as the checks take it: its words, and its entry in the record when it came from there. */
+type Evidence = { text: string; hit: Hit; refusal?: Refusal };
 
 /**
  * Why Claude cannot be ended now without cutting something off. `silent`:
@@ -102,8 +105,12 @@ export interface PtySessionOptions {
    * alone is untrustworthy: resuming a conversation REPLAYS history,
    * including old cap messages, and code on screen can mention rate limits.
    * When absent, a text match is trusted as-is (legacy behavior).
+   *
+   * `recorded`: the refused turn itself, when the conversation's record is
+   * where it was seen, which the check may take as proof when the API cannot
+   * answer. Absent for words on the screen.
    */
-  verifyCap?: (renderedText: string) => Promise<boolean>;
+  verifyCap?: (renderedText: string, recorded?: RecordedRefusal) => Promise<boolean>;
   /**
    * Called when the conversation's record says a turn was refused because the
    * login no longer works ("Please run /login"); resolves true ONLY when the
@@ -238,7 +245,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
      * the only surviving record of it. Without this the exit-time probe reads an
      * empty buffer and the session resolves "ok" on a real limit.
      */
-    let unprobed: { text: string; hit: Hit } | null = null;
+    let unprobed: Evidence | null = null;
     /**
      * A confirmed account limit waiting for the grace period to decide seamless
      * relief vs restart (see the deferral where this is set). Cleared by
@@ -374,13 +381,17 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
     };
 
     /** A refusal as evidence: Claude's own codes, and the wording for the checks that read it. */
-    const hitOf = (refusal: Refusal): { text: string; hit: Hit } => {
+    const hitOf = (refusal: Refusal): Evidence => {
       const resetAt = resetAtIn(refusal.text);
       return {
         text: refusal.text,
         hit: { reason: refusal.apiError ?? refusal.error, ...(resetAt !== undefined ? { resetAt } : {}) },
+        refusal,
       };
     };
+    /** A refusal as the check is given it, with when this Claude started and was last typed at. */
+    const recordedOf = (refusal: Refusal | undefined): RecordedRefusal | undefined =>
+      refusal ? { refusal, launchedAt: startedAt, promptAt: lastPromptAt } : undefined;
 
     /**
      * Hand on each turn the conversation's record says was refused, once. This
@@ -404,7 +415,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
       if (options.ignoreLimits) return;
       for (const refusal of seen.refusals) {
         const { text, hit } = hitOf(refusal);
-        onLimitEvidence(hit, text, refusal.sidechain);
+        onLimitEvidence(hit, text, refusal.sidechain, refusal);
       }
     };
 
@@ -752,7 +763,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
      * toward "this session is stuck" nor is kept for the exit path, and when
      * nothing can confirm it, it is dropped.
      */
-    const onLimitEvidence = (hit: Hit, snapshot: string, sidechain: boolean): void => {
+    const onLimitEvidence = (hit: Hit, snapshot: string, sidechain: boolean, refusal?: Refusal): void => {
       if (sidechain) {
         if (Date.now() < sidechainQuietUntil) return;
       } else {
@@ -780,7 +791,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
           return;
         }
       }
-      checkRefusal(hit, snapshot, sidechain);
+      checkRefusal(hit, snapshot, sidechain, refusal);
     };
 
     /**
@@ -794,14 +805,14 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
       mainRefusedMeanwhile = false;
       const held = unprobed;
       if (!held || exited || switching || cap.isSet()) return;
-      checkRefusal(held.hit, held.text, false);
+      checkRefusal(held.hit, held.text, false, held.refusal);
     };
 
     /** Ask the account about a refusal, or hold it while that cannot be done yet. */
-    const checkRefusal = (hit: Hit, snapshot: string, sidechain: boolean): void => {
+    const checkRefusal = (hit: Hit, snapshot: string, sidechain: boolean, refusal?: Refusal): void => {
       if (verifying || Date.now() < suppressUntil) {
         if (!sidechain) {
-          unprobed = { text: snapshot, hit };
+          unprobed = { text: snapshot, hit, ...(refusal ? { refusal } : {}) };
           if (verifying && lastHit?.sidechain) mainRefusedMeanwhile = true;
         }
         return;
@@ -824,7 +835,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
       // EXITS ITSELF on a session limit), the exit path awaits the verdict
       // instead of concluding "normal exit" and dropping the session.
       pendingVerify = options
-        .verifyCap(snapshot)
+        .verifyCap(snapshot, recordedOf(refusal))
         .then((confirmed) => {
           verifying = false;
           if (confirmed) {
@@ -854,7 +865,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
               // handler can still confirm it if the child dies first.
               if (options.onCapConfirmed && !exited) {
                 pendingCapRelief = { reason: hit.reason, resetAt: hit.resetAt, sidechain };
-                if (!sidechain) unprobed = { text: snapshot, hit };
+                if (!sidechain) unprobed = { text: snapshot, hit, ...(refusal ? { refusal } : {}) };
                 setTimeout(attemptCapRelief, RELIEF_GRACE_MS);
                 return confirmed;
               }
@@ -1051,9 +1062,10 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
             : final.refusals.filter((refusal) => !refusal.sidechain).pop();
           const recorded = lastRefusal ? hitOf(lastRefusal) : null;
           const live = recordReadable ? null : matchesCapText(window);
-          const pending = unprobed ?? recorded ?? (live ? { text: window, hit: live } : null);
+          const pending: Evidence | null = unprobed ?? recorded ?? (live ? { text: window, hit: live } : null);
           if (pending && options.verifyCap) {
-            void timeboxed(options.verifyCap(pending.text).catch(() => false)).then((confirmed) => {
+            const asked = options.verifyCap(pending.text, recordedOf(pending.refusal));
+            void timeboxed(asked.catch(() => false)).then((confirmed) => {
               if (confirmed) {
                 cap.confirm({ reason: pending.hit.reason, resetAt: pending.hit.resetAt });
               }

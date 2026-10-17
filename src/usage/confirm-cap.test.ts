@@ -1,8 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { confirmCap, confirmSessionCap } from './confirm-cap.js';
+import { confirmCap, confirmSessionCap, usageAnswer } from './confirm-cap.js';
 import type { LimitProbeResult } from './limit-probe.js';
 
 const probing = (result: LimitProbeResult, seen?: string[]) => (file: string) => {
@@ -400,5 +400,133 @@ describe('usage credits, which carry an account past its plan limit', () => {
     expect(decision.limited).toBe(true);
     expect(decision.model).toBe('Fable');
     expect(decision.resetAt).toBe(777);
+  });
+});
+
+describe('a usage check that gives no answer', () => {
+  /** A session folder signed in, so its own login is the one asked. */
+  function signedIn(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), 'cas-cap-unanswered-'));
+    writeFileSync(
+      path.join(dir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'tok', refreshToken: 'rt' } }),
+    );
+    return dir;
+  }
+  const TURNED_AWAY: LimitProbeResult = { verdict: 'unknown', detail: 'status 429' };
+  const proves = { proves: true, why: 'Claude recorded the turn as refused (usage_limit_reached)' };
+  const doesNot = { proves: false, why: 'the refusal was recorded before this Claude started' };
+  /** The usage endpoint's answers in turn, the last one standing; and how often it was asked. */
+  const answering = (...answers: LimitProbeResult[]) => {
+    let asked = 0;
+    return {
+      asked: () => asked,
+      probe: () => {
+        asked += 1;
+        return Promise.resolve(answers[Math.min(asked, answers.length) - 1] ?? TURNED_AWAY);
+      },
+    };
+  };
+  /** Back-offs waited out at once, and written down. */
+  const waits: number[] = [];
+  const sleep = (ms: number): Promise<void> => {
+    waits.push(ms);
+    return Promise.resolve();
+  };
+  const ask = (deps: Parameters<typeof confirmSessionCap>[2]) =>
+    confirmSessionCap({ sessionDir: signedIn(), believedDir: null }, 'limit reached', { sleep, ...deps });
+
+  it("confirms the limit, account-wide and with no window, on Claude's own record of the refused turn", async () => {
+    for (const probe of [() => Promise.resolve(TURNED_AWAY), () => Promise.reject(new Error('fetch aborted'))]) {
+      const decision = await ask({ probe, refusal: proves });
+      expect(decision).toMatchObject({ limited: true, byRefusal: true, unanswered: true, askedOf: 'session' });
+      expect(decision.model).toBeUndefined();
+      expect(decision.resetAt).toBeUndefined();
+    }
+  });
+
+  it('never confirms it on a refusal that does not prove it, or on none', async () => {
+    for (const refusal of [doesNot, undefined]) {
+      const decision = await ask({ probe: answering(TURNED_AWAY).probe, ...(refusal ? { refusal } : {}) });
+      expect(decision).toMatchObject({ limited: false, unanswered: true, detail: 'status 429' });
+      expect(decision.byRefusal).toBeUndefined();
+    }
+  });
+
+  it('leaves an answered check to the usage endpoint, whatever the record says', async () => {
+    // It says the account has room: Claude's refusal may have gone out on the
+    // login a move replaced, and the endpoint read the one there now.
+    const room = await ask({ probe: answering({ verdict: 'allowed', fiveHour: 0.2 }).probe, refusal: proves });
+    expect(room.limited).toBe(false);
+    expect(room.unanswered).toBeUndefined();
+    // It measured the limit, window and all.
+    const out = await ask({
+      probe: answering({ verdict: 'limited', fiveHour: 1, fiveHourReset: 4242 }).probe,
+      refusal: proves,
+    });
+    expect(out).toMatchObject({ limited: true, resetAt: 4242 });
+    expect(out.byRefusal).toBeUndefined();
+  });
+
+  it('asks again after the back-off the endpoint asks for, and takes that answer', async () => {
+    waits.length = 0;
+    const usage = answering(
+      { ...TURNED_AWAY, retryAfterMs: 1500 },
+      { verdict: 'limited', fiveHour: 1, fiveHourReset: 777 },
+    );
+    const decision = await ask({ probe: usage.probe, refusal: proves });
+    expect(waits).toEqual([1500]);
+    expect(usage.asked()).toBe(2);
+    expect(decision).toMatchObject({ limited: true, resetAt: 777, asks: 2 });
+    expect(decision.byRefusal).toBeUndefined();
+  });
+
+  it('asks again once, and then lets the record decide', async () => {
+    waits.length = 0;
+    const turnedAwayAgain = answering({ ...TURNED_AWAY, retryAfterMs: 1000 });
+    const decision = await ask({ probe: turnedAwayAgain.probe, refusal: proves });
+    expect(turnedAwayAgain.asked()).toBe(2);
+    expect(waits).toEqual([1000]);
+    expect(decision).toMatchObject({ limited: true, byRefusal: true, asks: 2 });
+    expect(usageAnswer(decision)).toBe('status 429, asked 2 times');
+  });
+
+  it('does not wait out a back-off longer than a check can, nor ask again without one', async () => {
+    waits.length = 0;
+    const long = answering({ ...TURNED_AWAY, retryAfterMs: 60_000 });
+    const decision = await ask({ probe: long.probe });
+    expect(long.asked()).toBe(1);
+    expect(decision).toMatchObject({ limited: false, backOffMs: 60_000 });
+    expect(usageAnswer(decision)).toBe('status 429; it asked to wait 60 s, longer than a check waits');
+    const none = answering(TURNED_AWAY);
+    await ask({ probe: none.probe });
+    expect(none.asked()).toBe(1);
+    expect(waits).toEqual([]);
+  });
+
+  it('keeps the whole check short: the back-off counts from the start, the second ask has 3 s', async () => {
+    vi.useFakeTimers();
+    try {
+      // Turned away after 3.5 s, with 1 s more asked for: past the 4 s a check waits.
+      const slow = () =>
+        new Promise<LimitProbeResult>((resolve) =>
+          setTimeout(() => resolve({ ...TURNED_AWAY, retryAfterMs: 1000 }), 3500),
+        );
+      const late = ask({ probe: slow, sleep: () => Promise.resolve() });
+      await vi.advanceTimersByTimeAsync(3500);
+      expect(await late).toMatchObject({ limited: false, backOffMs: 1000 });
+
+      // A second ask that never answers is given up on.
+      let asked = 0;
+      const silent = () => {
+        asked += 1;
+        return asked === 1 ? Promise.resolve({ ...TURNED_AWAY, retryAfterMs: 500 }) : new Promise<LimitProbeResult>(() => {});
+      };
+      const hung = ask({ probe: silent, sleep: () => Promise.resolve(), refusal: proves });
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(await hung).toMatchObject({ limited: true, byRefusal: true, asks: 2, detail: 'no answer in 3 s' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

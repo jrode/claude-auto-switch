@@ -58,6 +58,15 @@ export function cappedNames(ledger: Ledger, now: number): Set<string> {
   return new Set(ledger.caps.filter((c) => !c.model && isActive(c, now)).map((c) => c.account));
 }
 
+/**
+ * When the account-wide limit recorded for `account` ends, for one active at
+ * `now` that has an end; undefined when there is none.
+ */
+export function accountCapEnd(ledger: Ledger, account: string, now: number): number | undefined {
+  const cap = ledger.caps.find((c) => c.account === account && !c.model && isActive(c, now));
+  return cap?.capUntil ?? undefined;
+}
+
 
 
 /**
