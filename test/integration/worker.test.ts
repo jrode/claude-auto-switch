@@ -12,7 +12,7 @@ import { getActive, setActive } from '../../src/state/active.js';
 import { loadConfig } from '../../src/config/config.js';
 import { leasePath, processIsAlive } from '../../src/session/lease.js';
 import { sessionDirFor } from '../../src/session/session-dir.js';
-import { saveLedger } from '../../src/ledger/ledger.js';
+import { updateLedger } from '../../src/ledger/ledger.js';
 import { writeSwitchRequest } from '../../src/state/switch-request.js';
 import { saveToken } from '../../src/daemon/token-store.js';
 import type { CliContext } from '../../src/context.js';
@@ -682,12 +682,9 @@ describe('ccx worker (against fake-claude)', () => {
   it('lands on the first account it can, not the one sessions start on, when every account is out', { timeout: 60_000 }, async () => {
     const { context, runsLog } = await setup(['A', 'B']);
     const now = Date.now();
-    saveLedger(
-      {
-        caps: ['A', 'B'].map((account) => ({ account, capUntil: now + 3_600_000, reason: 'test', at: now })),
-      },
-      context.ctx,
-    );
+    updateLedger(context.ctx, () => ({
+      caps: ['A', 'B'].map((account) => ({ account, capUntil: now + 3_600_000, reason: 'test', at: now })),
+    }));
     setActive('B', context.ctx);
     await workerCommand(context, ['hi'], {}, [], capture().io);
     expect(launchesIn(runsLog)[0]?.marker).toBe('A');

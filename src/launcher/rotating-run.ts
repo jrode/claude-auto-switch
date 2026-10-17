@@ -7,7 +7,7 @@ import {
 } from '../selector/selector.js';
 import { planRotation, spentKey, type RotationStrategy } from '../usage/rotation-plan.js';
 import { modelInArgs } from '../usage/model-args.js';
-import { markCapped, cappedNames, clearAccount, activeModelCaps } from '../ledger/ledger.js';
+import { applyLedgerChange, cappedNames, activeModelCaps, type LedgerChange } from '../ledger/ledger.js';
 import type { Ledger } from '../ledger/ledger.schema.js';
 import type { CapDecision } from '../usage/confirm-cap.js';
 import { withModel } from '../usage/model-args.js';
@@ -58,8 +58,20 @@ export interface AutoRotateDeps<T extends RotatableAccount> {
   order?: AccountOrder;
   /** Remaining headroom per account (higher = less used), for the `most-room` order. */
   roomOf?: (name: string) => number;
-  /** Starting ledger; threaded through and returned updated for the caller to persist. */
+  /**
+   * The ledger as the run starts. The run plans from it and from what it
+   * records itself, so a limit another session records meanwhile is seen only
+   * by the next run: at worst this one tries that account and finds out.
+   */
   ledger: Ledger;
+  /**
+   * Called with each change as the run makes it, for the caller to apply to the
+   * ledger on disk at that moment (updateLedger). As it happens, not when the
+   * run ends: a limit is then on record for other sessions while the run goes
+   * on, survives the run being stopped, and never overrules a change someone
+   * else made after it.
+   */
+  recordChange?: (change: LedgerChange) => void;
   run?: HeadlessRunner;
   out: (message: string) => void;
   /** Emit the winning run's captured output (real CLI writes to std streams). */
@@ -70,21 +82,32 @@ export interface AutoRotateResult {
   exitCode: number;
   account?: string;
   rotations: number;
-  /** Updated ledger to persist. */
+  /**
+   * The run's own view: the ledger it started from with its changes applied.
+   * Never to be written back, since other sessions may have changed the file
+   * since it was read.
+   */
   ledger: Ledger;
+  /** Every change the run made, in order, each already handed to recordChange. */
+  changes: LedgerChange[];
 }
 
 /**
  * Run a headless request, hopping to the next healthy account each time the
  * current one reports a usage cap, until one succeeds or every account is
- * capped. The ledger is threaded through (never mutated in place) so the caller
- * persists exactly once.
+ * capped. Each change to the ledger goes to `deps.recordChange` as it is made.
  */
 export async function autoRotateHeadless<T extends RotatableAccount>(
   args: string[],
   deps: AutoRotateDeps<T>,
 ): Promise<AutoRotateResult> {
   let ledger = deps.ledger;
+  const changes: LedgerChange[] = [];
+  const record = (change: LedgerChange): void => {
+    ledger = applyLedgerChange(ledger, change);
+    changes.push(change);
+    deps.recordChange?.(change);
+  };
   let rotations = 0;
   /**
    * "account|model" pairs proven spent during THIS run.
@@ -128,7 +151,7 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
     const sel = select(selectInput);
     if (!sel.ok) {
       deps.out(`cannot run: ${sel.reason}`);
-      return { exitCode: 1, rotations, ledger };
+      return { exitCode: 1, rotations, ledger, changes };
     }
 
     // The account AND the model, decided together, by the same planner the
@@ -160,7 +183,7 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
       // accounts are fine and it is the model chain that has run out, and it
       // hides which chain that was.
       deps.out(plan.reason);
-      return { exitCode: 1, rotations, ledger };
+      return { exitCode: 1, rotations, ledger, changes };
     }
 
     const account = ordered.find((a) => a.name === plan.account) ?? sel.account;
@@ -171,6 +194,8 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
     }
     // By Claude's clock, which the record's times are in.
     const launchedAt = Date.now();
+    // By the clock caps are recorded with, which a success clears up to.
+    const startedAt = deps.now();
     const headless = await launchHeadless(runArgs, account, { claude: deps.claude, run: deps.run });
     const { classification } = headless;
     const recorded = refusedIn(account, runArgs, headless, launchedAt);
@@ -196,18 +221,21 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
           `${account.name} ${seen}, but it is not actually capped${why ? ` (${why})` : ''}; not rotating`,
         );
         deps.writeOutput?.(headless.stdout, headless.stderr);
-        return { exitCode: headless.exitCode, account: account.name, rotations, ledger };
+        return { exitCode: headless.exitCode, account: account.name, rotations, ledger, changes };
       }
-      ledger = markCapped(ledger, {
-        account: account.name,
-        now: deps.now(),
-        resetAt: confirmed.resetAt ?? classification.resetAt ?? null,
-        backoffMinutes: deps.defaultBackoffMinutes,
-        reason: confirmed.byRefusal
-          ? (recorded?.refusal.apiError ?? 'usage cap')
-          : (confirmed.detail ?? classification.reason ?? 'usage cap'),
-        // Carried so a model-scoped limit never blocks the whole account.
-        ...(confirmed.model ? { model: confirmed.model } : {}),
+      record({
+        kind: 'capped',
+        cap: {
+          account: account.name,
+          now: deps.now(),
+          resetAt: confirmed.resetAt ?? classification.resetAt ?? null,
+          backoffMinutes: deps.defaultBackoffMinutes,
+          reason: confirmed.byRefusal
+            ? (recorded?.refusal.apiError ?? 'usage cap')
+            : (confirmed.detail ?? classification.reason ?? 'usage cap'),
+          // Carried so a model-scoped limit never blocks the whole account.
+          ...(confirmed.model ? { model: confirmed.model } : {}),
+        },
       });
       rotations++;
 
@@ -229,13 +257,13 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
       continue;
     }
 
-    if (classification.kind === 'ok') ledger = clearAccount(ledger, account.name);
     deps.writeOutput?.(headless.stdout, headless.stderr);
-    return { exitCode: headless.exitCode, account: account.name, rotations, ledger };
+    if (classification.kind === 'ok') record({ kind: 'cleared', account: account.name, upTo: startedAt });
+    return { exitCode: headless.exitCode, account: account.name, rotations, ledger, changes };
   }
 
   deps.out('all accounts are capped; try again later');
-  return { exitCode: 1, rotations, ledger };
+  return { exitCode: 1, rotations, ledger, changes };
 }
 
 /**

@@ -19,7 +19,7 @@ import { installShim } from '../shell/install-shim.js';
 import type { ShellPlan } from '../shell/shells.js';
 import { loadConfig } from '../config/config.js';
 import { credentialFileFingerprint } from '../accounts/credential-vault.js';
-import { loadLedger, markCapped, saveLedger } from '../ledger/ledger.js';
+import { loadLedger, markCapped, updateLedger } from '../ledger/ledger.js';
 import { expectedKeepalive } from './keepalive.js';
 import type { CliContext } from '../context.js';
 
@@ -275,7 +275,7 @@ describe('auditCaps', () => {
         reason: 'usage cap',
       });
     }
-    saveLedger(ledger, ctxObj.ctx);
+    updateLedger(ctxObj.ctx, () => ledger);
   }
 
   it('is ok with an empty ledger', () => {

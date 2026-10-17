@@ -4,7 +4,7 @@ import { probeAll } from '../health/prober.js';
 import { select } from '../selector/selector.js';
 import { launchWatched, spawnWatched } from '../launcher/launcher.js';
 import type { CapClassification } from '../launcher/cap-detect.js';
-import { loadLedger, saveLedger, markCapped, cappedNames } from '../ledger/ledger.js';
+import { loadLedger, updateLedger, markCapped, cappedNames } from '../ledger/ledger.js';
 import { hasWorkingLogin } from '../accounts/account-login.js';
 import { signedInAndNotRejected } from '../health/signed-in.js';
 import { appendEvent } from '../events/log.js';
@@ -61,8 +61,8 @@ async function handleCap(
     );
     return;
   }
-  saveLedger(
-    markCapped(loadLedger(context.ctx), {
+  updateLedger(context.ctx, (ledger) =>
+    markCapped(ledger, {
       account: chosen.name,
       now: Date.now(),
       // The VERIFIED window only. The classification's reset time is parsed out
@@ -82,7 +82,6 @@ async function handleCap(
       // A model-scoped limit leaves the account working on everything else.
       ...('model' in decision && decision.model ? { model: decision.model } : {}),
     }),
-    context.ctx,
   );
   appendEvent(home, `${chosen.name} hit its limit (editor)`, Date.now());
   const next = await selectHealthy(

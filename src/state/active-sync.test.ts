@@ -5,7 +5,7 @@ import path from 'node:path';
 import { advanceActiveToHealthy } from './active-sync.js';
 import { addAccount } from '../accounts/registry.js';
 import { getActive, setActive } from './active.js';
-import { saveLedger, markCapped } from '../ledger/ledger.js';
+import { updateLedger, markCapped } from '../ledger/ledger.js';
 import { loadConfig } from '../config/config.js';
 import type { CliContext } from '../context.js';
 
@@ -29,7 +29,7 @@ describe('advanceActiveToHealthy', () => {
     addAccount({ name: 'a', dir: '/a' }, c.ctx);
     addAccount({ name: 'b', dir: '/b' }, c.ctx);
     setActive('a', c.ctx);
-    saveLedger(markCapped({ caps: [] }, { account: 'a', now: Date.now(), resetAt: null, backoffMinutes: 300 }), c.ctx);
+    updateLedger(c.ctx, () => markCapped({ caps: [] }, { account: 'a', now: Date.now(), resetAt: null, backoffMinutes: 300 }));
 
     expect(advanceActiveToHealthy(c, new Set(['a', 'b']))).toBe('b');
     expect(getActive(c.ctx)).toBe('b');
@@ -39,7 +39,7 @@ describe('advanceActiveToHealthy', () => {
     const c = makeContext();
     addAccount({ name: 'a', dir: '/a' }, c.ctx);
     setActive('a', c.ctx);
-    saveLedger(markCapped({ caps: [] }, { account: 'a', now: Date.now(), resetAt: null, backoffMinutes: 300 }), c.ctx);
+    updateLedger(c.ctx, () => markCapped({ caps: [] }, { account: 'a', now: Date.now(), resetAt: null, backoffMinutes: 300 }));
     // a is capped and there is no alternative; active is unchanged.
     expect(advanceActiveToHealthy(c, new Set(['a']))).toBe('a');
     expect(getActive(c.ctx)).toBe('a');

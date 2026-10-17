@@ -5,7 +5,7 @@ import { select } from '../selector/selector.js';
 import { launchWatched, launchPassthrough } from '../launcher/launcher.js';
 import { claudeSubcommandIn } from '../launcher/subcommand.js';
 import { autoRotateHeadless } from '../launcher/rotating-run.js';
-import { loadLedger, saveLedger, cappedNames, markCapped } from '../ledger/ledger.js';
+import { loadLedger, updateLedger, applyLedgerChange, cappedNames, markCapped } from '../ledger/ledger.js';
 import { preferredModel, roomOfFromSnapshot } from '../usage/account-room.js';
 import { getClaude, type CliContext } from '../context.js';
 import { hasAnyUsableAccount, runInteractiveHotSwap } from './session.js';
@@ -148,13 +148,13 @@ export async function runCommand(
       roomOf: roomOfFromSnapshot(context.ctx, Date.now(), context.config.rotation, preferredModel(context)),
       defaultBackoffMinutes: context.config.rotation.defaultBackoffMinutes,
       ledger: loadLedger(context.ctx),
+      recordChange: (change) => updateLedger(context.ctx, (ledger) => applyLedgerChange(ledger, change)),
       out: context.out,
       writeOutput: (stdout, stderr) => {
         if (stdout) process.stdout.write(stdout);
         if (stderr) process.stderr.write(stderr);
       },
     });
-    saveLedger(result.ledger, context.ctx);
     advanceActiveToHealthy(context, loggedIn); // carry the switch over to the editor
     return result.exitCode;
   }
@@ -182,8 +182,8 @@ export async function runCommand(
     // had learned better.
     const decision = await confirmCap(result.account.dir, watched.stderr);
     if (decision.limited) {
-      saveLedger(
-        markCapped(loadLedger(context.ctx), {
+      updateLedger(context.ctx, (ledger) =>
+        markCapped(ledger, {
           account: result.account.name,
           now: Date.now(),
           resetAt: decision.resetAt ?? watched.classification.resetAt ?? null,
@@ -191,7 +191,6 @@ export async function runCommand(
           reason: watched.classification.reason ?? 'usage cap',
           ...(decision.model ? { model: decision.model } : {}),
         }),
-        context.ctx,
       );
       context.out(
         decision.model

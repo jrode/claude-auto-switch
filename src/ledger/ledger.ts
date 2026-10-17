@@ -1,9 +1,19 @@
+import { mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { acquireOwnedLock } from '../claude/locks.js';
 import { configHome, type PathCtx } from '../config/paths.js';
+import { appendEvent } from '../events/log.js';
 import { readJsonFile, writeJsonFile } from '../util/fs-json.js';
 import { LedgerSchema, type CapRecord, type Ledger } from './ledger.schema.js';
 
 const FILENAME = 'ledger.json';
+
+/**
+ * Every change holds this lock while it reads the file, applies the change and
+ * writes the result, a few milliseconds. A holder that has exited is taken over
+ * at once, and a lock that names no holder after five seconds.
+ */
+const LOCK = { waitMs: 5_000, staleMs: 5_000 };
 
 // -- persistence -----------------------------------------------------------
 
@@ -13,12 +23,58 @@ export function ledgerFilePath(c: PathCtx = {}): string {
   return p.join(configHome(c), FILENAME);
 }
 
+/**
+ * The ledger as it is now, read without the lock: for deciding, never for
+ * writing back, since a ledger changed from this copy erases whatever another
+ * process recorded after it was read. Every write replaces the file in one
+ * step, so a read gets the old ledger or the new one, never part of one.
+ */
 export function loadLedger(c: PathCtx = {}): Ledger {
   return readJsonFile(ledgerFilePath(c), LedgerSchema) ?? { caps: [] };
 }
 
-export function saveLedger(ledger: Ledger, c: PathCtx = {}): void {
-  writeJsonFile(ledgerFilePath(c), ledger);
+/**
+ * The one way to change the ledger: read it, apply `change` and write the
+ * result, as one step under the ledger's lock, so a limit another process
+ * records at the same moment is never written over. `change` is handed the
+ * ledger as it is now and returns the new one; returning the one it was handed
+ * writes nothing. Returns the ledger as it now stands.
+ *
+ * A lock that is not free within `waitMs` is not waited on further: the change
+ * is written without it, and the event log says so. A holder only reads and
+ * writes one small file, so one still holding it after seconds is stopped, or
+ * gone with its pid now another program's. Waiting longer would freeze the
+ * session that asked, and dropping the change would lose a limit for certain,
+ * where writing loses one only if another process writes in that same moment.
+ */
+export function updateLedger(
+  c: PathCtx,
+  change: (ledger: Ledger) => Ledger,
+  options: { waitMs?: number } = {},
+): Ledger {
+  const file = ledgerFilePath(c);
+  const waitMs = options.waitMs ?? LOCK.waitMs;
+  // The lock lives beside the ledger, so a first write needs the folder first.
+  mkdirSync(path.dirname(file), { recursive: true });
+  const lock = acquireOwnedLock(`${file}.lock`, { ...LOCK, waitMs });
+  try {
+    const current = loadLedger(c);
+    const next = change(current);
+    if (next === current) return current;
+    writeJsonFile(file, next);
+    if (!lock.held) {
+      appendEvent(
+        configHome(c),
+        `ledger written without its lock (not free within ${waitMs / 1000} s); ` +
+          'a limit another session recorded at that moment may be lost',
+        Date.now(),
+        { kind: 'ledger-unlocked', data: { waitMs } },
+      );
+    }
+    return next;
+  } finally {
+    lock.release();
+  }
 }
 
 // -- pure operations (deterministic over an injected `now`) ----------------
@@ -167,4 +223,32 @@ export function clearExpired(ledger: Ledger, now: number): Ledger {
 /** Remove any cap for an account (e.g. after a successful run). Returns a new Ledger. */
 export function clearAccount(ledger: Ledger, account: string): Ledger {
   return { caps: ledger.caps.filter((c) => c.account !== account) };
+}
+
+/**
+ * Remove the caps for an account recorded at or before `upTo`, keeping any
+ * recorded later. Returns the same ledger when there is none to remove, so
+ * updateLedger writes nothing.
+ *
+ * For a run that started at `upTo` and finished fine: the account worked after
+ * the older limits were recorded. A later one came from a session that saw the
+ * account refuse while the run was going, which the run cannot speak to.
+ */
+export function clearAccountUpTo(ledger: Ledger, account: string, upTo: number): Ledger {
+  const caps = ledger.caps.filter((c) => c.account !== account || c.at > upTo);
+  return caps.length === ledger.caps.length ? ledger : { caps };
+}
+
+/**
+ * One change a run made to the ledger, applied to the file as it stands when it
+ * is written (updateLedger), never by writing back a copy read earlier.
+ */
+export type LedgerChange =
+  | { kind: 'capped'; cap: MarkCappedInput }
+  | { kind: 'cleared'; account: string; upTo: number };
+
+export function applyLedgerChange(ledger: Ledger, change: LedgerChange): Ledger {
+  return change.kind === 'capped'
+    ? markCapped(ledger, change.cap)
+    : clearAccountUpTo(ledger, change.account, change.upTo);
 }

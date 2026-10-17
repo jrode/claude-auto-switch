@@ -28,7 +28,7 @@ import { buildProactiveDeps } from '../usage/proactive-deps.js';
 import { syncEditorPointerIfEnabled } from '../editor/junction.js';
 import {
   loadLedger,
-  saveLedger,
+  updateLedger,
   markCapped,
   cappedNames,
   modelOnlyLimit,
@@ -1575,15 +1575,16 @@ export async function runInteractiveHotSwap(
       return;
     }
     refreshSettings(); // how long to skip it, as set now
-    const ledger = markCapped(loadLedger(context.ctx), {
-      account: accountName,
-      now: Date.now(),
-      resetAt: resetAt ?? limitedResetAt ?? null,
-      backoffMinutes: context.config.rotation.defaultBackoffMinutes,
-      reason,
-      ...(limitedModel ? { model: limitedModel } : {}),
-    });
-    saveLedger(ledger, context.ctx);
+    const ledger = updateLedger(context.ctx, (current) =>
+      markCapped(current, {
+        account: accountName,
+        now: Date.now(),
+        resetAt: resetAt ?? limitedResetAt ?? null,
+        backoffMinutes: context.config.rotation.defaultBackoffMinutes,
+        reason,
+        ...(limitedModel ? { model: limitedModel } : {}),
+      }),
+    );
     if (!limitedModel) {
       seenOut.set(accountName, ledger.caps.find((c) => c.account === accountName && !c.model)?.capUntil ?? null);
     }

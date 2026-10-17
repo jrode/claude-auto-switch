@@ -11,7 +11,7 @@ import {
 } from './desktop.js';
 import { addAccount } from '../accounts/registry.js';
 import { loadConfig, saveConfig } from '../config/config.js';
-import { loadLedger, markCapped, saveLedger } from '../ledger/ledger.js';
+import { markCapped, updateLedger } from '../ledger/ledger.js';
 import { readInstalledHandoff } from '../desktop/hooks.js';
 import type { DesktopConversation } from '../desktop/desktop-sessions.js';
 import { scheduleHandoff, type HandoffSettings, type HandoffTarget } from '../desktop/handoff.js';
@@ -311,13 +311,12 @@ describe('ccx desktop move', () => {
   it('refuses an account that could not take it, instead of starting somewhere else unsaid', async () => {
     const s = setup({ conversations: [{ ...busy, status: 'idle' }] });
     const home = s.context.ctx.env?.HOME as string;
-    saveLedger(
-      markCapped(loadLedger(s.context.ctx), {
+    updateLedger(s.context.ctx, (ledger) =>
+      markCapped(ledger, {
         account: 'osa',
         now: Date.now(),
         backoffMinutes: 60,
       }),
-      s.context.ctx,
     );
     expect(await desktopCommand(s.context, 'move', ['1'], { to: 'osa' }, s.deps)).toBe(1);
     expect(s.said.join(' ')).toMatch(/"osa" is out of usage/);

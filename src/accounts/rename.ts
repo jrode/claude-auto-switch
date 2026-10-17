@@ -4,7 +4,7 @@ import path from 'node:path';
 import { loadRegistry, saveRegistry } from './registry.js';
 import { RegistryError } from '../util/errors.js';
 import { getActive, setActive } from '../state/active.js';
-import { loadLedger, saveLedger } from '../ledger/ledger.js';
+import { updateLedger } from '../ledger/ledger.js';
 import { readUsageSnapshot, writeUsageSnapshot } from '../usage/usage-store.js';
 import { assertProfileName } from '../util/names.js';
 import { leaseFor } from '../session/lease.js';
@@ -113,15 +113,11 @@ export function renameAccount(
   // here leaves a renamed account rather than an unrenamed one with moved history.
   if (getActive(c) === from) setActive(target, c);
 
-  const ledger = loadLedger(c);
-  let ledgerChanged = false;
-  for (const cap of ledger.caps) {
-    if (cap.account === from) {
-      cap.account = target;
-      ledgerChanged = true;
-    }
-  }
-  if (ledgerChanged) saveLedger(ledger, c);
+  updateLedger(c, (ledger) =>
+    ledger.caps.some((cap) => cap.account === from)
+      ? { caps: ledger.caps.map((cap) => (cap.account === from ? { ...cap, account: target } : cap)) }
+      : ledger,
+  );
 
   const usage = readUsageSnapshot(c);
   const entry = usage.accounts[from];

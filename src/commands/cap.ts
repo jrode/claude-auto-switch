@@ -1,5 +1,5 @@
 import { getAccount } from '../accounts/registry.js';
-import { loadLedger, saveLedger, markCapped, clearAccount } from '../ledger/ledger.js';
+import { updateLedger, markCapped, clearAccount } from '../ledger/ledger.js';
 import type { CliContext } from '../context.js';
 
 export interface CapOptions {
@@ -18,10 +18,8 @@ export function capCommand(context: CliContext, name: string, options: CapOption
     return 1;
   }
 
-  const ledger = loadLedger(context.ctx);
-
   if (options.clear) {
-    saveLedger(clearAccount(ledger, name), context.ctx);
+    updateLedger(context.ctx, (ledger) => clearAccount(ledger, name));
     context.out(`cleared cap for "${name}"`);
     return 0;
   }
@@ -40,7 +38,7 @@ export function capCommand(context: CliContext, name: string, options: CapOption
     ? Number(options.minutes)
     : context.config.rotation.defaultBackoffMinutes;
 
-  saveLedger(
+  updateLedger(context.ctx, (ledger) =>
     markCapped(ledger, {
       account: name,
       now: Date.now(),
@@ -48,7 +46,6 @@ export function capCommand(context: CliContext, name: string, options: CapOption
       backoffMinutes,
       reason: 'manual cap',
     }),
-    context.ctx,
   );
   context.out(`marked "${name}" capped${resetAt ? ` until ${new Date(resetAt).toISOString()}` : ''}`);
   return 0;
