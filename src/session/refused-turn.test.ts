@@ -54,7 +54,8 @@ describe('what a refused turn in the record proves on its own', () => {
   });
 
   it('proves nothing for a limit it cannot name, or none', async () => {
-    for (const limitType of ['overage', 'seven_day_someday', undefined]) {
+    // Names an object has by inheritance are not limit names either.
+    for (const limitType of ['overage', 'seven_day_someday', 'constructor', 'toString', '__proto__', undefined]) {
       const proof = await judge(recorded({ limitType }));
       expect(proof.proves, String(limitType)).toBe(false);
       expect(proof.why).toContain('does not say which limit it is');

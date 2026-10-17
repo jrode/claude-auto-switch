@@ -53,11 +53,12 @@ const LIMIT_REACHED = 'usage_limit_reached';
  * added later, is not taken as either.
  */
 const ACCOUNT_LIMITS = new Set(['five_hour', 'seven_day']);
-const MODEL_LIMITS: Record<string, string> = {
-  seven_day_opus: 'Opus',
-  seven_day_sonnet: 'Sonnet',
-  seven_day_overage_included: 'Fable',
-};
+// A Map, so a name off the record such as "constructor" finds nothing inherited.
+const MODEL_LIMITS = new Map([
+  ['seven_day_opus', 'Opus'],
+  ['seven_day_sonnet', 'Sonnet'],
+  ['seven_day_overage_included', 'Fable'],
+]);
 
 /** A refused turn from the record, with what tells whether it is the session's own turn now. */
 export interface RecordedRefusal {
@@ -106,7 +107,7 @@ export async function refusalProof(
     return not(`the refusal (${refusal.apiError ?? refusal.error}) does not say a usage limit is spent`);
   }
   const type = refusal.limitType ?? '';
-  const model = MODEL_LIMITS[type];
+  const model = MODEL_LIMITS.get(type);
   if (!ACCOUNT_LIMITS.has(type) && model === undefined) {
     return not(`the refusal does not say which limit it is (${type || 'no name'})`);
   }
