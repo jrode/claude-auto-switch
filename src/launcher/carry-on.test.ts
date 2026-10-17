@@ -24,6 +24,7 @@ function view(now: number, over: Partial<CarryOnView> = {}): CarryOnView {
     promptAt: 0,
     readsPastes: true,
     subagentWroteAt: 0,
+    limitMenuOpen: false,
     ...over,
   };
 }
@@ -315,5 +316,59 @@ describe('when a carry-on prompt may be typed into a live session', () => {
     expect(gone.step(view(READY + T.blockedMs, { status: null }))).toMatchObject({
       do: 'relaunch',
     });
+  });
+});
+
+describe("Claude's own usage-limit menu", () => {
+  /**
+   * On a limit Claude opens /rate-limit-options by itself ("Stop and wait for
+   * limit to reset", "Wait here, then continue automatically", "Switch to usage
+   * credits") and says "waiting" for as long as it is open (measured, 2.1.280).
+   * With the account under it replaced, none of those choices applies.
+   */
+  const MENU = { status: { status: 'waiting', forMs: 1_000 }, limitMenuOpen: true };
+
+  it('is closed at once, even before the new login has been picked up', () => {
+    expect(carryOn().step(view(MOVED + 1, MENU))).toEqual({ do: 'dismiss' });
+  });
+
+  it('then types the prompt once Claude is back at its prompt', () => {
+    const c = carryOn();
+    expect(c.step(view(MOVED + 1, MENU))).toEqual({ do: 'dismiss' });
+    c.dismissed(MOVED + 1);
+    expect(c.step(view(READY))).toEqual({ do: 'type' });
+  });
+
+  it('is closed again when it comes back, but only after giving the first Esc time to work', () => {
+    const c = carryOn();
+    expect(c.step(view(MOVED + 1, MENU))).toEqual({ do: 'dismiss' });
+    c.dismissed(MOVED + 1);
+    expect(c.step(view(MOVED + 1_000, MENU))).toEqual({ do: 'wait' });
+    expect(c.step(view(MOVED + 6_000, MENU))).toEqual({ do: 'dismiss' });
+  });
+
+  it('is left to the old way, a relaunch once a dialog stays open, when closing it does not work', () => {
+    const c = carryOn();
+    let at = MOVED + 1;
+    for (let i = 0; i < 3; i++) {
+      expect(c.step(view(at, MENU))).toEqual({ do: 'dismiss' });
+      c.dismissed(at);
+      at += 6_000;
+    }
+    expect(c.step(view(at, MENU))).toEqual({ do: 'wait' });
+    expect(c.step(view(at + T.blockedMs, MENU))).toMatchObject({ do: 'relaunch' });
+  });
+
+  it('is never answered for anyone: another dialog, or a person at the keyboard, is left alone', () => {
+    const other = { status: { status: 'waiting', forMs: 1_000 }, limitMenuOpen: false };
+    expect(carryOn().step(view(MOVED + 1, other))).toEqual({ do: 'wait' });
+    expect(carryOn().step(view(MOVED + 1, { ...MENU, lastKeyAt: MOVED }))).toMatchObject({
+      do: 'done',
+      outcome: 'attended',
+    });
+  });
+
+  it('is not closed by a dialog that only says it is the menu while Claude is not waiting', () => {
+    expect(carryOn().step(view(READY, { limitMenuOpen: true }))).toEqual({ do: 'type' });
   });
 });

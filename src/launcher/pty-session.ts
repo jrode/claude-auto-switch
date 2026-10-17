@@ -19,6 +19,9 @@ import { ACCOUNT_ENV, withoutEnv } from './child-env.js';
 import { createCarryOn, inputBoxEmpty, type CarryOn, type CarryOnTiming } from './carry-on.js';
 import { createKeyboardWatch } from './keyboard-watch.js';
 import { createPasteModeWatch, pasteAndSend } from './paste-mode.js';
+import { createLimitMenuWatch } from './limit-menu.js';
+
+const ESC = String.fromCharCode(27);
 
 /** What a confirmed limit was met by, and what can be done about it under the live child. */
 export interface CapContext {
@@ -51,6 +54,7 @@ export type CapDecision =
 /** What became of a carry-on prompt handed to the live session, for the log. */
 export type CarryOnEvent =
   | { kind: 'typed' }
+  | { kind: 'dismissed' }
   | { kind: 'refused' }
   | { kind: 'done'; outcome: 'delivered' | 'attended' | 'left'; why: string }
   | { kind: 'relaunch'; why: string };
@@ -121,11 +125,14 @@ export interface PtySessionOptions {
    */
   verifySignedOut?: () => Promise<boolean>;
   /**
-   * Do not watch for usage limits during this run. Used for the deliberate
-   * "run anyway" case, where the limit is already known and the operator needs
-   * the session to start so they can switch models.
+   * Do not act on usage limits during this run. Used for the deliberate "run
+   * anyway" case, where the limit is already known and the operator needs the
+   * session to start so they can switch models. A function is asked each time
+   * a limit turns up, so a run started that way can act on limits again once
+   * there is somewhere to go: a reset, or an account enabled or signed in
+   * meanwhile. `true` ignores them for the whole run.
    */
-  ignoreLimits?: boolean;
+  ignoreLimits?: boolean | (() => boolean);
   /**
    * The run's terminal input. Sessions borrow the operator's keyboard from this
    * owner rather than taking the terminal into raw mode themselves, so a swap
@@ -270,6 +277,9 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
     let mainRefusedMeanwhile = false;
     /** A prompt waiting to be typed into this child, after a move in place. */
     let carryOn: CarryOn | null = null;
+    /** When Claude last drew its own usage-limit menu (see CarryOnView.limitMenuOpen, limit-menu). */
+    let limitMenuDrawnAt = 0;
+    const limitMenu = createLimitMenuWatch(process.stdout.rows ?? 24);
     /** The account that move went to, for a caller that does not say where the session is now. */
     let carryOnAccount = '';
     /** What the person has typed into this child, from what the relay forwards. */
@@ -314,6 +324,9 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
      */
     const RELIEF_GRACE_MS = 400;
     let noConversation = false;
+    /** Whether a limit turning up now is to be let be (see PtySessionOptions.ignoreLimits). */
+    const limitsIgnored = (): boolean =>
+      typeof options.ignoreLimits === 'function' ? options.ignoreLimits() : options.ignoreLimits === true;
     /** The conversation's own record, read as it grows (see session/transcript). */
     // A launch that starts a new conversation reads its record whole; one that
     // resumes skips the history it brings with it.
@@ -425,7 +438,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
       }
       // Not a limit, so watched even when limits are not.
       if (seen.signedOut !== null) onSignedOut(seen.signedOut);
-      if (options.ignoreLimits) return;
+      if (seen.refusals.length === 0 || limitsIgnored()) return;
       for (const refusal of seen.refusals) {
         const { text, hit } = hitOf(refusal);
         onLimitEvidence(hit, text, refusal.sidechain, refusal);
@@ -474,16 +487,29 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
       // A limit or a switch being decided owns what happens next.
       if (cap.isSet() || switching || pendingCapRelief || verifying || noConversation) return;
       const now = Date.now();
+      const status = readLiveStatus(options.configDir, child.pid, startedAt, now);
       const step = carryOn.step({
         now,
-        status: readLiveStatus(options.configDir, child.pid, startedAt, now),
+        status,
         lastKeyAt: keyboard.lastKeyAt(),
         endedOnEnter: keyboard.endedOnEnter(),
         promptAt: lastPromptAt,
         readsPastes: pasteMode.on(),
         subagentWroteAt,
+        // Drawn since Claude began waiting, a moment's slack either side: the
+        // menu and the status that says it is open are written together.
+        limitMenuOpen:
+          status?.status === 'waiting' && limitMenuDrawnAt > 0 && limitMenuDrawnAt >= now - status.forMs - 2_000,
       });
       if (step.do === 'wait') return;
+      if (step.do === 'dismiss') {
+        // Esc, as a person closes it. Not through the keyboard watch: this is
+        // not somebody at the keyboard.
+        child.write(ESC);
+        carryOn.dismissed(now);
+        options.onCarryOn?.({ kind: 'dismissed' });
+        return;
+      }
       if (step.do === 'type') {
         child.write(pasteAndSend(carryOn.prompt));
         carryOn.typed(now);
@@ -711,6 +737,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
       // input relay uses that to refuse reports this child cannot have wanted.
       input.observeChildOutput(data);
       pasteMode.observe(data);
+      if (limitMenu.observe(data)) limitMenuDrawnAt = Date.now();
       if (options.debugLog) captured += data;
       // `pendingCapRelief` is part of this guard so a cap episode is handled
       // ONCE. Without it, more banner output during the relief grace could start
@@ -747,7 +774,7 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
       // replay cannot spam probes.
       // The conversation's own record decides once it can be read (see
       // checkRecord): the screen only stands in for it until then.
-      if (options.ignoreLimits || recordReadable) return;
+      if (recordReadable) return;
       // Dropped, not kept for later: what is on screen while the gate holds
       // can be another account talking, and nothing on it says which.
       if (options.limitGate?.held()) {
@@ -756,6 +783,11 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
       }
       const hit = matchesCapText(window);
       if (!hit) return;
+      // Judged once: text left in the buffer would ask again on every chunk.
+      if (limitsIgnored()) {
+        window = '';
+        return;
+      }
       // Cleared HERE, before anything can return early. One message is one
       // episode, and leaving it in the rolling buffer means the next unrelated
       // output re-matches the same text: three checks of a single wall would
@@ -1065,14 +1097,15 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
           // One last read of the record, for a refusal written just before the
           // exit; the screen only counts while the record could not be read.
           const final = record.poll(lastConversation);
-          if (final.readable && !options.ignoreLimits) recordReadable = true;
+          const ignoring = limitsIgnored();
+          if (final.readable && !ignoring) recordReadable = true;
           // A prompt read only now still comes after a refusal held before it.
           if (final.promptAt !== null) lastPromptAt = Math.max(lastPromptAt, final.promptAt);
           // A "Please run /login" written just before the exit is asked about
           // too; finalize waits for the answer.
           if (final.signedOut !== null) onSignedOut(final.signedOut, true);
           // The main thread's only, as above.
-          const lastRefusal = options.ignoreLimits
+          const lastRefusal = ignoring
             ? undefined
             : final.refusals.filter((refusal) => !refusal.sidechain).pop();
           const recorded = lastRefusal ? hitOf(lastRefusal) : null;

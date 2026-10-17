@@ -476,6 +476,56 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
     );
 
     it(
+      'acts on a limit in a run started anyway, once another account has room again',
+      { timeout: 60_000 },
+      async () => {
+        // Every account is recorded as out, so the run starts on A anyway, and
+        // the limit it was started under is let be. Then B's limit lifts. A
+        // limit met after that has somewhere to go, and the session moves: it
+        // used to sit on it for the rest of the run, with nothing in the log.
+        const { home, runsLog, context } = await twoAccounts('cas-anyway-then-room-');
+        recordedOut(home, ['A', 'B']);
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '20000',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '2500',
+          FAKE_CLAUDE_EXIT_AFTER_PROMPTS: '1',
+        });
+        setTimeout(() => recordedOut(home, ['A']), 1_000);
+
+        expect(await runCommand(context, [])).toBe(0);
+        const log = readLog(runsLog);
+        expect(launches(log).map((l) => l.marker)).toEqual(['A']);
+        expect(prompts(log)).toEqual([
+          expect.objectContaining({ text: IN_PLACE_PROMPT, marker: 'B', refused: false }),
+        ]);
+        expect(eventsIn(home).map((e) => e.msg)).toContainEqual(expect.stringMatching(/Starting on "A" anyway/));
+      },
+    );
+
+    it(
+      'still lets the limit be in a run started anyway while there is nowhere to go',
+      { timeout: 60_000 },
+      async () => {
+        const { home, runsLog, context } = await twoAccounts('cas-anyway-nowhere-');
+        recordedOut(home, ['A', 'B']);
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '5000',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1500',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        const log = readLog(runsLog);
+        expect(launches(log)).toHaveLength(1);
+        expect(prompts(log)).toEqual([]);
+        expect(eventsIn(home).filter((e) => e.kind === 'cap-relief' || e.kind === 'capped')).toEqual([]);
+      },
+    );
+
+    it(
       'starts when the file naming the active account cannot be read',
       { timeout: 60_000 },
       async () => {
