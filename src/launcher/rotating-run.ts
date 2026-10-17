@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { ClaudeInvoker } from '../invoker.js';
 import {
   select,
@@ -12,7 +13,13 @@ import type { Ledger } from '../ledger/ledger.schema.js';
 import type { CapDecision } from '../usage/confirm-cap.js';
 import { withModel } from '../usage/model-args.js';
 import { launchHeadless, type HeadlessRunner } from './launcher.js';
-import { conversationIdIn, forksConversation, reportedSessionId } from './conversation.js';
+import {
+  conversationIdIn,
+  forksConversation,
+  namesConversation,
+  reportedSessionId,
+  withConversationId,
+} from './conversation.js';
 import { refusalsSince } from '../session/transcript.js';
 import { outputShows } from '../session/own-output.js';
 import type { RecordedRefusal } from '../session/refused-turn.js';
@@ -78,6 +85,8 @@ export interface AutoRotateDeps<T extends RotatableAccount> {
    */
   recordChange: (change: LedgerChange) => void;
   run?: HeadlessRunner;
+  /** A new conversation id, for a launch whose conversation ccx names. */
+  newId?: () => string;
   out: (message: string) => void;
   /** Emit the winning run's captured output (real CLI writes to std streams). */
   writeOutput?: (stdout: string, stderr: string) => void;
@@ -137,6 +146,15 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
    */
   let modelInUse: string | null = modelInArgs(args);
   let runArgs = args;
+  /**
+   * When the person named no conversation, ccx names each launch's, so its
+   * record can be found by that id however the run prints its answer. A new
+   * one for every launch, since each starts a new conversation as it did
+   * before: Claude refuses an id whose record is already where it looks
+   * ("Session ID <id> is already in use").
+   */
+  const nameEachLaunch = !namesConversation(args);
+  const newId = deps.newId ?? randomUUID;
   // Room for the whole preference chain on every account, or the loop gives up
   // before it has actually tried the fallbacks.
   const chain = deps.modelPreference ?? [];
@@ -207,9 +225,10 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
     const launchedAt = Date.now();
     // By the clock caps are recorded with: a success clears only what came before.
     const startedAt = deps.now();
-    const headless = await launchHeadless(runArgs, account, { claude: deps.claude, run: deps.run });
+    const launchArgs = nameEachLaunch ? withConversationId(runArgs, newId()) : runArgs;
+    const headless = await launchHeadless(launchArgs, account, { claude: deps.claude, run: deps.run });
     const { classification } = headless;
-    const recorded = refusedIn(account, runArgs, headless, launchedAt);
+    const recorded = refusedIn(account, launchArgs, headless, launchedAt);
 
     if (classification.kind === 'capped' || recorded) {
       // Cap-looking text is a TRIGGER, never a verdict. This path used to write
@@ -283,10 +302,11 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
 /**
  * The refused turn in a finished run's own record, for when it is one Claude
  * itself recorded: the run failed, and its record is found by the
- * conversation its arguments name or its JSON output reports, never by the
- * newest file in the folder, which a run beside it may have written. A fork
- * is its own new conversation, which only the output reports. A plain-text
- * run with neither has none to find.
+ * conversation its arguments name (ccx's own id when the person named none)
+ * or its JSON output reports, never by the newest file in the folder, which a
+ * run beside it may have written. A fork is its own new conversation, which
+ * only the output reports, so a plain-text fork, like a plain-text
+ * `--continue`, has none to find.
  *
  * Of the refusals written since it started, the one it printed: two runs
  * resuming one conversation write into one record, and each printed only its

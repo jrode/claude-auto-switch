@@ -148,6 +148,61 @@ function isOperand(value: string | undefined): boolean {
 }
 
 /**
+ * Flags that say which conversation a run is in, or put it where ccx keeps no
+ * record: a resume, a continue, an id, a fork, and the flags that resume or
+ * attach to a conversation elsewhere (a pull request's, a teleported one, a
+ * cloud session). Claude refuses `--session-id` beside a resume or a continue
+ * without `--fork-session` (2.1.299 and 2.1.302: "--session-id can only be
+ * used with --continue or --resume if --fork-session is also specified").
+ */
+const NAMING_FLAGS = new Set([
+  '--resume',
+  '--continue',
+  SESSION_ID_FLAG,
+  FORK_FLAG,
+  '--from-pr',
+  '--teleport',
+  '--cloud',
+  '--remote',
+]);
+/** The short ones: `-r` and `-c`. */
+const NAMING_LETTERS = new Set(['r', 'c']);
+/** Claude's short options that take a value, which takes the rest of a cluster with it (`-rID`). */
+const VALUE_LETTERS = new Set(['d', 'n', 'r', 'w']);
+
+/**
+ * Whether `args` say which conversation the run is in, in any spelling
+ * Claude's parser takes: a long flag with its value after it or inside it
+ * (`--resume=<id>`), or a short one alone, in a cluster (`-pc`) or with its
+ * value attached (`-r<id>`). An option's value is never read as a flag, and
+ * nothing after `--` is one.
+ */
+export function namesConversation(args: string[]): boolean {
+  for (const token of optionTokens(args)) {
+    if (token.startsWith('--')) {
+      if (NAMING_FLAGS.has(splitOption(token).flag)) return true;
+      continue;
+    }
+    for (const letter of token.slice(1)) {
+      if (NAMING_LETTERS.has(letter)) return true;
+      // The rest of the cluster is this option's value, or not options at all.
+      if (VALUE_LETTERS.has(letter) || !/[A-Za-z]/.test(letter)) break;
+    }
+  }
+  return false;
+}
+
+/**
+ * `args` with `--session-id <id>` added: before a `--`, after which Claude
+ * reads everything as the prompt, and at the end otherwise.
+ */
+export function withConversationId(args: string[], id: string): string[] {
+  const end = args.indexOf('--');
+  if (end === -1) return [...args, SESSION_ID_FLAG, id];
+  return [...args.slice(0, end), SESSION_ID_FLAG, id, ...args.slice(end)];
+}
+
+/**
  * Strip every conversation flag, including whatever value it carries, and the
  * fork flag, which only ever applies to the launch that made the copy.
  */

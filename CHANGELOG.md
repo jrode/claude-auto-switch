@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.12]
+
+### Fixed
+
+- **A plain `claude -p` run through ccx moves on when its turn is refused,
+  even while ccx's usage check is turned away (#146).** Since 2.6.9 a refusal
+  Claude recorded confirms the limit when the usage check cannot answer, but
+  ccx found a `-p` run's record only by the conversation its arguments named
+  or its JSON output reported, and plain text reports none. So `claude -p
+  "..."` with no conversation flag, the way pipelines run it, still read a
+  429 from the usage check as "not capped" and stopped. Now:
+  - When the person names no conversation (no `--resume`, `--continue`,
+    `--session-id` or `--fork-session` in any spelling, short forms and
+    `--resume=<id>` included, and no `--from-pr`, `--teleport` or
+    `--cloud`), ccx starts each launch with a new conversation of its own,
+    `--session-id <uuid>`, before any `--`, and reads the record by that id
+    when the run fails. Nothing else changes for the person: each run was a
+    new conversation before too, and `--continue` afterwards picks up the
+    newest conversation in the folder whoever chose its id.
+  - A flag the person passed is left exactly as typed, since Claude refuses
+    `--session-id` beside `--resume` or `--continue` without
+    `--fork-session`.
+  - Every guard stays: words alone never rotate a run, a refusal counts only
+    when the run printed it, and another live ccx session or Claude on the
+    same conversation blocks it.
+  - Still not covered, now said in the README with the reasons: the editor
+    launch, a `claude -p` run with headless rotation turned off, and the
+    launch ccx falls back to when no account has a login.
+
 ## [2.6.11]
 
 ### Fixed

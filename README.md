@@ -127,9 +127,26 @@ already recorded for the account, if there is one; anything else takes the
 configured backoff. Any other refusal waits for the usage check, and even the
 right one never counts while ccx knows of another live Claude on the same
 conversation, since every Claude on a conversation writes to the same record.
-That covers sessions in the terminal, workers and `claude -p` runs whose
-conversation is named or reported in JSON, not yet the editor launch. Text on
-screen that talks about usage limits never moves a session.
+That covers sessions in the terminal, workers and `claude -p` runs through ccx.
+A `claude -p` run that names no conversation (no `--resume`, `--continue`,
+`--session-id`, `--fork-session`, or `--from-pr`, `--teleport` or `--cloud`) is
+started with a new one of ccx's own (`--session-id`), so its record is found
+however it prints its answer. Text on screen that talks about usage limits
+never moves a session.
+
+Three launches still wait for the usage check, because ccx cannot tell that a
+refusal there was the run's own:
+
+- **The editor launch.** An editor chat is one Claude that answers turn after
+  turn and stops only when the chat is closed, usually long after the 2 minutes
+  in which a refusal still speaks for the turn in front of it. What it prints
+  goes to the editor, not through ccx.
+- **A `claude -p` run with headless rotation turned off.** Its answer goes
+  straight to you, not through ccx, so ccx cannot check that the refusal is in
+  it.
+- **The launch ccx falls back to when no account has a login.** It is a whole
+  terminal session, which ccx looks at only once it ends, usually long after a
+  refusal.
 
 **Moving.** A refused turn has already ended, so the session needs another
 account and to be told to carry on. ccx replaces the login under the running
