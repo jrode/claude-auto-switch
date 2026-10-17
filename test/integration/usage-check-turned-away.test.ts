@@ -241,6 +241,8 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
           `; runs log: ${JSON.stringify(readLog(runsLog))}`;
         expect(launches(readLog(runsLog)).map((l) => l.marker), story).toEqual(['A']);
         expect(code, story).toBe(0);
+        // Ended by the test after the four, not by anything before them.
+        expect(shown(), story).toBeGreaterThanOrEqual(atVerdict + 4);
         // Asked, turned away, and not moved.
         expect(asked, story).toContain('A');
         expect(capsIn(home)).toEqual([]);
