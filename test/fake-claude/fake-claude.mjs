@@ -353,15 +353,22 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
   };
   const refusedOn = (marker) =>
     (process.env.FAKE_CLAUDE_REFUSE_ON ?? '').split(',').filter(Boolean).includes(marker ?? '');
-  /** A refused turn as Claude writes one; a subagent's carries its own marks. */
+  /**
+   * A refused turn as Claude writes one for an account out of its usage limit:
+   * "usage_limit_reached" is the API's code for it from 2.1.292 on (measured
+   * up to 2.1.302). A subagent's carries its own marks. With
+   * FAKE_CLAUDE_REFUSAL_AGE_MS it carries a time that long ago, as an entry
+   * copied into a new record from an older one (a fork, a record Claude
+   * wrote again) still carries its own.
+   */
   const refusalEntry = (extra = {}) => ({
     type: 'assistant',
     isSidechain: false,
     isApiErrorMessage: true,
     error: 'rate_limit',
-    apiError: 'model_requires_usage_credits',
+    apiError: 'usage_limit_reached',
     apiErrorStatus: 429,
-    timestamp: new Date().toISOString(),
+    timestamp: new Date(Date.now() - (Number(process.env.FAKE_CLAUDE_REFUSAL_AGE_MS) || 0)).toISOString(),
     message: {
       model: '<synthetic>',
       role: 'assistant',

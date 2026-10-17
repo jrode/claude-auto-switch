@@ -702,6 +702,26 @@ describe('ccx worker (against fake-claude)', () => {
     expect(answer.ccx.accounts).toEqual(['A', 'B']);
   });
 
+  it('moves on when the usage check is turned away and Claude recorded the refusal', { timeout: 60_000 }, async () => {
+    // The usage endpoint's budget is shared by every session on the machine,
+    // so it answers 429 exactly when many are busy. Claude's own record of the
+    // refused turn then confirms the limit.
+    const { context, runsLog } = await setup(['A', 'B']);
+    delete context.verifyCap;
+    context.capProbe = (credentialsFile) =>
+      Promise.resolve(
+        (JSON.parse(readFileSync(credentialsFile, 'utf8')) as { account?: string }).account === 'A'
+          ? { verdict: 'unknown', detail: 'status 429' }
+          : { verdict: 'allowed' },
+      );
+    Object.assign(process.env, refusing(), { FAKE_CLAUDE_REFUSE_ON: 'A', FAKE_CLAUDE_REFUSAL_ENDS_RUN: '1' });
+    const seen = capture();
+    expect(await workerCommand(context, ['hi'], {}, [], seen.io)).toBe(0);
+    expect(launchesIn(runsLog).map((l) => l.marker)).toEqual(['A', 'B']);
+    const answer = JSON.parse(seen.out()) as { is_error: boolean; ccx: { accounts: string[] } };
+    expect(answer).toMatchObject({ is_error: false, ccx: { accounts: ['A', 'B'] } });
+  });
+
   it('fails with the answer Claude gave when every account runs out', { timeout: 60_000 }, async () => {
     const { context } = await setup(['A'], () => Promise.resolve('limited'));
     Object.assign(process.env, refusing(), { FAKE_CLAUDE_REFUSAL_ENDS_RUN: '1' });
