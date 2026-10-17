@@ -1,5 +1,6 @@
 import {
   closeSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -7,7 +8,7 @@ import {
   rmSync,
   statSync,
   utimesSync,
-  writeSync,
+  writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 
@@ -157,10 +158,20 @@ export interface OwnedLockOptions {
   maxHoldMs?: number;
   now?: () => number;
   isRunning?: (pid: number) => boolean;
-  /** Creates the lock file, failing if it exists, and names this process in it. */
-  create?: (file: string) => void;
+  /** Creates the lock file, failing if it exists, with `content` in it: this process's pid. */
+  create?: (file: string, content: string) => void;
   platform?: NodeJS.Platform;
 }
+
+/**
+ * Which acquisition in this process holds each lock file now. Other processes
+ * are told apart by the pid in the file, since no two live processes share
+ * one; acquisitions inside this process share the pid, so this tells them
+ * apart, and a takeover by this same process replaces the entry. This holds
+ * while one copy of this module serves the whole process, with no worker
+ * threads taking locks, as in ccx today.
+ */
+const heldHere = new Map<string, symbol>();
 
 /**
  * A lock for work done synchronously, which therefore cannot refresh its lock
@@ -184,8 +195,11 @@ export function acquireOwnedLock(lockFile: string, options: OwnedLockOptions): L
 
   for (;;) {
     try {
-      create(lockFile);
-      return ownedHandle(lockFile);
+      // A bare pid, which every build of ccx reads, older ones included.
+      create(lockFile, String(process.pid));
+      const token = Symbol(lockFile);
+      heldHere.set(path.resolve(lockFile), token);
+      return ownedHandle(lockFile, token, options.maxHoldMs ?? 60_000, now);
     } catch (err) {
       if (!busy.includes((err as NodeJS.ErrnoException).code ?? '')) return { held: false, release: () => {} };
     }
@@ -195,31 +209,127 @@ export function acquireOwnedLock(lockFile: string, options: OwnedLockOptions): L
   }
 }
 
-function createOwnedLockFile(file: string): void {
+/**
+ * Create the lock file with the holder's pid in it. A lock whose pid could not
+ * be written (a full disk) is removed again and refused: one naming no holder
+ * would hold everyone else off until it went stale, and never be released.
+ */
+export function createOwnedLockFile(
+  file: string,
+  content: string,
+  write: (fd: number, text: string) => unknown = (fd, text) => writeFileSync(fd, text),
+): void {
   const fd = openSync(file, 'wx', 0o600);
+  let written = false;
   try {
-    writeSync(fd, String(process.pid));
-  } catch {
-    /* held all the same; with no holder named it is judged by its age */
+    write(fd, content);
+    // Read back, since a write can come up short and a lock without its whole
+    // pid names no holder.
+    if (readFileSync(file, 'utf8') !== content) {
+      throw Object.assign(new Error(`could not write all of ${file}`), { code: 'EIO' });
+    }
+    written = true;
   } finally {
-    closeSync(fd);
+    try {
+      if (!written) removeOwnFailedLock(file, fd);
+    } finally {
+      closeSync(fd);
+    }
   }
 }
 
-function ownedHandle(lockFile: string): LockHandle {
+/**
+ * Remove a lock this attempt created but could not finish, and only that one:
+ * compared with the open file, which keeps its identity from being reused,
+ * and under the takeover guard, so no takeover replaces it between the look
+ * and the removal. Without the guard it is left, since whoever holds the
+ * guard is taking it over.
+ */
+function removeOwnFailedLock(file: string, fd: number): void {
+  const guard = `${file}.takeover`;
+  if (!takeGuard(guard)) return;
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    const current = statSync(file, { bigint: true });
+    if (opened.dev === current.dev && opened.ino === current.ino) rmSync(file, { force: true });
+  } catch {
+    /* already gone */
+  } finally {
+    try {
+      rmdirSync(guard);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/**
+ * The one rule by which a running holder's lock may be taken over: once it is
+ * older than the longest hold.
+ */
+function pastLongestHold(age: number, maxHoldMs: number): boolean {
+  return age > maxHoldMs;
+}
+
+function ownedHandle(lockFile: string, token: symbol, maxHoldMs: number, now: () => number): LockHandle {
   let released = false;
   return {
     held: true,
     release: () => {
       if (released) return;
       released = true;
+      // Only while the lock is still this acquisition's: a holder that ran past
+      // the longest hold may have been taken over, by another task of this
+      // process (which replaced it in heldHere) or by another process (whose
+      // pid is in the file now), and the lock is then the new holder's.
+      const key = path.resolve(lockFile);
+      if (heldHere.get(key) !== token) return;
+      heldHere.delete(key);
+      // A running holder's lock is taken over only once it is older than the
+      // longest hold, so while it is younger than half of that, a takeover
+      // practically cannot replace it between the look and the removal, short
+      // of this process pausing for at least half the longest hold in between
+      // (30 seconds for an event, five and a half minutes for a repair). Past
+      // that, both happen under the takeover guard, and the lock is left when
+      // the guard cannot be had, since whoever holds it is taking it over.
+      // Short holds, as every event's is, never pay for the guard.
+      const since = mtimeMs(lockFile);
+      const young = since !== null && now() - since < maxHoldMs / 2;
+      const guard = `${lockFile}.takeover`;
+      const guarded = !young && takeGuard(guard);
+      if (!young && !guarded) return;
       try {
-        rmSync(lockFile, { force: true });
+        if (lockHolder(lockFile) === process.pid) rmSync(lockFile, { force: true });
       } catch {
         /* already gone */
+      } finally {
+        if (guarded) {
+          try {
+            rmdirSync(guard);
+          } catch {
+            /* already gone */
+          }
+        }
       }
     },
   };
+}
+
+/**
+ * Take the takeover guard, trying for about half a second: a takeover holds it
+ * for a few file operations, and Windows refuses a new folder for a moment
+ * while the last one of that name is still being removed.
+ */
+function takeGuard(guard: string): boolean {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      mkdirSync(guard);
+      return true;
+    } catch {
+      sleepSync(25);
+    }
+  }
+  return false;
 }
 
 function isAbandoned(
@@ -234,12 +344,16 @@ function isAbandoned(
   const age = now - since;
   const holder = lockHolder(lockFile);
   if (holder === null) return age > staleMs;
-  return age > maxHoldMs || !running(holder);
+  // This process's own pid with no acquisition of this process holding the
+  // lock: a dead ccx left it, and Windows has given its pid to this process.
+  if (holder === process.pid && !heldHere.has(path.resolve(lockFile))) return true;
+  return pastLongestHold(age, maxHoldMs) || !running(holder);
 }
 
 function lockHolder(lockFile: string): number | null {
   try {
-    const pid = Number(readFileSync(lockFile, 'utf8').trim());
+    // The pid comes first; older builds wrote it alone.
+    const pid = Number(readFileSync(lockFile, 'utf8').trim().split(/\s+/)[0]);
     return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
   } catch {
     return null; // a directory from an older build, or unreadable

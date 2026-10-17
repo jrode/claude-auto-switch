@@ -7,9 +7,14 @@ import type { ClaudeInvoker } from '../invoker.js';
 import { RealClaudeError } from '../util/errors.js';
 import { writeJsonFile } from '../util/fs-json.js';
 import {
+  aboutTime,
   cannotFindClaude,
+  CLOCK_AHEAD_MS,
   findRealClaude,
+  SETTLED_MS,
   inspectNpmInstall,
+  isCutShortWindowsProgram,
+  isWholeWindowsProgram,
   isWindowsProgram,
   nodeClaudeFs,
   type BrokenNpmInstall,
@@ -74,6 +79,9 @@ export interface LaunchDeps extends Omit<ResolveDeps, 'fs'>, Partial<RepairDeps>
   /** Where a repair that failed is written down, so the next run does not repeat it. */
   memoryFile?: () => string;
   memory?: RepairMemory;
+  /** Where the size of a platform program seen cut short is written down, to tell a download from a leftover. */
+  sizesFile?: () => string;
+  sizes?: SizeMemory;
   /** Shared by every resolve in one ccx run, so the repair is tried at most once. */
   run?: { repairTried: boolean };
 }
@@ -93,16 +101,60 @@ export interface RepairMemory {
   set(folder: string, failed: FailedRepair | null): void;
 }
 
+/** A platform program's size when first seen at that size. */
+export interface SizeSeen {
+  size: number;
+  at: string;
+}
+
+export interface SizeMemory {
+  get(file: string): SizeSeen | null;
+  set(file: string, seen: SizeSeen | null): void;
+}
+
+/**
+ * How long a platform program cut short of its headers must stay one size
+ * before ccx takes it for a dead npm's leftover and reinstalls. Twice npm's
+ * own fetch timeout (fetch-timeout, five minutes by default): an npm still
+ * waiting on a slow registry has given up by then, and a download that has
+ * not moved for that long is not going to finish.
+ */
+export const STALLED_MS = 10 * 60_000;
+
 export interface RepairOptions {
   /** Repair only this install folder: the one a launch is about to start. */
   only?: string;
-  /** Repair what an earlier repair failed on too, as `ccx doctor --fix` asks. */
+  /**
+   * Repair what an earlier repair failed on, and what npm may still be
+   * writing, as `ccx doctor --fix` asks.
+   */
   force?: boolean;
+  /**
+   * Claude starts anyway (from the platform package): say what is done, not
+   * why something is not. Doctor reports those.
+   */
+  quiet?: boolean;
+}
+
+/**
+ * How long a failed repair holds off the next automatic one while the install
+ * stays as it was. A failure that cannot be fixed by trying again (npm leaving
+ * no program) then costs one npm run an hour of use, where a passing one (no
+ * network, the registry, npm's own timeout) clears within the hour, without
+ * waiting for anyone to run ccx doctor --fix.
+ */
+export const FAILED_REPAIR_HOLD_MS = 60 * 60_000;
+
+/** Whether a failed repair still holds off the next one, by the time it was written. */
+function stillHolds(failed: FailedRepair, now: number): boolean {
+  const age = now - Date.parse(failed.at);
+  return age >= -CLOCK_AHEAD_MS && age < FAILED_REPAIR_HOLD_MS;
 }
 
 const PACKAGE = '@anthropic-ai/claude-code';
 export const REPAIR_LOCK = 'claude-repair.lock';
 export const REPAIR_MEMORY = 'claude-repair.json';
+export const REPAIR_SIZES = 'claude-repair-sizes.json';
 const NPM_TIMEOUT_MS = 10 * 60_000;
 /**
  * The longest one hold of the lock can last: it covers one install's repair,
@@ -137,7 +189,7 @@ export function resolveClaudeForLaunch(deps: LaunchDeps = {}): ClaudeInvoker {
       ? search.broken[0]
       : undefined;
   if (!target) return launchable(search, platform, []);
-  const failures = repairClaudeInstalls(withFs, { only: target.folder });
+  const failures = repairClaudeInstalls(withFs, { only: target.folder, quiet: search.fromPlatformPackage });
   return launchable(findRealClaude(withFs), platform, failures);
 }
 
@@ -159,14 +211,16 @@ export function repairClaudeInstalls(deps: LaunchDeps, options: RepairOptions = 
   const fs = deps.fs ?? nodeRepairFs;
   const say = deps.say ?? ((line: string) => void process.stderr.write(`${line}\n`));
   const notRepaired = (reason: string): string[] => {
-    say(`ccx: did not repair Claude Code: ${reason}`);
+    if (!options.quiet) say(`ccx: did not repair Claude Code: ${reason}`);
     return [reason];
   };
   let lockFile: string;
   let memory: RepairMemory;
+  let sizes: SizeMemory;
   try {
     lockFile = (deps.lockFile ?? (() => path.join(configHome({}), REPAIR_LOCK)))();
     memory = deps.memory ?? fileRepairMemory((deps.memoryFile ?? (() => path.join(configHome({}), REPAIR_MEMORY)))());
+    sizes = deps.sizes ?? fileSizeMemory((deps.sizesFile ?? (() => path.join(configHome({}), REPAIR_SIZES)))());
   } catch (err) {
     return [`ccx could not find its own folder for its repair lock (${(err as Error).message})`];
   }
@@ -184,6 +238,9 @@ export function repairClaudeInstalls(deps: LaunchDeps, options: RepairOptions = 
     if (!handle.held && !fs.exists(lockFile)) handle = lock(0);
     if (!handle.held) {
       if (!fs.exists(lockFile)) return [...failures, ...notRepaired(`ccx could not make its repair lock, ${lockFile}`)];
+      // Claude starts from the platform program anyway, and the repair is the
+      // other ccx's: no reason to make this launch wait for it.
+      if (options.quiet) return failures;
       say('ccx: another ccx is repairing Claude Code; waiting for it to finish');
       handle = lock(LOCK_WAIT_MS);
       if (!handle.held) {
@@ -193,7 +250,7 @@ export function repairClaudeInstalls(deps: LaunchDeps, options: RepairOptions = 
     try {
       // Looked at again under the lock: the ccx that held it may have repaired it.
       const install = findRealClaude({ ...deps, fs }).broken.find((found) => same(found.folder, folder));
-      if (install) failures.push(...repairOne(install, { ...deps, fs, say }, memory, options.force === true));
+      if (install) failures.push(...repairOne(install, { ...deps, fs, say }, memory, sizes, options));
     } finally {
       handle.release();
     }
@@ -201,28 +258,83 @@ export function repairClaudeInstalls(deps: LaunchDeps, options: RepairOptions = 
   return failures;
 }
 
-function repairOne(install: BrokenNpmInstall, deps: LaunchDeps & RepairDeps, memory: RepairMemory, force: boolean): string[] {
+function repairOne(
+  install: BrokenNpmInstall,
+  deps: LaunchDeps & RepairDeps,
+  memory: RepairMemory,
+  sizes: SizeMemory,
+  options: RepairOptions,
+): string[] {
   const fs = deps.fs ?? nodeRepairFs;
+  const force = options.force === true;
   const notRepaired = (reason: string): string[] => {
-    deps.say(`ccx: did not repair Claude Code: ${reason}`);
+    if (!options.quiet) deps.say(`ccx: did not repair Claude Code: ${reason}`);
     return [reason];
   };
   // Asked first: what a failed repair of ccx's own left behind is recent too,
   // and is not npm at work.
   const remembered = memory.get(install.folder);
-  if (!force && remembered && remembered.stamp === stampOf(install, fs)) {
+  if (!force && remembered && stillHolds(remembered, (deps.now ?? Date.now)()) && remembered.stamp === stampOf(install, fs)) {
     return notRepaired(
-      `ccx tried on ${remembered.at} and could not (${remembered.reason}); it tries again once the install changes, or when you run ccx doctor --fix`,
+      `ccx tried on ${remembered.at} and could not (${remembered.reason}); it tries again once the install changes or an hour has passed, or when you run ccx doctor --fix`,
     );
   }
+  const now = (deps.now ?? Date.now)();
+  const busyWhy = `${install.folder} changed moments ago, so npm may still be installing it`;
   if (install.busy) {
-    return notRepaired(`${install.folder} changed in the last few minutes, so npm may still be installing it; ccx leaves it alone until it settles`);
+    // A whole platform program can be put in place beside a running npm, as
+    // its own setup step does; a second npm on the same folder cannot run
+    // beside it, so nothing starts one while the install may be busy.
+    if (!(force && install.platformProgram)) {
+      return notRepaired(
+        `${busyWhy}; ccx leaves it alone until nothing in it has changed for ${SETTLED_MS / 60_000} minutes, ` +
+          `${aboutTime(install.settlesInMs ?? 0)} more. Start Claude or run ccx doctor --fix again then`,
+      );
+    }
   }
-  const result = install.platformProgram ? placeProgram(install, deps) : reinstallWithNpm(install, deps);
+  // A program shorter than its headers say is one npm is still downloading, or
+  // install.cjs still copying, or one left when either died. Windows may not
+  // move a change time while a handle writes, so the file's own size is what
+  // shows whether it still grows: nothing is replaced, and no npm is started,
+  // until each such file has stayed one size for STALLED_MS. Every file's size
+  // is written down on the same pass, so two such files wait once, not twice.
+  if (install.platformProgram) sizes.set(install.platformProgram, null); // whole now: nothing to watch
+  const watched = [
+    ...(install.state === 'cut-short' ? [install.program] : []),
+    ...(install.partialProgram && !install.platformProgram ? [install.partialProgram.file] : []),
+  ];
+  const waiting: string[] = [];
+  for (const file of watched) {
+    const size = fs.size(file) ?? -1;
+    const seen = sizes.get(file);
+    const since = seen ? Date.parse(seen.at) : Number.NaN;
+    if (!seen || seen.size !== size || Number.isNaN(since) || now - since < -CLOCK_AHEAD_MS) {
+      sizes.set(file, { size, at: new Date(now).toISOString() });
+      waiting.push(
+        `${file} is shorter than its own headers say (${size} bytes), so it may still be being written. ` +
+          `ccx repairs it only once it has stayed that size for ${STALLED_MS / 60_000} minutes`,
+      );
+    } else if (now - since < STALLED_MS) {
+      waiting.push(
+        `${file} has stayed at ${size} bytes for ${aboutTime(Math.max(0, now - since))}; ccx repairs it once ` +
+          `that reaches ${STALLED_MS / 60_000} minutes, ${aboutTime(STALLED_MS - Math.max(0, now - since))} more`,
+      );
+    }
+    // Otherwise it stopped growing long ago, so what is there was left by a writer that died.
+  }
+  if (waiting.length > 0) return notRepaired(waiting.join('; '));
+  // Said only once the repair is really going ahead.
+  if (install.busy) deps.say(`ccx: ${busyWhy}; putting its program in place anyway, as ccx doctor --fix asks`);
+  // When Claude starts anyway, what the repair says is kept back unless it worked.
+  const heldBack: string[] = [];
+  const repairDeps = options.quiet ? { ...deps, say: (line: string) => void heldBack.push(line) } : deps;
+  const result = install.platformProgram ? placeProgram(install, repairDeps) : reinstallWithNpm(install, repairDeps);
+  if (result.repaired) heldBack.forEach((line) => deps.say(line));
   // ccx's own changes are finished, so nothing here is still being written.
   const after = inspectNpmInstall(install.folder, fs, deps.arch, { settledMs: 0 });
   if (result.repaired || after === null) {
     memory.set(install.folder, null);
+    for (const file of watched) sizes.set(file, null);
     return [];
   }
   memory.set(install.folder, {
@@ -250,29 +362,65 @@ export function stampOf(install: BrokenNpmInstall, fs: ClaudeFs): string {
 
 /** Failed repairs, kept in a JSON file in ccx's folder, one per install folder. */
 export function fileRepairMemory(file: string): RepairMemory {
-  const read = (): Record<string, FailedRepair> => {
+  return jsonRecords<FailedRepair>(
+    file,
+    (entry): entry is FailedRepair =>
+      typeof entry === 'object' &&
+      entry !== null &&
+      typeof (entry as FailedRepair).stamp === 'string' &&
+      typeof (entry as FailedRepair).reason === 'string',
+  );
+}
+
+/** Sizes of platform programs seen cut short, kept in a JSON file in ccx's folder, one per file. */
+export function fileSizeMemory(file: string, now: () => number = Date.now): SizeMemory {
+  return jsonRecords<SizeSeen>(
+    file,
+    (entry): entry is SizeSeen =>
+      typeof entry === 'object' &&
+      entry !== null &&
+      typeof (entry as SizeSeen).size === 'number' &&
+      typeof (entry as SizeSeen).at === 'string',
+    // A size is needed for STALLED_MS; one a day old is for a file long since
+    // repaired or gone, and is dropped when the next is written.
+    (entry) => !(now() - Date.parse(entry.at) < SIZE_RECORD_MS),
+  );
+}
+
+const SIZE_RECORD_MS = 24 * 60 * 60_000;
+
+/** Records in a JSON file, one per path, compared the way Windows compares paths. */
+function jsonRecords<T>(
+  file: string,
+  isEntry: (entry: unknown) => entry is T,
+  isStale: (entry: T) => boolean = () => false,
+): { get(key: string): T | null; set(key: string, value: T | null): void } {
+  const read = (): Record<string, unknown> => {
     try {
       const data = JSON.parse(readFileSync(file, 'utf8')) as unknown;
-      return data !== null && typeof data === 'object' ? (data as Record<string, FailedRepair>) : {};
+      return data !== null && typeof data === 'object' ? (data as Record<string, unknown>) : {};
     } catch {
       return {};
     }
   };
   return {
-    get: (folder) => {
-      const entry = read()[folder.toLowerCase()];
-      return entry && typeof entry.stamp === 'string' && typeof entry.reason === 'string' ? entry : null;
+    get: (key) => {
+      const entry = read()[key.toLowerCase()];
+      return isEntry(entry) ? entry : null;
     },
-    set: (folder, failed) => {
+    set: (key, value) => {
       const all = read();
-      const key = folder.toLowerCase();
-      if (!failed && !(key in all)) return;
-      if (failed) all[key] = failed;
-      else delete all[key];
+      const name = key.toLowerCase();
+      if (!value && !(name in all)) return;
+      if (value) all[name] = value;
+      else delete all[name];
+      for (const [other, entry] of Object.entries(all)) {
+        if (other !== name && isEntry(entry) && isStale(entry)) delete all[other];
+      }
       try {
         writeJsonFile(file, all);
       } catch {
-        // Only a courtesy: without it the next run tries the repair again.
+        // Only a courtesy: without it the next run judges afresh.
       }
     },
   };
@@ -302,19 +450,21 @@ export function takeRepairLock(
  * Put the platform package's program in place as `bin\claude.exe`, the way
  * the package's own install.cjs does: a hardlink, else a copy. No network.
  *
- * Only a placeholder or an empty spot is ever replaced. The placeholder is
- * renamed aside first and put back if nothing could take its place, and a
- * rename Windows refuses means another process has the file open, so the
- * repair stops there without touching it.
+ * Only a placeholder, a copy cut short of its own headers, or an empty spot is
+ * ever replaced, never a whole program. What is there is renamed aside first
+ * and put back if nothing could take its place, and a rename Windows refuses
+ * means another process has the file open, so the repair stops there without
+ * touching it.
  */
 export function placeProgram(install: BrokenNpmInstall, deps: Pick<RepairDeps, 'fs' | 'say'>): RepairResult {
   const fs = deps.fs ?? nodeRepairFs;
   const from = install.platformProgram;
   const to = install.program;
-  if (!from || isWindowsProgram(fs, from) !== true) {
-    return { repaired: false, reason: `the platform package has no program to put in place for ${install.folder}` };
+  if (!from || isWindowsProgram(fs, from) !== true || !isWholeWindowsProgram(fs, from)) {
+    return { repaired: false, reason: `the platform package has no whole program to put in place for ${install.folder}` };
   }
-  const isPlaceholder = (file: string): boolean => fs.isFile(file) && isWindowsProgram(fs, file) === false;
+  const isPlaceholder = (file: string): boolean =>
+    fs.isFile(file) && (isWindowsProgram(fs, file) === false || isCutShortWindowsProgram(fs, file));
   const occupied = fs.exists(to);
   if (occupied && !isPlaceholder(to)) {
     return { repaired: false, reason: `${to} is no longer the placeholder, so ccx left it alone` };
@@ -436,7 +586,9 @@ export function reinstallWithNpm(install: BrokenNpmInstall, deps: RepairDeps): R
         ? `${after.folder} is still not there`
         : after.state === 'missing'
           ? `${after.program} is still not there`
-          : `${after.program} is still only the placeholder`;
+          : after.state === 'cut-short'
+            ? `${after.program} is still cut short`
+            : `${after.program} is still only the placeholder`;
     const reason = `npm finished, but ${still}`;
     deps.say(`ccx: ${reason}`);
     return { repaired: false, reason };

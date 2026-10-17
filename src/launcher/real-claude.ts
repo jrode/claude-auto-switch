@@ -29,6 +29,8 @@ export interface ClaudeFs {
   list(dir: string): string[];
   /** When a file or folder last changed, in milliseconds, or null when it is not there. */
   modifiedAt(file: string): number | null;
+  /** A file's length in bytes, or null when it is not there. */
+  size(file: string): number | null;
 }
 
 export const nodeClaudeFs: ClaudeFs = {
@@ -95,6 +97,13 @@ export const nodeClaudeFs: ClaudeFs = {
       return null;
     }
   },
+  size: (file) => {
+    try {
+      return statSync(file).size;
+    } catch {
+      return null;
+    }
+  },
 };
 
 export interface ResolveDeps {
@@ -132,13 +141,21 @@ export interface BrokenNpmInstall {
   prefix: string;
   /** `<folder>\bin\claude.exe`, which the shims run. */
   program: string;
-  state: 'missing' | 'placeholder' | 'folder-missing';
+  /** `cut-short`: a program shorter than its own headers say, a copy that has not finished. */
+  state: 'missing' | 'placeholder' | 'cut-short' | 'folder-missing';
   /** The platform package's own program, when npm left a real one and is not still writing it. */
   platformProgram: string | null;
   /** From its package.json, or the one npm left in the folder it moved aside; null when neither names one. */
   version: string | null;
-  /** Changed in the last few minutes, so npm may still be installing it: nothing is taken from it or done to it. */
+  /** Changed in the last few minutes, so npm may still be installing it, and ccx does not repair it. */
   busy: boolean;
+  /** While busy: how long until it has gone unchanged for SETTLED_MS. */
+  settlesInMs?: number;
+  /**
+   * A platform program shorter than its own headers say: one npm is still
+   * downloading, or one a dead npm left. Its size tells which, over time.
+   */
+  partialProgram?: { file: string; size: number };
 }
 
 export interface ClaudeSearch {
@@ -232,7 +249,19 @@ export function describeBrokenInstall(install: BrokenNpmInstall): string {
   if (install.state === 'placeholder') {
     return `${install.folder}: its bin\\claude.exe is only the placeholder npm puts there first, a short script rather than the program`;
   }
+  if (install.state === 'cut-short') {
+    return `${install.folder}: its bin\\claude.exe is shorter than its own headers say, a copy of the program that never finished`;
+  }
   return `${install.folder}: the folder is not there, though npm's claude shims in ${install.prefix} still point into it`;
+}
+
+/** What ccx waits for on an install npm may still be writing, and for how long. */
+export function settlingLine(broken: BrokenNpmInstall[]): string {
+  const longest = Math.max(0, ...broken.map((install) => (install.busy ? (install.settlesInMs ?? 0) : 0)));
+  return (
+    `It changed moments ago, so npm may still be installing it. ccx leaves it alone until nothing in it has ` +
+    `changed for ${SETTLED_MS / 60_000} minutes, ${aboutTime(longest)} more; start Claude or run ccx doctor --fix again then.`
+  );
 }
 
 function brokenInstallMessage(broken: BrokenNpmInstall[], repairFailures: string[]): string {
@@ -240,9 +269,7 @@ function brokenInstallMessage(broken: BrokenNpmInstall[], repairFailures: string
     "Claude Code's npm install is missing its program, so Claude cannot start:",
     ...broken.map((install) => `  ${describeBrokenInstall(install)}`),
     'This usually happens when an update ran while Claude was open.',
-    ...(broken.some((install) => install.busy)
-      ? ['It changed in the last few minutes, so npm may still be installing it; try again once that has finished.']
-      : []),
+    ...(broken.some((install) => install.busy) ? [settlingLine(broken)] : []),
     ...(repairFailures.length > 0
       ? ['', 'ccx tried to repair it and could not:', ...repairFailures.map((reason) => `  ${reason}`)]
       : []),
@@ -269,14 +296,22 @@ function pickOnWindows(
   execPath: string,
 ): { bin: string; prefixArgs: string[] } | undefined {
   const p = path.win32;
-  const directExe = candidates.find((c) => /\.exe$/i.test(c) && isWindowsProgram(fs, c) !== false);
+  // One of Claude Code's own npm files cut short of its own headers is half
+  // copied, and is not started wherever it is found: npm's bin\claude.exe
+  // arrives here directly from the default prefixes (%APPDATA%\npm,
+  // C:\Program Files\nodejs). Any other .exe is judged as before, since the
+  // length rule was checked against Claude Code's program and no other.
+  const whole = (exe: string): boolean =>
+    isWindowsProgram(fs, exe) !== false && !(isClaudeNpmProgram(exe) && isCutShortWindowsProgram(fs, exe));
+  const directExe = candidates.find((c) => /\.exe$/i.test(c) && whole(c));
   if (directExe) return { bin: directExe, prefixArgs: [] };
 
   // Prefer the standard npm install layout (a real file) BEFORE trusting text
   // scraped from a .cmd shim.
+  const usable = (exe: string): boolean => fs.isFile(exe) && whole(exe);
   for (const candidate of candidates) {
     const guess = p.join(p.dirname(candidate), ...NPM_PACKAGE, 'bin', 'claude.exe');
-    if (fs.isFile(guess) && isWindowsProgram(fs, guess) !== false) return { bin: guess, prefixArgs: [] };
+    if (usable(guess)) return { bin: guess, prefixArgs: [] };
   }
   for (const candidate of candidates) {
     const folder = p.join(p.dirname(candidate), ...NPM_PACKAGE);
@@ -289,7 +324,7 @@ function pickOnWindows(
   }
   for (const candidate of candidates) {
     const derived = deriveExeFromCmd(candidate, fs);
-    if (derived && fs.isFile(derived) && isWindowsProgram(fs, derived) !== false) return { bin: derived, prefixArgs: [] };
+    if (derived && usable(derived)) return { bin: derived, prefixArgs: [] };
   }
   // Never fall back to a non-.exe on Windows: node-pty cannot launch a .cmd
   // (and routing a .cmd through cmd.exe is an argument-escaping hazard). Failing
@@ -330,6 +365,104 @@ export function isWindowsProgram(fs: ClaudeFs, file: string): boolean | null {
   return start.length === 2 && start[0] === 0x4d && start[1] === 0x5a;
 }
 
+/**
+ * Whether a Windows program is all there: at least as long as its own headers
+ * say. npm writes the platform program from its start to its end, so one still
+ * being written is shorter than the extent its sections and its signature
+ * give. A change time cannot show this: Windows may not move a file's change
+ * time while the handle writing it is still open.
+ */
+export function isWholeWindowsProgram(fs: ClaudeFs, file: string): boolean {
+  return shortOfHeaders(fs, file) === false;
+}
+
+/** Whether a file is one of Claude Code's own npm programs: the package's bin\claude.exe, or a platform package's. */
+function isClaudeNpmProgram(file: string): boolean {
+  return (
+    endsWithParts(file, [...NPM_PACKAGE, 'bin', 'claude.exe']) ||
+    Object.values(PLATFORM_PACKAGES).some((name) => endsWithParts(file, ['node_modules', '@anthropic-ai', name, 'claude.exe']))
+  );
+}
+
+/**
+ * Whether a program is shown to be cut short: its headers read, and it is
+ * shorter than they say. Headers that cannot be read show nothing, so this
+ * never refuses a program it does not understand.
+ */
+export function isCutShortWindowsProgram(fs: ClaudeFs, file: string): boolean {
+  return shortOfHeaders(fs, file) === true;
+}
+
+/**
+ * How far a certificate table may end past the file. The table's length is
+ * rounded up to eight bytes, and a signer need not write the padding.
+ */
+const SIGNATURE_PADDING = 7;
+
+/** True when shorter than its headers say, false when not, null when they cannot be read. */
+function shortOfHeaders(fs: ClaudeFs, file: string): boolean | null {
+  const size = fs.size(file);
+  const head = fs.readStart(file, 64 * 1024);
+  if (size === null || head === null) return null;
+  const extent = programExtent(head);
+  if (extent === null) return null;
+  return size < extent.sections || size + SIGNATURE_PADDING < extent.signature;
+}
+
+/**
+ * The extent a program's PE headers declare, from the start of the file: the
+ * end of its last section, or of its signature (the certificate table, which
+ * sits after everything else in a signed program such as Claude Code's).
+ * Null when the headers cannot be read from `head`.
+ */
+export function declaredProgramSize(head: Uint8Array): number | null {
+  const extent = programExtent(head);
+  if (extent === null) return null;
+  const end = Math.max(extent.sections, extent.signature);
+  return end > 0 ? end : null;
+}
+
+/**
+ * Where a program's sections end and where its signature ends (0 when it has
+ * none). A section with no raw data takes no room in the file, whatever its
+ * offset says, as Windows reads it.
+ */
+function programExtent(head: Uint8Array): { sections: number; signature: number } | null {
+  const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+  const u16 = (at: number): number | null => (at >= 0 && at + 2 <= head.length ? view.getUint16(at, true) : null);
+  const u32 = (at: number): number | null => (at >= 0 && at + 4 <= head.length ? view.getUint32(at, true) : null);
+  if (u16(0) !== 0x5a4d) return null; // "MZ"
+  const pe = u32(0x3c);
+  if (pe === null || u32(pe) !== 0x00004550) return null; // "PE\0\0"
+  const sections = u16(pe + 6);
+  const optionalSize = u16(pe + 20);
+  if (sections === null || optionalSize === null) return null;
+  const optional = pe + 24;
+  const magic = u16(optional);
+  // The data directories, after the optional header's fixed part (PE32+ or PE32).
+  const directories = magic === 0x20b ? optional + 112 : magic === 0x10b ? optional + 96 : null;
+  if (directories === null) return null;
+  let signature = 0;
+  const directoryCount = u32(directories - 4);
+  if (directoryCount !== null && directoryCount > 4) {
+    // Directory 4 is the certificate table, whose address is a file offset.
+    const signatureAt = u32(directories + 4 * 8);
+    const signatureSize = u32(directories + 4 * 8 + 4);
+    if (signatureAt === null || signatureSize === null) return null;
+    if (signatureSize > 0) signature = signatureAt + signatureSize;
+  }
+  let sectionsEnd = 0;
+  const table = optional + optionalSize;
+  for (let i = 0; i < sections; i++) {
+    const rawSize = u32(table + i * 40 + 16);
+    const rawAt = u32(table + i * 40 + 20);
+    if (rawSize === null || rawAt === null) return null;
+    if (rawSize > 0) sectionsEnd = Math.max(sectionsEnd, rawAt + rawSize);
+  }
+  if (sectionsEnd === 0 && signature === 0) return null;
+  return { sections: sectionsEnd, signature };
+}
+
 const NPM_PACKAGE = ['node_modules', '@anthropic-ai', 'claude-code'];
 
 /** The platform package npm installs for each processor, as install.cjs names them. */
@@ -360,11 +493,35 @@ function brokenNpmInstalls(candidates: string[], fs: ClaudeFs, arch: string, now
 }
 
 /**
- * How long an install must have gone unchanged before ccx takes anything from
- * it or repairs it. npm writes the placeholder, then streams the platform
- * package's program of about 290 MB, and a half-written one already starts "MZ".
+ * How long an install must have gone unchanged before ccx repairs it. npm
+ * writes the placeholder, then streams the platform package's program of about
+ * 290 MB, then runs the setup step that puts it in place.
  */
 export const SETTLED_MS = 3 * 60_000;
+
+/**
+ * How long the platform program itself must have gone unchanged, besides being
+ * whole by its own headers, before ccx starts Claude from it. npm writes it as
+ * fast as the download arrives, so where Windows moves the change time as it
+ * writes, half a minute without a change is a stall far longer than a working
+ * download has, and short enough that someone who just ran npm with install
+ * scripts off barely waits.
+ */
+export const PROGRAM_QUIET_MS = 30_000;
+
+/**
+ * How far ahead of the clock a change time is believed. Times on one machine
+ * come from one clock, so one ahead by more than a moment was written while
+ * the clock was set wrong, and says nothing about whether npm is at work now.
+ */
+export const CLOCK_AHEAD_MS = 2_000;
+
+/** A wait, in words: "about 40 seconds", "about 3 minutes". */
+export function aboutTime(ms: number): string {
+  const seconds = Math.max(1, Math.ceil(ms / 1000));
+  if (seconds < 90) return `about ${seconds} second${seconds === 1 ? '' : 's'}`;
+  return `about ${Math.ceil(seconds / 60)} minutes`;
+}
 
 export interface InspectOptions {
   now?: number;
@@ -391,13 +548,21 @@ export function inspectNpmInstall(
   const scope = p.dirname(folder);
   const now = options.now ?? Date.now();
   const settledMs = options.settledMs ?? SETTLED_MS;
+  /** How long ago a file changed, when that was within `withinMs`; null otherwise. */
+  const changedWithin = (file: string, withinMs: number): number | null => {
+    const at = fs.modifiedAt(file);
+    if (at === null) return null;
+    const age = now - at;
+    return age >= -CLOCK_AHEAD_MS && age < withinMs ? Math.max(0, age) : null;
+  };
   // What npm touches while it replaces the package: the scope folder it renames
   // the old package within, the folder it moves aside, and the new package.
-  const changing = (files: string[]): boolean =>
-    [scope, ...retiredFolders(folder, fs), ...files].some((file) => {
-      const at = fs.modifiedAt(file);
-      return at !== null && now - at < settledMs;
-    });
+  const settling = (files: string[]): { busy: boolean; settlesInMs?: number } => {
+    const ages = [scope, ...retiredFolders(folder, fs), ...files]
+      .map((file) => changedWithin(file, settledMs))
+      .filter((age): age is number => age !== null);
+    return ages.length === 0 ? { busy: false } : { busy: true, settlesInMs: settledMs - Math.min(...ages) };
+  };
 
   if (!fs.isDirectory(folder)) {
     if (!shimsPointInto(prefix, fs)) return null;
@@ -409,7 +574,7 @@ export function inspectNpmInstall(
       state: 'folder-missing',
       platformProgram: null,
       version: leftoverVersion(folder, fs),
-      busy: changing([]),
+      ...settling([]),
     };
   }
   // Classed by what the package says it runs, never by the absence of a file
@@ -419,18 +584,37 @@ export function inspectNpmInstall(
     ? 'missing'
     : fs.isFile(program) && isWindowsProgram(fs, program) === false
       ? 'placeholder'
-      : null;
+      : fs.isFile(program) && isCutShortWindowsProgram(fs, program)
+        ? 'cut-short'
+        : null;
   if (!state) return null;
   const places = platformPrograms(folder, arch);
-  const busy = changing([folder, program, ...places]);
+  const quietMs = Math.min(settledMs, PROGRAM_QUIET_MS);
+  // Judged on its own, even while the rest of the install is still settling:
+  // whole by its own headers, and left alone for a while besides.
+  const platformProgram =
+    places.find(
+      (exe) =>
+        fs.isFile(exe) &&
+        isWindowsProgram(fs, exe) === true &&
+        isWholeWindowsProgram(fs, exe) &&
+        changedWithin(exe, quietMs) === null,
+    ) ?? null;
+  // Shorter than its headers say: whether npm is still writing it shows in its
+  // size over time, which the repair keeps track of (claude-repair).
+  const partial = platformProgram
+    ? undefined
+    : places.find((exe) => fs.isFile(exe) && isCutShortWindowsProgram(fs, exe));
+  const partialSize = partial ? fs.size(partial) : null;
   return {
     folder,
     prefix,
     program,
     state,
-    platformProgram: busy ? null : (places.find((exe) => fs.isFile(exe) && isWindowsProgram(fs, exe) === true) ?? null),
+    platformProgram,
     version: versionOf(folder, fs),
-    busy,
+    ...settling([folder, program, ...places]),
+    ...(partial && partialSize !== null ? { partialProgram: { file: partial, size: partialSize } } : {}),
   };
 }
 

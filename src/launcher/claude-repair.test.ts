@@ -5,12 +5,14 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { buildContext, claudeForSession, getClaude, getClaudeAsIs } from '../context.js';
 import {
+  fileSizeMemory,
   nodeRepairFs,
   npmFor,
   placeProgram,
   repairClaudeInstalls,
   resolveClaudeForLaunch,
   runNpm,
+  stampOf,
   takeRepairLock,
   LOCK_MAX_HOLD_MS,
   LOCK_WAIT_MS,
@@ -18,6 +20,8 @@ import {
   type LaunchDeps,
   type NpmRun,
   type RepairMemory,
+  type SizeMemory,
+  type SizeSeen,
 } from './claude-repair.js';
 import { inspectNpmInstall, type BrokenNpmInstall } from './real-claude.js';
 import { RealClaudeError } from '../util/errors.js';
@@ -29,6 +33,7 @@ import {
   NPM_PLACEHOLDER,
   NPM_SH_SHIM,
   WINDOWS_PROGRAM,
+  windowsProgram,
   type MemoryFs,
 } from '../../test/memory-claude-fs.js';
 
@@ -94,6 +99,18 @@ function memoryOfRepairs(): RepairMemory & { all: Map<string, FailedRepair> } {
   };
 }
 
+/** Sizes of cut-short platform programs, kept in memory as the file in ccx's folder keeps them. */
+function sizesSeen(): SizeMemory {
+  const all = new Map<string, SizeSeen>();
+  return {
+    get: (file) => all.get(file.toLowerCase()) ?? null,
+    set: (file, seen) => {
+      if (seen) all.set(file.toLowerCase(), seen);
+      else all.delete(file.toLowerCase());
+    },
+  };
+}
+
 /**
  * Everything the repair talks to, on a Windows disk in memory. npm is a stand-in
  * that never runs: `npm` decides what it leaves on the disk and how it exits.
@@ -129,6 +146,7 @@ function harness(
     },
     say: (line) => said.push(line),
     memory,
+    sizes: sizesSeen(),
     run: { repairTried: false },
   };
   return { deps, said, npmCalls, locks, memory };
@@ -233,7 +251,19 @@ describe('repairing an npm install from its platform package (no network)', () =
     expect(resolveClaudeForLaunch(h.deps).bin).toBe(NESTED);
     expect(fs.content(BIN)).toBe(NPM_PLACEHOLDER);
     expect(fs.changes).toEqual([]);
-    expect(h.said.at(-1)).toContain('in use');
+    // Claude starts anyway, so the launch keeps quiet about the repair it could not make.
+    expect(h.said).toEqual([]);
+    const said: string[] = [];
+    expect(placeProgram(brokenAt(fs), { fs, say: (line) => said.push(line) })).toMatchObject({ repaired: false });
+    expect(said.at(-1)).toContain('in use');
+  });
+
+  it('never puts in place a platform program shorter than its own headers say', () => {
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }));
+    const install = brokenAt(fs);
+    fs.put(NESTED, windowsProgram(4096, 2048), 0);
+    expect(placeProgram(install, { fs, say: () => {} }).repaired).toBe(false);
+    expect(fs.content(BIN)).toBe(NPM_PLACEHOLDER);
   });
 
   it('puts the placeholder back when neither a link nor a copy can be made', () => {
@@ -670,16 +700,106 @@ describe('when the repair is allowed to run', () => {
     expect(h.memory.all.size).toBe(0);
   });
 
-  it('never while npm may still be writing the install, and says so', () => {
+  it('never while npm may still be writing the install, and says how long it holds off', () => {
     const now = Date.parse('2026-10-16T22:00:00Z');
-    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }), {
+    const fs = memoryWindowsFs(missingInstall(), {
       modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 60_000 },
     });
     const h = harness(fs);
     const message = messageOf(() => resolveClaudeForLaunch({ ...h.deps, now: () => now }));
     expect(message).toContain('npm may still be installing it');
+    expect(message).toContain('about 2 minutes more');
     expect(fs.changes).toEqual([]);
     expect(h.npmCalls).toEqual([]);
+  });
+
+  it('starts Claude at once from a whole platform program while the rest settles, and says nothing of the repair it holds off', () => {
+    // Right after `npm i -g` with install scripts off: everything is new and
+    // the platform program is whole, but nothing has put it in place.
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }), {
+      modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 10_000, [BIN]: now - 10_000, [NESTED]: now - 40_000 },
+    });
+    const h = harness(fs);
+    expect(resolveClaudeForLaunch({ ...h.deps, now: () => now }).bin).toBe(NESTED);
+    expect(h.said).toEqual([]);
+    expect(fs.changes).toEqual([]);
+  });
+
+  it('with doctor --fix even while npm may still be writing the install, after saying so', () => {
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }), {
+      modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 60_000, [NESTED]: now - 60_000 },
+    });
+    const h = harness(fs);
+    expect(repairClaudeInstalls({ ...h.deps, now: () => now }, { force: true })).toEqual([]);
+    expect(fs.content(BIN)).toBe(WINDOWS_PROGRAM);
+    expect(h.said.some((line) => line.includes('putting its program in place anyway'))).toBe(true);
+  });
+
+  it('never starts npm while npm may still be writing the install, with doctor --fix or without', () => {
+    // A second npm on the same folder would work against the one still running.
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(missingInstall(), {
+      modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 60_000 },
+    });
+    const h = harness(fs);
+    const failures = repairClaudeInstalls({ ...h.deps, now: () => now }, { force: true });
+    expect(h.npmCalls).toEqual([]);
+    expect(failures.join('\n')).toContain('run ccx doctor --fix again then');
+  });
+
+  it('never starts npm over a platform program still being downloaded, however old its times', () => {
+    // Windows may not move a change time while npm writes, so only the size
+    // shows the download going on: once it holds still long enough, npm left it.
+    const start = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(missingInstall({ [NESTED]: windowsProgram(4096, 2048) }));
+    const h = harness(fs, {
+      npm: (f) => {
+        f.put(BIN, WINDOWS_PROGRAM);
+        return { status: 0 };
+      },
+    });
+    const at = (ms: number): LaunchDeps => ({ ...h.deps, now: () => ms, run: { repairTried: false } });
+    messageOf(() => resolveClaudeForLaunch(at(start)));
+    fs.put(NESTED, windowsProgram(4096, 3072), 0); // it grew
+    messageOf(() => resolveClaudeForLaunch(at(start + 9 * 60_000)));
+    messageOf(() => resolveClaudeForLaunch(at(start + 18 * 60_000)));
+    expect(h.npmCalls).toEqual([]);
+    // The same size for ten minutes and more: a dead npm's leftover, repaired.
+    expect(resolveClaudeForLaunch(at(start + 20 * 60_000)).bin).toBe(BIN);
+    expect(h.npmCalls).toHaveLength(1);
+  });
+
+  it("does not make a launch that starts from the platform program wait for another ccx's repair", () => {
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM, [LOCK]: String(process.pid + 1) }));
+    const h = harness(fs, { lock: () => ({ held: false, release: () => {} }) });
+    expect(resolveClaudeForLaunch(h.deps).bin).toBe(NESTED);
+    expect(h.locks).toEqual([0]);
+    expect(h.said).toEqual([]);
+  });
+
+  it('by itself again an hour after a repair failed, though the install is as it was', () => {
+    // No network, the registry or npm's timeout: trying again later can work.
+    const start = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(missingInstall());
+    const h = harness(fs, { npm: () => ({ status: 1 }) });
+    const at = (ms: number): LaunchDeps => ({ ...h.deps, now: () => ms, run: { repairTried: false } });
+    messageOf(() => resolveClaudeForLaunch(at(start)));
+    messageOf(() => resolveClaudeForLaunch(at(start + 30 * 60_000)));
+    expect(h.npmCalls).toHaveLength(1);
+    messageOf(() => resolveClaudeForLaunch(at(start + 61 * 60_000)));
+    expect(h.npmCalls).toHaveLength(2);
+  });
+
+  it('says nothing at a launch that starts from the platform package about a repair that failed before', () => {
+    // Doctor reports it; saying it on every launch of a Claude that starts is noise.
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }));
+    const h = harness(fs);
+    const failed = { stamp: stampOf(brokenAt(fs), fs), version: '2.1.302', at: new Date().toISOString(), reason: 'it was in use' };
+    h.memory.set(PKG, failed);
+    expect(resolveClaudeForLaunch(h.deps).bin).toBe(NESTED);
+    expect(h.said).toEqual([]);
   });
 
   it('never in a worker, which stops at once, naming ccx doctor --fix', () => {
@@ -710,5 +830,70 @@ describe('when the repair is allowed to run', () => {
     context.claudeSearch = h.deps;
     expect(claudeForSession(context, false).bin).toBe(BIN);
     expect(h.npmCalls).toHaveLength(1);
+  });
+
+  it('puts the whole program over a bin\\claude.exe cut short, once that file has held its size', () => {
+    // A copy install.cjs is still making must not be replaced mid-copy, so it
+    // is judged by its size over time, as the platform program is.
+    const start = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(placeholderInstall({ [BIN]: windowsProgram(4096, 2048), [NESTED]: WINDOWS_PROGRAM }));
+    const h = harness(fs);
+    const at = (ms: number): LaunchDeps => ({ ...h.deps, now: () => ms, run: { repairTried: false } });
+    expect(resolveClaudeForLaunch(at(start)).bin).toBe(NESTED);
+    expect(fs.content(BIN)).toBe(windowsProgram(4096, 2048));
+    expect(repairClaudeInstalls(at(start + 11 * 60_000))).toEqual([]);
+    expect(fs.content(BIN)).toBe(WINDOWS_PROGRAM);
+    expect(h.npmCalls).toEqual([]);
+  });
+
+  it('waits ten minutes once, not once a file, when bin\\claude.exe and the platform program are both cut short', () => {
+    const start = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(
+      missingInstall({ [BIN]: windowsProgram(4096, 2048), [NESTED]: windowsProgram(4096, 1024) }),
+    );
+    const h = harness(fs, {
+      npm: (f) => {
+        f.put(BIN, WINDOWS_PROGRAM);
+        f.put(NESTED, WINDOWS_PROGRAM);
+        return { status: 0 };
+      },
+    });
+    const at = (ms: number): LaunchDeps => ({ ...h.deps, now: () => ms, run: { repairTried: false } });
+    messageOf(() => resolveClaudeForLaunch(at(start)));
+    expect(h.npmCalls).toEqual([]);
+    expect(resolveClaudeForLaunch(at(start + 11 * 60_000)).bin).toBe(BIN);
+    expect(h.npmCalls).toHaveLength(1);
+  });
+
+  it('says "anyway" with doctor --fix only when it really goes ahead', () => {
+    // Busy, and bin\claude.exe cut short and not yet watched for ten minutes:
+    // the repair waits, so it must not first say it is going ahead.
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(placeholderInstall({ [BIN]: windowsProgram(4096, 2048), [NESTED]: WINDOWS_PROGRAM }), {
+      modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 60_000 },
+    });
+    const h = harness(fs);
+    const failures = repairClaudeInstalls({ ...h.deps, now: () => now }, { force: true });
+    expect(failures.join('\n')).toContain('shorter than its own headers say');
+    expect(h.said.some((line) => line.includes('anyway'))).toBe(false);
+    expect(fs.content(BIN)).toBe(windowsProgram(4096, 2048));
+  });
+
+  it('drops the size it kept of a platform program once that program is whole', () => {
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }));
+    const h = harness(fs);
+    h.deps.sizes?.set(NESTED, { size: 2048, at: new Date().toISOString() });
+    resolveClaudeForLaunch(h.deps);
+    expect(h.deps.sizes?.get(NESTED)).toBeNull();
+  });
+
+  it('drops, when it writes one, sizes it kept that are a day old', () => {
+    const file = path.join(mkdtempSync(path.join(tmpdir(), 'cas-sizes-')), 'claude-repair-sizes.json');
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const sizes = fileSizeMemory(file, () => now);
+    sizes.set('C:\\old\\claude.exe', { size: 1, at: new Date(now - 25 * 60 * 60_000).toISOString() });
+    sizes.set('C:\\new\\claude.exe', { size: 2, at: new Date(now).toISOString() });
+    expect(sizes.get('C:\\old\\claude.exe')).toBeNull();
+    expect(sizes.get('C:\\new\\claude.exe')).toMatchObject({ size: 2 });
   });
 });

@@ -66,6 +66,47 @@ semantic versioning.
     waiting on, for example "the usage check could not answer (status 429),
     and Claude has not recorded the turn as refused".
 
+## [2.6.8]
+
+### Fixed
+
+- **Right after `npm i -g @anthropic-ai/claude-code` with install scripts
+  off, Claude starts.** ccx holds off repairing an install that changed in the
+  last three minutes, since npm may still be writing it, and that hold also
+  kept ccx from starting Claude from the second package, so running npm again
+  only started the three minutes over. ccx now judges the second package's
+  program on its own: once it is as long as its own headers say and has gone
+  half a minute without changing, Claude starts from it while the rest
+  settles, without waiting on another ccx's repair. The message says how long
+  the hold has left. `ccx doctor --fix` puts that program in place at once,
+  after saying npm may still be at work, but never starts npm while the
+  install may be busy, since a second npm would work against the first.
+- **A platform program still downloading is never reinstalled over.** One
+  shorter than its own headers say is left while its size changes, and only
+  reinstalled once it has stayed one size for ten minutes, as a dead npm's
+  leftover.
+- **A `bin\claude.exe` cut short of its own headers, a copy that never
+  finished, is never started, wherever it is found.** It counts as a broken
+  install: Claude starts from the whole platform program, `ccx doctor` names
+  it with its fix, and the whole program is put over it once the short file
+  has stayed one size for ten minutes, so a copy still being made is not
+  replaced part way.
+- **A clock that was ahead no longer holds a repair off for hours.** A change
+  time more than two seconds in the future is not taken as a recent change.
+- **A repair that failed once is tried again by itself.** Being offline, a
+  registry error or npm's timeout leaves the install as it was, and ccx used
+  to wait for the install to change before trying again. It now tries again
+  an hour later.
+- **A launch that starts Claude from the second package says nothing about a
+  repair it did not make.** It used to print why on every launch; `ccx
+  doctor` reports it.
+- **Releasing a lock no longer removes another holder's.** A holder whose
+  lock was taken over after it ran past the longest hold removed the new
+  holder's lock when it finished, whether the new holder was another process
+  or another task of the same one. A lock whose holder could not be written
+  (a full disk) is no longer left behind, and a lock a dead ccx left under a
+  pid Windows has since given to this process is taken over at once.
+
 ## [2.6.7]
 
 ### Fixed
@@ -93,10 +134,11 @@ semantic versioning.
     and left behind, if there is one, and is otherwise the current release.
     ccx starts npm as `node.exe` running npm's own script, since Node refuses
     to start `npm.cmd` without a shell.
-  - A launch repairs only the install it is about to start, and only when
-    Claude cannot otherwise start from it; at most once per run, and never
-    while another ccx is repairing, which it waits for instead. `ccx doctor
-    --fix` repairs every broken install it finds.
+  - A launch repairs only the install it is about to start: one Claude could
+    not start from at all, or could start only from the second package. At
+    most once per run, and never while another ccx is repairing, which it
+    waits for instead. `ccx doctor --fix` repairs every broken install it
+    finds.
   - An install that changed in the last few minutes is left alone, since npm
     may still be writing it, and nothing is taken from it.
   - A repair that did not work is written down, and ccx does not run npm for

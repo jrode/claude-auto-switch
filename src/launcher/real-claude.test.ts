@@ -2,7 +2,14 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { findRealClaude, resolveRealClaude, whereItIsUsuallyInstalled, type ClaudeFs } from './real-claude.js';
+import {
+  declaredProgramSize,
+  findRealClaude,
+  isWholeWindowsProgram,
+  resolveRealClaude,
+  whereItIsUsuallyInstalled,
+  type ClaudeFs,
+} from './real-claude.js';
 import { RealClaudeError } from '../util/errors.js';
 import {
   memoryWindowsFs,
@@ -12,6 +19,7 @@ import {
   NPM_PS1_SHIM,
   NPM_SH_SHIM,
   WINDOWS_PROGRAM,
+  windowsProgram,
   type MemoryFs,
 } from '../../test/memory-claude-fs.js';
 
@@ -331,7 +339,7 @@ describe('an install npm may still be writing (Windows)', () => {
   const NOW = Date.parse('2026-10-16T22:00:00Z');
   const SCOPE = `${PREFIX}\\node_modules\\@anthropic-ai`;
 
-  it('never takes a platform program that changed in the last few minutes, which may be half written', () => {
+  it('never takes a platform program that changed in the last half minute, which may be half written', () => {
     const fs = memoryWindowsFs(
       { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER, [NESTED]: WINDOWS_PROGRAM },
       { modified: { [NESTED]: NOW - 5_000 } },
@@ -345,12 +353,173 @@ describe('an install npm may still be writing (Windows)', () => {
   });
 
   it('counts a moved-aside folder npm is still working in as an update running', () => {
+    // Only the moved-aside folder changed, so the test depends on it being looked at.
+    const retired = `${SCOPE}\\.claude-code-Ab3dE9xQ`;
     const fs = memoryWindowsFs(
-      { [CMD]: NPM_CMD_SHIM, [`${SCOPE}\\.claude-code-Ab3dE9xQ\\package.json`]: PACKAGE_JSON },
-      { modified: { [SCOPE]: NOW - 60_000 } },
+      { [CMD]: NPM_CMD_SHIM, [`${retired}\\package.json`]: PACKAGE_JSON },
+      { modified: { [retired]: NOW - 60_000 } },
     );
     const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
     expect(search.broken[0]).toMatchObject({ state: 'folder-missing', busy: true });
+  });
+
+  it('starts Claude from a platform program left alone for half a minute, while the rest still settles', () => {
+    // Right after `npm i -g` with install scripts off: everything is new, and
+    // the platform program is whole, but nothing put it in place.
+    const fs = memoryWindowsFs(
+      { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER, [NESTED]: WINDOWS_PROGRAM },
+      { modified: { [SCOPE]: NOW - 20_000, [PKG]: NOW - 20_000, [BIN]: NOW - 20_000, [NESTED]: NOW - 45_000 } },
+    );
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.bin).toBe(NESTED);
+    expect(search.broken[0]).toMatchObject({ busy: true, settlesInMs: 160_000 });
+  });
+
+  it('never takes a platform program shorter than its own headers say, however long ago it changed', () => {
+    // Windows may not move a file's change time while the handle writing it is
+    // still open, so the time alone is no proof the program is whole.
+    const fs = memoryWindowsFs({
+      [CMD]: NPM_CMD_SHIM,
+      [PKG_JSON]: PACKAGE_JSON,
+      [BIN]: NPM_PLACEHOLDER,
+      [NESTED]: windowsProgram(4096, 2048),
+    });
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.bin).toBeNull();
+    expect(search.broken[0]?.platformProgram).toBeNull();
+  });
+
+  it('notes a platform program cut short, for the repair to watch its size', () => {
+    const fs = memoryWindowsFs({
+      [CMD]: NPM_CMD_SHIM,
+      [PKG_JSON]: PACKAGE_JSON,
+      [BIN]: NPM_PLACEHOLDER,
+      [NESTED]: windowsProgram(4096, 2048),
+    });
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.broken[0]?.partialProgram).toEqual({ file: NESTED, size: 2048 });
+  });
+
+  it('never starts a bin\\claude.exe cut short of its own headers, which is half copied, and counts it broken', () => {
+    const fs = memoryWindowsFs({ [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: windowsProgram(4096, 2048) });
+    const search = findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.bin).toBeNull();
+    expect(search.broken.map((b) => b.state)).toEqual(['cut-short']);
+    expect(() =>
+      resolveRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW }),
+    ).toThrow('shorter than its own headers say');
+  });
+
+  it('starts Claude from a whole platform program when bin\\claude.exe is cut short', () => {
+    const fs = memoryWindowsFs({
+      [CMD]: NPM_CMD_SHIM,
+      [PKG_JSON]: PACKAGE_JSON,
+      [BIN]: windowsProgram(4096, 2048),
+      [NESTED]: WINDOWS_PROGRAM,
+    });
+    const search = findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.bin).toBe(NESTED);
+    expect(search.fromPlatformPackage).toBe(true);
+    expect(search.broken[0]).toMatchObject({ state: 'cut-short', platformProgram: NESTED });
+  });
+
+  it('passes over a cut-short bin\\claude.exe that is a candidate itself, as the default npm prefixes give it', () => {
+    // %APPDATA%\npm and C:\Program Files\nodejs are searched without PATH, so
+    // npm's own bin\claude.exe arrives as an .exe candidate.
+    const fs = memoryWindowsFs({ [PKG_JSON]: PACKAGE_JSON, [BIN]: windowsProgram(4096, 2048), [NESTED]: WINDOWS_PROGRAM });
+    expect(findRealClaude({ findCandidates: () => [BIN], platform: 'win32', fs, arch: 'x64', now: () => NOW }).bin).toBe(NESTED);
+  });
+
+  it('starts a bin\\claude.exe whose headers it cannot read, as before', () => {
+    // Only a program shown to be short is refused, so an unusual one still starts.
+    const fs = memoryWindowsFs({ [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: 'MZ, headers of some other shape' });
+    expect(findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW }).bin).toBe(BIN);
+  });
+
+  it('counts a change time a moment ahead of the clock as recent, and one further ahead as not', () => {
+    const at = (ms: number) =>
+      findRealClaude({
+        findCandidates: () => [CMD],
+        platform: 'win32',
+        fs: memoryWindowsFs(
+          { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER },
+          { modified: { [SCOPE]: NOW + ms } },
+        ),
+        arch: 'x64',
+        now: () => NOW,
+      }).broken[0]?.busy;
+    expect(at(1_000)).toBe(true);
+    expect(at(3_000)).toBe(false);
+  });
+
+  it('reads a program whole whose section with no raw data points past its end, as Windows ignores it', () => {
+    const program = Buffer.from(windowsProgram(1024), 'latin1');
+    program.writeUInt16LE(2, 0x46); // a second section
+    program.writeUInt32LE(0, 0x148 + 40 + 16); // with no raw data
+    program.writeUInt32LE(100_000, 0x148 + 40 + 20); // at an offset far past the file
+    const fs = memoryWindowsFs({ [NESTED]: program.toString('latin1') });
+    expect(isWholeWindowsProgram(fs, NESTED)).toBe(true);
+    expect(declaredProgramSize(program)).toBe(1024);
+  });
+
+  it('reads a program whole whose certificate table ends up to 7 bytes past the file, its padding unwritten', () => {
+    const signedTo = (end: number): MemoryFs => {
+      const program = Buffer.from(windowsProgram(1024), 'latin1');
+      program.writeUInt32LE(1000, 0x58 + 112 + 4 * 8); // the certificate table starts inside the section's bytes
+      program.writeUInt32LE(end - 1000, 0x58 + 112 + 4 * 8 + 4);
+      return memoryWindowsFs({ [NESTED]: program.toString('latin1') });
+    };
+    expect(isWholeWindowsProgram(signedTo(1024 + 7), NESTED)).toBe(true);
+    expect(isWholeWindowsProgram(signedTo(1024 + 8), NESTED)).toBe(false);
+  });
+
+  it('still starts an .exe that is not one of Claude Code own npm files, though it reads as short', () => {
+    // The length rule was checked against Claude Code's program only; a Scoop
+    // shim or another packager's program is judged as before.
+    const other = 'C:\\Users\\me\\scoop\\shims\\claude.exe';
+    const fs = memoryWindowsFs({ [other]: windowsProgram(4096, 2048) });
+    expect(findRealClaude({ findCandidates: () => [other], platform: 'win32', fs, arch: 'x64', now: () => NOW }).bin).toBe(other);
+  });
+
+  it('reads how long a PE32 program is, whose data directories sit elsewhere', () => {
+    const pe32 = Buffer.from(windowsProgram(2048, 2048, 'PE32'), 'latin1');
+    expect(declaredProgramSize(pe32)).toBe(2048);
+    // A signature, found only where PE32 keeps its directories (96 bytes into its optional header).
+    pe32.writeUInt32LE(2048, 0x58 + 96 + 4 * 8);
+    pe32.writeUInt32LE(512, 0x58 + 96 + 4 * 8 + 4);
+    expect(declaredProgramSize(pe32)).toBe(2560);
+  });
+
+  it('reads how long a program is from its sections, and from its signature when it has one', () => {
+    const whole = Buffer.from(windowsProgram(1024), 'latin1');
+    expect(declaredProgramSize(whole)).toBe(1024);
+    const signed = Buffer.from(whole);
+    signed.writeUInt32LE(1024, 0x58 + 112 + 4 * 8); // the certificate table starts where the section ends
+    signed.writeUInt32LE(512, 0x58 + 112 + 4 * 8 + 4);
+    expect(declaredProgramSize(signed)).toBe(1536);
+    expect(declaredProgramSize(Buffer.from(NPM_PLACEHOLDER, 'latin1'))).toBeNull();
+    expect(declaredProgramSize(whole.subarray(0, 0x100))).toBeNull();
+  });
+
+  it('believes no change time from a clock that was ahead', () => {
+    const later = NOW + 2 * 60 * 60_000;
+    const fs = memoryWindowsFs(
+      { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER, [NESTED]: WINDOWS_PROGRAM },
+      { modified: { [SCOPE]: later, [PKG]: later, [BIN]: later, [NESTED]: later } },
+    );
+    const search = findRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.bin).toBe(NESTED);
+    expect(search.broken[0]?.busy).toBe(false);
+  });
+
+  it('says how long it holds off', () => {
+    const fs = memoryWindowsFs(
+      { [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: NPM_PLACEHOLDER },
+      { modified: { [SCOPE]: NOW - 60_000 } },
+    );
+    expect(() =>
+      resolveRealClaude({ findCandidates: () => [CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW }),
+    ).toThrow('changed for 3 minutes, about 2 minutes more');
   });
 
   it('takes the platform program once the install has settled', () => {

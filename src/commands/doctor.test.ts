@@ -611,6 +611,18 @@ describe('doctor and a Claude Code npm install that has lost its program', () =>
     expect((await report(search, false, changed)).claude?.detail).not.toContain('did not work');
   });
 
+  it('names a bin\\claude.exe cut short, with its fix, while Claude starts from the platform package', async () => {
+    const { claude } = await report({
+      bin: platformProgram,
+      prefixArgs: [],
+      fromPlatformPackage: true,
+      candidates: shims,
+      broken: [{ ...missing, state: 'cut-short', platformProgram }],
+    });
+    expect(claude).toMatchObject({ ok: true, note: true, fix: ['ccx doctor --fix'] });
+    expect(claude?.detail).toContain('shorter than its own headers say');
+  });
+
   it('reports a package folder that is gone the same way', async () => {
     const gone: BrokenNpmInstall = { ...missing, state: 'folder-missing', version: null };
     const { claude, repairs } = await report({ bin: null, prefixArgs: [], fromPlatformPackage: false, candidates: shims, broken: [gone] });

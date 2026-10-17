@@ -1,10 +1,21 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, existsSync, utimesSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  existsSync,
+  utimesSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+  writeSync,
+  rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   acquireLockDir,
   acquireOwnedLock,
+  createOwnedLockFile,
   withCredentialLock,
   withCredentialLockIfFree,
   CREDENTIALS_LOCK_DIR,
@@ -60,7 +71,8 @@ describe('acquireOwnedLock', () => {
     const then = new Date(Date.now() - minutes * 60_000);
     utimesSync(lock, then, then);
   };
-  const owner = (lock: string): string => readFileSync(lock, 'utf8');
+  /** The pid a lock names, which comes before its token. */
+  const owner = (lock: string): string => readFileSync(lock, 'utf8').trim().split(/\s+/)[0] ?? '';
 
   it('takes a free lock, names its holder in it, and releases it', () => {
     const lock = path.join(dir(), 'x.lock');
@@ -70,6 +82,138 @@ describe('acquireOwnedLock', () => {
     h.release();
     expect(existsSync(lock)).toBe(false);
     h.release(); // idempotent
+  });
+
+  it('leaves, on release, a lock another process has taken over', () => {
+    // A holder that ran past the longest hold can have its lock taken over;
+    // removing the lock then would remove the new holder's.
+    const lock = path.join(dir(), 'x.lock');
+    const other = String(process.pid + 1);
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000 });
+    writeFileSync(lock, other, 'utf8');
+    h.release();
+    expect(owner(lock)).toBe(other);
+  });
+
+  it('leaves, on release, a lock another task of this same process has taken over', () => {
+    // The pid is the same; which acquisition holds the lock now is kept in memory.
+    const lock = path.join(dir(), 'x.lock');
+    const first = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    minutesAgo(lock, 2); // past the longest hold, so it is taken over though its pid runs
+    const second = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    expect(second.held).toBe(true);
+    first.release();
+    expect(existsSync(lock)).toBe(true);
+    second.release();
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('takes over at once a lock naming this process that none of its acquisitions holds', () => {
+    // A dead ccx left it, and Windows gave its pid to this process.
+    const lock = path.join(dir(), 'x.lock');
+    writeFileSync(lock, String(process.pid), 'utf8');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 * 11 });
+    expect(h.held).toBe(true);
+    h.release();
+  });
+
+  it('writes a bare pid, which an older ccx reads as the holder', () => {
+    // ccx 2.6.7 and older read Number(content), and a pid with anything after it
+    // reads as no holder, so a live repair would be taken over after a minute.
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000 });
+    expect(Number(readFileSync(lock, 'utf8').trim())).toBe(process.pid);
+    h.release();
+  });
+
+  it('leaves no lock, and holds none, when the pid cannot be written', () => {
+    // A full disk: an empty lock names no holder and would never be released.
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, {
+      waitMs: 0,
+      staleMs: 5_000,
+      create: (file, content) =>
+        createOwnedLockFile(file, content, () => {
+          throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+        }),
+    });
+    expect(h.held).toBe(false);
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('removes, after a failed write, only the lock it made, not one put in its place meanwhile', () => {
+    // Another process judged the half-made lock abandoned and made its own.
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, {
+      waitMs: 0,
+      staleMs: 5_000,
+      create: (file, content) =>
+        createOwnedLockFile(file, content, () => {
+          renameSync(file, `${file}.moved`);
+          writeFileSync(file, '4242', 'utf8');
+          throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+        }),
+    });
+    expect(h.held).toBe(false);
+    expect(readFileSync(lock, 'utf8')).toBe('4242');
+  });
+
+  it('leaves no lock, and holds none, when the pid is written only in part', () => {
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, {
+      waitMs: 0,
+      staleMs: 5_000,
+      // Every byte but the last, as a short write leaves it.
+      create: (file, content) => createOwnedLockFile(file, content, (fd, text) => writeSync(fd, text.slice(0, -1))),
+    });
+    expect(h.held).toBe(false);
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('leaves a lock just past half the longest hold, on release, when the takeover guard is held', () => {
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    minutesAgo(lock, 31 / 60); // 31 seconds of a 60-second longest hold
+    mkdirSync(`${lock}.takeover`);
+    h.release();
+    expect(existsSync(lock)).toBe(true);
+  });
+
+  it('leaves a lock held past the longest hold, on release, when the takeover guard is held', () => {
+    // Whoever holds the guard is taking the lock over, and removing it
+    // unguarded could remove the lock that takeover makes next.
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    minutesAgo(lock, 2);
+    mkdirSync(`${lock}.takeover`);
+    h.release();
+    expect(existsSync(lock)).toBe(true);
+    expect(owner(lock)).toBe(String(process.pid));
+  });
+
+  it('removes a lock held past the longest hold, on release, under the takeover guard', () => {
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    minutesAgo(lock, 2);
+    h.release();
+    expect(existsSync(lock)).toBe(false);
+    expect(existsSync(`${lock}.takeover`)).toBe(false);
+  });
+
+  it('removes a lock held briefly, on release, without the takeover guard, which no takeover can need yet', () => {
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    mkdirSync(`${lock}.takeover`); // even one left behind does not hold it up
+    h.release();
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('removes its own lock on release, and the takeover guard with it', () => {
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000 });
+    h.release();
+    expect(existsSync(lock)).toBe(false);
+    expect(existsSync(`${lock}.takeover`)).toBe(false);
   });
 
   it('never takes over a running holder for age alone', () => {
@@ -98,10 +242,13 @@ describe('acquireOwnedLock', () => {
   });
 
   it('takes over a running holder past the longest hold, since its pid may have been reused', () => {
+    // Another process's pid, reported running, so only the age can let it go.
     const lock = path.join(dir(), 'x.lock');
-    writeFileSync(lock, String(process.pid), 'utf8');
+    writeFileSync(lock, '4242', 'utf8');
     minutesAgo(lock, 2);
-    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    const isRunning = (pid: number): boolean => pid === 4242;
+    expect(acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 180_000, isRunning }).held).toBe(false);
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000, isRunning });
     expect(h.held).toBe(true);
     h.release();
   });
@@ -137,10 +284,10 @@ describe('acquireOwnedLock', () => {
   it("waits through Windows' refusals while the last holder's lock is still being removed", () => {
     const lock = path.join(dir(), 'x.lock');
     let attempts = 0;
-    const create = (file: string): void => {
+    const create = (file: string, content: string): void => {
       attempts += 1;
       if (attempts < 3) throw Object.assign(new Error('delete pending'), { code: 'EPERM' });
-      writeFileSync(file, String(process.pid), { flag: 'wx' });
+      writeFileSync(file, content, { flag: 'wx' });
     };
     const h = acquireOwnedLock(lock, { waitMs: 10_000, staleMs: 5_000, create, platform: 'win32' });
     expect(h.held).toBe(true);
