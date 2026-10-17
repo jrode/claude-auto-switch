@@ -141,7 +141,8 @@ export interface BrokenNpmInstall {
   prefix: string;
   /** `<folder>\bin\claude.exe`, which the shims run. */
   program: string;
-  state: 'missing' | 'placeholder' | 'folder-missing';
+  /** `cut-short`: a program shorter than its own headers say, a copy that has not finished. */
+  state: 'missing' | 'placeholder' | 'cut-short' | 'folder-missing';
   /** The platform package's own program, when npm left a real one and is not still writing it. */
   platformProgram: string | null;
   /** From its package.json, or the one npm left in the folder it moved aside; null when neither names one. */
@@ -248,6 +249,9 @@ export function describeBrokenInstall(install: BrokenNpmInstall): string {
   if (install.state === 'placeholder') {
     return `${install.folder}: its bin\\claude.exe is only the placeholder npm puts there first, a short script rather than the program`;
   }
+  if (install.state === 'cut-short') {
+    return `${install.folder}: its bin\\claude.exe is shorter than its own headers say, a copy of the program that never finished`;
+  }
   return `${install.folder}: the folder is not there, though npm's claude shims in ${install.prefix} still point into it`;
 }
 
@@ -292,14 +296,16 @@ function pickOnWindows(
   execPath: string,
 ): { bin: string; prefixArgs: string[] } | undefined {
   const p = path.win32;
-  const directExe = candidates.find((c) => /\.exe$/i.test(c) && isWindowsProgram(fs, c) !== false);
+  // A program cut short of its own headers is half copied, and is not started
+  // wherever it is found: npm's own bin\claude.exe arrives here directly from
+  // the default prefixes (%APPDATA%\npm, C:\Program Files\nodejs).
+  const whole = (exe: string): boolean => isWindowsProgram(fs, exe) !== false && !isCutShortWindowsProgram(fs, exe);
+  const directExe = candidates.find((c) => /\.exe$/i.test(c) && whole(c));
   if (directExe) return { bin: directExe, prefixArgs: [] };
 
   // Prefer the standard npm install layout (a real file) BEFORE trusting text
-  // scraped from a .cmd shim. That file is the platform program, linked or
-  // copied, so one cut short of its own headers is half copied and not started.
-  const usable = (exe: string): boolean =>
-    fs.isFile(exe) && isWindowsProgram(fs, exe) !== false && !isCutShortWindowsProgram(fs, exe);
+  // scraped from a .cmd shim.
+  const usable = (exe: string): boolean => fs.isFile(exe) && whole(exe);
   for (const candidate of candidates) {
     const guess = p.join(p.dirname(candidate), ...NPM_PACKAGE, 'bin', 'claude.exe');
     if (usable(guess)) return { bin: guess, prefixArgs: [] };
@@ -545,7 +551,9 @@ export function inspectNpmInstall(
     ? 'missing'
     : fs.isFile(program) && isWindowsProgram(fs, program) === false
       ? 'placeholder'
-      : null;
+      : fs.isFile(program) && isCutShortWindowsProgram(fs, program)
+        ? 'cut-short'
+        : null;
   if (!state) return null;
   const places = platformPrograms(folder, arch);
   const quietMs = Math.min(settledMs, PROGRAM_QUIET_MS);

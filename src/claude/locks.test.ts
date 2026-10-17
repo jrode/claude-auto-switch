@@ -98,6 +98,15 @@ describe('acquireOwnedLock', () => {
     expect(existsSync(lock)).toBe(false);
   });
 
+  it('takes over at once a lock naming this process that none of its acquisitions holds', () => {
+    // A dead ccx left it, and Windows gave its pid to this process.
+    const lock = path.join(dir(), 'x.lock');
+    writeFileSync(lock, String(process.pid), 'utf8');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 * 11 });
+    expect(h.held).toBe(true);
+    h.release();
+  });
+
   it('writes a bare pid, which an older ccx reads as the holder', () => {
     // ccx 2.6.7 and older read Number(content), and a pid with anything after it
     // reads as no holder, so a live repair would be taken over after a minute.

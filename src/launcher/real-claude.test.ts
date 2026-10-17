@@ -399,9 +399,34 @@ describe('an install npm may still be writing (Windows)', () => {
     expect(search.broken[0]?.partialProgram).toEqual({ file: NESTED, size: 2048 });
   });
 
-  it('never starts a bin\\claude.exe cut short of its own headers, which is half copied', () => {
+  it('never starts a bin\\claude.exe cut short of its own headers, which is half copied, and counts it broken', () => {
     const fs = memoryWindowsFs({ [CMD]: NPM_CMD_SHIM, [PKG_JSON]: PACKAGE_JSON, [BIN]: windowsProgram(4096, 2048) });
-    expect(findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW }).bin).toBeNull();
+    const search = findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.bin).toBeNull();
+    expect(search.broken.map((b) => b.state)).toEqual(['cut-short']);
+    expect(() =>
+      resolveRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW }),
+    ).toThrow('shorter than its own headers say');
+  });
+
+  it('starts Claude from a whole platform program when bin\\claude.exe is cut short', () => {
+    const fs = memoryWindowsFs({
+      [CMD]: NPM_CMD_SHIM,
+      [PKG_JSON]: PACKAGE_JSON,
+      [BIN]: windowsProgram(4096, 2048),
+      [NESTED]: WINDOWS_PROGRAM,
+    });
+    const search = findRealClaude({ findCandidates: () => [SHIM, CMD], platform: 'win32', fs, arch: 'x64', now: () => NOW });
+    expect(search.bin).toBe(NESTED);
+    expect(search.fromPlatformPackage).toBe(true);
+    expect(search.broken[0]).toMatchObject({ state: 'cut-short', platformProgram: NESTED });
+  });
+
+  it('passes over a cut-short bin\\claude.exe that is a candidate itself, as the default npm prefixes give it', () => {
+    // %APPDATA%\npm and C:\Program Files\nodejs are searched without PATH, so
+    // npm's own bin\claude.exe arrives as an .exe candidate.
+    const fs = memoryWindowsFs({ [PKG_JSON]: PACKAGE_JSON, [BIN]: windowsProgram(4096, 2048), [NESTED]: WINDOWS_PROGRAM });
+    expect(findRealClaude({ findCandidates: () => [BIN], platform: 'win32', fs, arch: 'x64', now: () => NOW }).bin).toBe(NESTED);
   });
 
   it('starts a bin\\claude.exe whose headers it cannot read, as before', () => {

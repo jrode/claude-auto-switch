@@ -319,6 +319,9 @@ function isAbandoned(
   const age = now - since;
   const holder = lockHolder(lockFile);
   if (holder === null) return age > staleMs;
+  // This process's own pid with no acquisition of this process holding the
+  // lock: a dead ccx left it, and Windows has given its pid to this process.
+  if (holder === process.pid && !heldHere.has(path.resolve(lockFile))) return true;
   return pastLongestHold(age, maxHoldMs) || !running(holder);
 }
 

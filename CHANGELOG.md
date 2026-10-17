@@ -22,7 +22,13 @@ semantic versioning.
 - **A platform program still downloading is never reinstalled over.** One
   shorter than its own headers say is left while its size changes, and only
   reinstalled once it has stayed one size for ten minutes, as a dead npm's
-  leftover. A `bin\claude.exe` cut short the same way is not started.
+  leftover.
+- **A `bin\claude.exe` cut short of its own headers, a copy that never
+  finished, is never started, wherever it is found.** It counts as a broken
+  install: Claude starts from the whole platform program, `ccx doctor` names
+  it with its fix, and the whole program is put over it once the short file
+  has stayed one size for ten minutes, so a copy still being made is not
+  replaced part way.
 - **A clock that was ahead no longer holds a repair off for hours.** A change
   time more than two seconds in the future is not taken as a recent change.
 - **A repair that failed once is tried again by itself.** Being offline, a
@@ -36,7 +42,8 @@ semantic versioning.
   lock was taken over after it ran past the longest hold removed the new
   holder's lock when it finished, whether the new holder was another process
   or another task of the same one. A lock whose holder could not be written
-  (a full disk) is no longer left behind.
+  (a full disk) is no longer left behind, and a lock a dead ccx left under a
+  pid Windows has since given to this process is taken over at once.
 
 ## [2.6.7]
 

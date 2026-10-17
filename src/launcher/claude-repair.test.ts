@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { buildContext, claudeForSession, getClaude, getClaudeAsIs } from '../context.js';
 import {
+  fileSizeMemory,
   nodeRepairFs,
   npmFor,
   placeProgram,
@@ -829,5 +830,37 @@ describe('when the repair is allowed to run', () => {
     context.claudeSearch = h.deps;
     expect(claudeForSession(context, false).bin).toBe(BIN);
     expect(h.npmCalls).toHaveLength(1);
+  });
+
+  it('puts the whole program over a bin\\claude.exe cut short, once that file has held its size', () => {
+    // A copy install.cjs is still making must not be replaced mid-copy, so it
+    // is judged by its size over time, as the platform program is.
+    const start = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(placeholderInstall({ [BIN]: windowsProgram(4096, 2048), [NESTED]: WINDOWS_PROGRAM }));
+    const h = harness(fs);
+    const at = (ms: number): LaunchDeps => ({ ...h.deps, now: () => ms, run: { repairTried: false } });
+    expect(resolveClaudeForLaunch(at(start)).bin).toBe(NESTED);
+    expect(fs.content(BIN)).toBe(windowsProgram(4096, 2048));
+    expect(repairClaudeInstalls(at(start + 11 * 60_000))).toEqual([]);
+    expect(fs.content(BIN)).toBe(WINDOWS_PROGRAM);
+    expect(h.npmCalls).toEqual([]);
+  });
+
+  it('drops the size it kept of a platform program once that program is whole', () => {
+    const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }));
+    const h = harness(fs);
+    h.deps.sizes?.set(NESTED, { size: 2048, at: new Date().toISOString() });
+    resolveClaudeForLaunch(h.deps);
+    expect(h.deps.sizes?.get(NESTED)).toBeNull();
+  });
+
+  it('drops, when it writes one, sizes it kept that are a day old', () => {
+    const file = path.join(mkdtempSync(path.join(tmpdir(), 'cas-sizes-')), 'claude-repair-sizes.json');
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const sizes = fileSizeMemory(file, () => now);
+    sizes.set('C:\\old\\claude.exe', { size: 1, at: new Date(now - 25 * 60 * 60_000).toISOString() });
+    sizes.set('C:\\new\\claude.exe', { size: 2, at: new Date(now).toISOString() });
+    expect(sizes.get('C:\\old\\claude.exe')).toBeNull();
+    expect(sizes.get('C:\\new\\claude.exe')).toMatchObject({ size: 2 });
   });
 });
