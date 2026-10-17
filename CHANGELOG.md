@@ -19,13 +19,24 @@ semantic versioning.
     `claude -p` run, the editor launcher, `ccx cap`, renaming an account)
     reads, changes and writes it as one step under a lock beside it,
     `ledger.json.lock`, held only for that step. A lock left by a ccx that
-    has exited is taken over at once. One still held after 5 seconds is
-    written past rather than waited on, since waiting would freeze the
-    session asking, and the event log says so (`ledger-unlocked`).
+    has exited is taken over at once. One still held after 5 seconds, or
+    one that cannot be made at all, is written past rather than waited on,
+    since waiting would freeze the session asking, and the event log says
+    so (`ledger-unlocked`). Written past, the two changes can still erase
+    each other as any two could before: a holder that was stalled writes
+    back what it read before it stalled, over this change, or this change
+    lands over the holder's.
   - A `claude -p` run records each limit as it confirms it, so other
-    sessions see it while the run goes on, and the account it ends on is
-    cleared only of limits recorded before its attempt began: one another
-    session recorded while it ran is kept.
+    sessions see it while the run goes on. A ledger it cannot write loses
+    that record, never the request: the run goes on to the next account,
+    and the event log says what was not recorded (`ledger-write-failed`).
+  - When a `claude -p` run finishes fine, ccx clears only what that shows
+    is over: the account's limits on the whole account, and its limit on
+    the model the run used, recorded before the run started. A limit on
+    another model stays, as does one another session recorded once the run
+    had started, even in the same millisecond. Before, a run that ran out
+    of Fable and then finished on Opus wiped the Fable limit it had just
+    found.
   - An older ccx that is still running does not take the lock, so its
     changes can still collide until it is running this version.
 
