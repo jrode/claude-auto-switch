@@ -85,9 +85,10 @@ describe('updateLedger', () => {
     expect(exited.status).toBe(0);
     writeFileSync(`${ledgerFilePath(c)}.lock`, String(exited.pid), 'utf8');
 
+    // Waiting it out instead would take the whole 12 s, inside the test's time.
     const started = Date.now();
-    updateLedger(c, capFor('A'), { waitMs: 30_000 });
-    expect(Date.now() - started).toBeLessThan(10_000);
+    updateLedger(c, capFor('A'), { waitMs: 12_000 });
+    expect(Date.now() - started).toBeLessThan(6_000);
     expect(accounts(loadLedger(c))).toEqual(['A']);
     expect(unlockedWrites(dir)).toEqual([]);
     expect(existsSync(`${ledgerFilePath(c)}.lock`)).toBe(false);
