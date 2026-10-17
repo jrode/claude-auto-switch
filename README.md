@@ -129,10 +129,10 @@ right one never counts while ccx knows of another live Claude on the same
 conversation, since every Claude on a conversation writes to the same record.
 That covers sessions in the terminal, workers and `claude -p` runs through ccx.
 A `claude -p` run that names no conversation (no `--resume`, `--continue`,
-`--session-id`, `--fork-session`, or `--from-pr`, `--teleport` or `--cloud`) is
-started with a new one of ccx's own (`--session-id`), so its record is found
-however it prints its answer. Text on screen that talks about usage limits
-never moves a session.
+`--session-id`, `--fork-session`, or `--from-pr`, `--teleport` or `--cloud` and
+its old name `--remote`) is started with a new one of ccx's own
+(`--session-id`), so its record is found however it prints its answer. Text
+on screen that talks about usage limits never moves a session.
 
 Three launches still wait for the usage check, because ccx cannot tell that a
 refusal there was the run's own:

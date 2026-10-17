@@ -17,10 +17,10 @@ semantic versioning.
   429 from the usage check as "not capped" and stopped. Now:
   - When the person names no conversation (no `--resume`, `--continue`,
     `--session-id` or `--fork-session` in any spelling, short forms and
-    `--resume=<id>` included, and no `--from-pr`, `--teleport` or
-    `--cloud`), ccx starts each launch with a new conversation of its own,
-    `--session-id <uuid>`, before any `--`, and reads the record by that id
-    when the run fails. Nothing else changes for the person: each run was a
+    `--resume=<id>` included, and no `--from-pr`, `--teleport`, or `--cloud`
+    and its old name `--remote`), ccx starts each launch with a new
+    conversation of its own, `--session-id <uuid>`, before any `--`, and
+    reads the record by that id when the run fails. Nothing else changes for the person: each run was a
     new conversation before too, and `--continue` afterwards picks up the
     newest conversation in the folder whoever chose its id.
   - A flag the person passed is left exactly as typed, since Claude refuses
