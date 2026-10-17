@@ -44,10 +44,11 @@ semantic versioning.
     run's own output.
   - A `claude -p` run's own record is found by the conversation it names
     (`--session-id`, `--resume`) or reports (`--output-format json` or
-    `stream-json`; a fork only by what it reports), and read from its end. A
-    refused turn there now starts the check by itself, since Claude's wording
-    for one ("You've hit your session limit") need not match the limit text
-    ccx looks for.
+    `stream-json`; a fork only by what it reports), and read from its end. Of
+    the refusals since the run started, the one it printed counts, and none
+    does when two read alike. A refused turn there now starts the check by
+    itself, since Claude's wording for one ("You've hit your session limit")
+    need not match the limit text ccx looks for.
   - Covered: sessions in the terminal, workers, and `claude -p` runs through
     ccx whose conversation is named or reported. Not covered yet: the editor
     launch, a `claude -p` run with headless rotation turned off, a plain-text

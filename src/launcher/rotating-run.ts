@@ -246,10 +246,10 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
  * is its own new conversation, which only the output reports. A plain-text
  * run with neither has none to find.
  *
- * Of the refusals written since it started, the newest one it printed: two
- * runs resuming one conversation write into one record, and each printed only
- * its own. When it printed none, the newest, which the check then refuses as
- * not shown.
+ * Of the refusals written since it started, the one it printed: two runs
+ * resuming one conversation write into one record, and each printed only its
+ * own. When it printed none, or more than one reads like what it printed, the
+ * newest, which the check then refuses as not shown.
  */
 function refusedIn(
   account: RotatableAccount,
@@ -263,7 +263,8 @@ function refusedIn(
   if (id === null) return undefined;
   const output = `${run.stdout}\n${run.stderr}`;
   const refusals = refusalsSince(account.dir, id, launchedAt);
-  const refusal = refusals.find((r) => outputShows(output, r.text)) ?? refusals[0];
+  const printed = refusals.filter((r) => outputShows(output, r.text));
+  const refusal = printed[0] ?? refusals[0];
   if (!refusal) return undefined;
   return {
     refusal,
@@ -272,6 +273,8 @@ function refusedIn(
     promptAt: 0,
     conversation: id,
     claudePid: null,
-    shown: () => Promise.resolve(outputShows(output, refusal.text)),
+    // Two refusals since it started that read like what it printed cannot
+    // tell which was its own, nor which limit and reset are.
+    shown: () => Promise.resolve(printed.length === 1),
   };
 }

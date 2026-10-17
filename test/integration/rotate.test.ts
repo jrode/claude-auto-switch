@@ -346,6 +346,20 @@ describe("the refused turn a print-mode run's own record holds", () => {
     expect(await seen[0]?.shown?.()).toBe(true);
   });
 
+  it('proves nothing when two refusals since it started read like what it printed', async () => {
+    // The same words from two runs on one conversation: which limit, and which
+    // reset, was this run's cannot be told.
+    const dir = mkdtempSync(path.join(tmpdir(), 'cas-print-same-'));
+    const printed = JSON.stringify({ type: 'result', is_error: true, result: MINE, session_id: ID });
+    const seen = await recordedFor(
+      ['-p', '--resume', ID, 'hi'],
+      runWriting(dir, ID, [refusal(MINE, 10), refusal(MINE, 20)], printed),
+      dir,
+    );
+    expect(seen).toHaveLength(1);
+    expect(await seen[0]?.shown?.()).toBe(false);
+  });
+
   it('is read from the conversation a fork reports, not the one it was copied from', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'cas-print-fork-'));
     const printed = JSON.stringify({ type: 'result', is_error: true, result: MINE, session_id: FORK });
