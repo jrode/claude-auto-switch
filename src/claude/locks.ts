@@ -219,33 +219,42 @@ function ownedHandle(lockFile: string, content: string): LockHandle {
       released = true;
       // Only while the lock is still this acquisition's: a holder that ran past
       // the longest hold may have been taken over, by another process or by
-      // another task of this one, and the lock is then the new holder's. Under
-      // the takeover guard where it can be had, so no takeover removes this lock
-      // and makes its own between the look and the removal; where it cannot, a
-      // takeover holds it, and makes no lock of its own until it lets go.
+      // another task of this one, and the lock is then the new holder's. And
+      // only under the takeover guard, so no takeover can remove this lock and
+      // make its own between the look and the removal. Without the guard the
+      // lock is left: whoever holds the guard is taking it over.
       const guard = `${lockFile}.takeover`;
-      let guarded = false;
-      try {
-        mkdirSync(guard);
-        guarded = true;
-      } catch {
-        /* see above */
-      }
+      if (!takeGuard(guard)) return;
       try {
         if (readLock(lockFile) === content) rmSync(lockFile, { force: true });
       } catch {
         /* already gone */
       } finally {
-        if (guarded) {
-          try {
-            rmdirSync(guard);
-          } catch {
-            /* already gone */
-          }
+        try {
+          rmdirSync(guard);
+        } catch {
+          /* already gone */
         }
       }
     },
   };
+}
+
+/**
+ * Take the takeover guard, trying for about half a second: a takeover holds it
+ * for a few file operations, and Windows refuses a new folder for a moment
+ * while the last one of that name is still being removed.
+ */
+function takeGuard(guard: string): boolean {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      mkdirSync(guard);
+      return true;
+    } catch {
+      sleepSync(25);
+    }
+  }
+  return false;
 }
 
 function readLock(lockFile: string): string | null {
