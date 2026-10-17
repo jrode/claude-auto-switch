@@ -770,7 +770,7 @@ describe('when the repair is allowed to run', () => {
     expect(h.npmCalls).toHaveLength(1);
   });
 
-  it('does not make a launch that starts from the platform program wait for another ccx's repair', () => {
+  it("does not make a launch that starts from the platform program wait for another ccx's repair", () => {
     const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM, [LOCK]: String(process.pid + 1) }));
     const h = harness(fs, { lock: () => ({ held: false, release: () => {} }) });
     expect(resolveClaudeForLaunch(h.deps).bin).toBe(NESTED);
