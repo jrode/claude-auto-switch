@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, existsSync, utimesSync, readFileSync, writeFileSync, writeSync, rmSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  existsSync,
+  utimesSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+  writeSync,
+  rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -129,6 +139,23 @@ describe('acquireOwnedLock', () => {
     });
     expect(h.held).toBe(false);
     expect(existsSync(lock)).toBe(false);
+  });
+
+  it('removes, after a failed write, only the lock it made, not one put in its place meanwhile', () => {
+    // Another process judged the half-made lock abandoned and made its own.
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, {
+      waitMs: 0,
+      staleMs: 5_000,
+      create: (file, content) =>
+        createOwnedLockFile(file, content, () => {
+          renameSync(file, `${file}.moved`);
+          writeFileSync(file, '4242', 'utf8');
+          throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+        }),
+    });
+    expect(h.held).toBe(false);
+    expect(readFileSync(lock, 'utf8')).toBe('4242');
   });
 
   it('leaves no lock, and holds none, when the pid is written only in part', () => {

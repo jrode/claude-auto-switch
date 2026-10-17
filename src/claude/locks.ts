@@ -1,5 +1,6 @@
 import {
   closeSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -229,13 +230,35 @@ export function createOwnedLockFile(
     }
     written = true;
   } finally {
-    closeSync(fd);
-    if (!written) {
-      try {
-        rmSync(file, { force: true });
-      } catch {
-        /* already gone */
-      }
+    try {
+      if (!written) removeOwnFailedLock(file, fd);
+    } finally {
+      closeSync(fd);
+    }
+  }
+}
+
+/**
+ * Remove a lock this attempt created but could not finish, and only that one:
+ * compared with the open file, which keeps its identity from being reused,
+ * and under the takeover guard, so no takeover replaces it between the look
+ * and the removal. Without the guard it is left, since whoever holds the
+ * guard is taking it over.
+ */
+function removeOwnFailedLock(file: string, fd: number): void {
+  const guard = `${file}.takeover`;
+  if (!takeGuard(guard)) return;
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    const current = statSync(file, { bigint: true });
+    if (opened.dev === current.dev && opened.ino === current.ino) rmSync(file, { force: true });
+  } catch {
+    /* already gone */
+  } finally {
+    try {
+      rmdirSync(guard);
+    } catch {
+      /* already gone */
     }
   }
 }
