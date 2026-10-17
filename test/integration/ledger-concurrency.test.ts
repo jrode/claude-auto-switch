@@ -3,13 +3,20 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { addAccount } from '../../src/accounts/registry.js';
 import { renameAccount } from '../../src/accounts/rename.js';
 import { capCommand } from '../../src/commands/cap.js';
+import { editorLaunch } from '../../src/commands/editor-launch.js';
+import { runCommand } from '../../src/commands/run.js';
+import { workerCommand } from '../../src/commands/worker.js';
 import { loadConfig } from '../../src/config/config.js';
 import { readEvents } from '../../src/events/log.js';
+import { processIsAlive } from '../../src/session/lease.js';
+import { setActive } from '../../src/state/active.js';
 import type { CliContext } from '../../src/context.js';
+import type { LimitProbeResult, LimitVerdict } from '../../src/usage/limit-probe.js';
 
 /**
  * Two ccx processes changing the limits ledger at once. Every change reads the
@@ -19,15 +26,15 @@ import type { CliContext } from '../../src/context.js';
  *
  * The other process here takes the ledger's lock, reads the file, and only
  * writes it back a while later, as any change does in the moment between its
- * read and its write. The command under test must wait for it and build on what
+ * read and its write. Each writer under test must wait for it and build on what
  * it wrote. Children run through tsx (a devDependency), so no build is needed.
  */
 
 const REPO = fileURLToPath(new URL('../..', import.meta.url));
 const TSX = path.join(REPO, 'node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
+const fakeClaude = fileURLToPath(new URL('../fake-claude/fake-claude.mjs', import.meta.url));
 const moduleAt = (...parts: string[]): string => JSON.stringify(path.join(REPO, 'src', ...parts).split(path.sep).join('/'));
-/** How long the other process holds the lock between its read and its write; well inside the 5 s a change waits. */
-const HOLD_MS = 2_000;
+const HOUR = 3_600_000;
 
 interface Cap {
   account: string;
@@ -43,13 +50,24 @@ const capsIn = (home: string): Cap[] => {
 const accountsIn = (home: string): string[] => capsIn(home).map((cap) => cap.account).sort();
 const unlockedWrites = (home: string) => readEvents(home, 100).filter((e) => e.kind === 'ledger-unlocked');
 
+interface OtherWriter {
+  /** Settles once it is running and waiting to be told to go. */
+  ready: Promise<void>;
+  /** Tell it to go, and settle once it holds the lock and has read the ledger. */
+  go: () => Promise<void>;
+  exited: Promise<{ code: number | null; stderr: string }>;
+}
+
 /**
- * Another process recording a limit for `account`: it holds the lock from its
- * read to its write, `HOLD_MS` apart. `reading` settles once it has read.
+ * Another process recording a limit for `account`. Told to go, it takes the
+ * lock, reads the ledger, holds the lock for `holdMs` (well inside the 5 s a
+ * change waits for it), then writes and lets go. Started ahead of time and
+ * told to go from inside the step under test, so its own start-up never
+ * delays that step.
  */
-function anotherWriter(home: string, account: string): { reading: Promise<void>; exited: Promise<{ code: number | null; stderr: string }> } {
+function anotherWriter(home: string, account: string, holdMs = 2_000): OtherWriter {
   const script = path.join(home, `writer-${account}.ts`);
-  const marker = path.join(home, `writer-${account}.read`);
+  const marker = (name: string): string => path.join(home, `writer-${account}.${name}`);
   writeFileSync(
     script,
     [
@@ -57,13 +75,20 @@ function anotherWriter(home: string, account: string): { reading: Promise<void>;
       `import path from 'node:path';`,
       `import { acquireOwnedLock } from ${moduleAt('claude', 'locks.ts')};`,
       `import { writeJsonFile } from ${moduleAt('util', 'fs-json.ts')};`,
-      `const [home, account, marker, holdMs] = process.argv.slice(2);`,
+      `const [home, account, ready, go, read, holdMs] = process.argv.slice(2);`,
+      `const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);`,
+      `writeFileSync(ready, '');`,
+      `const giveUpAt = Date.now() + 60000;`,
+      `while (!existsSync(go)) {`,
+      `  if (Date.now() > giveUpAt) throw new Error('the other writer was never told to go');`,
+      `  pause(10);`,
+      `}`,
       `const file = path.join(home, 'ledger.json');`,
       `const lock = acquireOwnedLock(file + '.lock', { waitMs: 30000, staleMs: 5000 });`,
       `if (!lock.held) throw new Error('the other writer could not take the ledger lock');`,
       `const ledger = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : { caps: [] };`,
-      `writeFileSync(marker, '');`,
-      `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(holdMs));`,
+      `writeFileSync(read, '');`,
+      `pause(Number(holdMs));`,
       `ledger.caps.push({ account, capUntil: Date.now() + 3600000, reason: 'another session', at: Date.now() });`,
       `writeJsonFile(file, ledger);`,
       `lock.release();`,
@@ -74,10 +99,8 @@ function anotherWriter(home: string, account: string): { reading: Promise<void>;
   let stderr = '';
   let ended = false;
   const exited = new Promise<{ code: number | null; stderr: string }>((resolve) => {
-    const child = spawn(TSX, [script, home, account, marker, String(HOLD_MS)], {
-      stdio: ['ignore', 'ignore', 'pipe'],
-      shell: process.platform === 'win32',
-    });
+    const args = [script, home, account, marker('ready'), marker('go'), marker('read'), String(holdMs)];
+    const child = spawn(TSX, args, { stdio: ['ignore', 'ignore', 'pipe'], shell: process.platform === 'win32' });
     child.stderr.on('data', (d) => {
       stderr += String(d);
     });
@@ -86,31 +109,68 @@ function anotherWriter(home: string, account: string): { reading: Promise<void>;
       resolve({ code, stderr });
     });
   });
-  const reading = (async () => {
-    await vi.waitUntil(() => existsSync(marker) || ended, { timeout: 30_000, interval: 20 });
-    expect(existsSync(marker), `the other writer ended before it read: ${stderr}`).toBe(true);
-  })();
-  return { reading, exited };
+  const reached = async (name: string): Promise<void> => {
+    await vi.waitUntil(() => existsSync(marker(name)) || ended, { timeout: 30_000, interval: 10 });
+    expect(existsSync(marker(name)), `the other writer ended before "${name}": ${stderr}`).toBe(true);
+  };
+  const ready = reached('ready');
+  ready.catch(() => {}); // awaited by go(), which reports it
+  return {
+    ready,
+    go: async () => {
+      await ready;
+      writeFileSync(marker('go'), '');
+      await reached('read');
+    },
+    exited,
+  };
 }
 
-function setup(names: string[]): { home: string; context: CliContext } {
+/** Accounts signed in, through the fake claude; those named in `capped` are out on every run. */
+function setup(names: string[], capped: string[] = []): { home: string; context: CliContext } {
   const home = mkdtempSync(path.join(tmpdir(), 'cas-ledger-race-'));
   const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };
   for (const name of names) {
     const dir = path.join(home, 'profiles', name);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, '.credentials.json'), '{}', 'utf8');
+    writeFileSync(path.join(dir, '.credentials.json'), JSON.stringify({ account: name }), 'utf8');
+    writeFileSync(
+      path.join(dir, 'fake-scenario.json'),
+      JSON.stringify({
+        authStatus: { loggedIn: true, subscriptionType: 'max', email: `${name.toLowerCase()}@example.com` },
+        capped: capped.includes(name),
+        capMessage: 'Usage limit reached. Try again later.',
+        capExitCode: 1,
+      }),
+      'utf8',
+    );
     addAccount({ name, dir }, ctx);
   }
-  const context: CliContext = { ctx, config: loadConfig(ctx), out: () => {}, err: () => {}, json: false, quiet: false };
+  const context: CliContext = {
+    ctx,
+    config: loadConfig(ctx),
+    claude: { bin: process.execPath, prefixArgs: [fakeClaude] },
+    out: () => {},
+    err: () => {},
+    json: false,
+    quiet: false,
+  };
   return { home, context };
 }
+
+/** Variables the worker case sets for the fake claude, put back afterwards. */
+const REFUSING: Record<string, string> = {
+  FAKE_CLAUDE_IDLE_MS: '4000',
+  FAKE_CLAUDE_SESSION_RECORD: '1',
+  FAKE_CLAUDE_TRANSCRIPT: '1',
+  FAKE_CLAUDE_REFUSE_AFTER_MS: '1200',
+};
 
 describe('two processes changing the limits ledger at once', () => {
   it('ccx cap waits for a change already in progress, and both limits are kept', async () => {
     const { home, context } = setup(['A']);
     const other = anotherWriter(home, 'B');
-    await other.reading;
+    await other.go();
     // Started after the other process read, before it writes.
     expect(capCommand(context, 'A')).toBe(0);
     const { code, stderr } = await other.exited;
@@ -125,7 +185,7 @@ describe('two processes changing the limits ledger at once', () => {
     const { home, context } = setup(['A']);
     expect(capCommand(context, 'A')).toBe(0);
     const other = anotherWriter(home, 'B');
-    await other.reading;
+    await other.go();
     expect(capCommand(context, 'A', { clear: true })).toBe(0);
     const { code, stderr } = await other.exited;
     expect(code, stderr).toBe(0);
@@ -138,12 +198,81 @@ describe('two processes changing the limits ledger at once', () => {
     const { home, context } = setup(['old']);
     expect(capCommand(context, 'old')).toBe(0);
     const other = anotherWriter(home, 'B');
-    await other.reading;
+    await other.go();
     renameAccount('old', 'new', {}, context.ctx);
     const { code, stderr } = await other.exited;
     expect(code, stderr).toBe(0);
 
     expect(accountsIn(home)).toEqual(['B', 'new']);
+    expect(unlockedWrites(home)).toEqual([]);
+  }, 60_000);
+
+  it('a session that meets a limit records it on top of a change in progress (a worker here)', async () => {
+    // The usage check confirms A is out just after the other process has read
+    // the ledger. The session then ends that launch and records the limit, so
+    // the other process holds the lock longer here, to still be holding it then.
+    const { home, context } = setup(['A', 'B']);
+    const other = anotherWriter(home, 'other', 4_000);
+    await other.ready;
+    let checks = 0;
+    context.verifyCap = async (): Promise<LimitVerdict> => {
+      checks += 1;
+      if (checks > 1) return 'allowed';
+      await other.go();
+      return 'limited';
+    };
+    context.isClaudeProcess = processIsAlive;
+    const before = Object.fromEntries(Object.keys(REFUSING).map((name) => [name, process.env[name]]));
+    Object.assign(process.env, REFUSING);
+    try {
+      const io = { stdout: () => {}, stderr: () => {}, signals: new EventEmitter() };
+      expect(await workerCommand(context, ['hi'], {}, [], io)).toBe(0);
+    } finally {
+      for (const [name, value] of Object.entries(before)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+    const { code, stderr } = await other.exited;
+    expect(code, stderr).toBe(0);
+
+    expect(accountsIn(home)).toEqual(['A', 'other']);
+    expect(unlockedWrites(home)).toEqual([]);
+  }, 60_000);
+
+  it('the editor launcher records a limit on top of a change in progress', async () => {
+    const { home, context } = setup(['A', 'B'], ['A']);
+    const other = anotherWriter(home, 'other');
+    await other.ready;
+    context.verifyCap = async (): Promise<LimitVerdict> => {
+      await other.go();
+      return 'limited';
+    };
+    setActive('A', context.ctx);
+    expect(await editorLaunch(context, ['chat'])).toBe(1);
+    const { code, stderr } = await other.exited;
+    expect(code, stderr).toBe(0);
+
+    expect(accountsIn(home)).toEqual(['A', 'other']);
+    expect(unlockedWrites(home)).toEqual([]);
+  }, 60_000);
+
+  it('a run on one account, without rotation, records a limit on top of a change in progress', async () => {
+    const { home, context } = setup(['A', 'B'], ['A']);
+    context.config.rotation.autoRotateHeadless = false;
+    const other = anotherWriter(home, 'other');
+    await other.ready;
+    context.capProbe = async (): Promise<LimitProbeResult> => {
+      await other.go();
+      return { verdict: 'limited', fiveHour: 1, sevenDay: 0.4, fiveHourReset: Date.now() + HOUR };
+    };
+    setActive('A', context.ctx);
+    // The run's own exit code, a limit's.
+    expect(await runCommand(context, ['-p', 'hi'])).toBe(1);
+    const { code, stderr } = await other.exited;
+    expect(code, stderr).toBe(0);
+
+    expect(accountsIn(home)).toEqual(['A', 'other']);
     expect(unlockedWrites(home)).toEqual([]);
   }, 60_000);
 });
