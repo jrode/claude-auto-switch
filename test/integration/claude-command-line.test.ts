@@ -166,9 +166,10 @@ describe('a print run rotating to another model (against fake-claude)', () => {
       expect(onOpus?.args).toEqual(['-p', '--model', 'opus', '--session-id', SECOND, '--', PROMPT]);
       expect(onOpus?.applied).toMatchObject({ print: true, model: 'opus', sessionId: SECOND, prompt: PROMPT });
 
+      // The first launch is given its model the same way, which moves it to the end.
       const plain = await fallingBack(['-p', '--model', 'fable', 'hi']);
       expect(plain.map((l) => l.args)).toEqual([
-        ['-p', '--model', 'fable', 'hi', '--session-id', FIRST],
+        ['-p', 'hi', '--model', 'fable', '--session-id', FIRST],
         ['-p', 'hi', '--model', 'opus', '--session-id', SECOND],
       ]);
       expect(plain[1]?.applied).toMatchObject({ model: 'opus', sessionId: SECOND, prompt: 'hi' });
