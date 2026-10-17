@@ -249,6 +249,8 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
           timing: { answerMs: 300 },
         });
         await waitFor('the carry-on prompt to be seen through', () => session.events, carryOnEnded);
+        // Ended with the subagent still writing, as it is meant to be: its
+        // 15 s only has to outlast the prompt, and is never waited out.
         session.end();
         expect((await session.outcome).kind).toBe('ok');
 
