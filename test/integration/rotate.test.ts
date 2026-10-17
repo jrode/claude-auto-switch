@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { autoRotateHeadless } from '../../src/launcher/rotating-run.js';
+import type { RecordedRefusal } from '../../src/session/refused-turn.js';
 import type { RunOptions } from '../../src/util/exec.js';
 
 function acct(name: string, priority: number) {
@@ -284,5 +288,72 @@ describe('autoRotateHeadless', () => {
     expect(result.account).toBe('B');
     expect(result.rotations).toBe(0);
     expect(calls).toEqual(['/dir/B']); // launched B first, never A
+  });
+});
+describe("the refused turn a print-mode run's own record holds", () => {
+  const ID = '11111111-2222-4333-8444-555555555555';
+  const FORK = '22222222-2222-4333-8444-555555555555';
+  const MINE = "You've hit your session limit · resets 6pm (America/New_York)";
+  const THEIRS = "You've hit your session limit · resets 9pm (America/New_York)";
+
+  /** A refusal as Claude 2.1.302 writes one, `afterMs` from now. */
+  const refusal = (text: string, afterMs: number): string =>
+    JSON.stringify({
+      type: 'assistant',
+      isSidechain: false,
+      isApiErrorMessage: true,
+      error: 'rate_limit',
+      apiError: 'usage_limit_reached',
+      apiErrorStatus: 429,
+      apiErrorParams: { rate_limit_info: { rateLimitType: 'five_hour', resetsAt: Math.floor(Date.now() / 1000) + 3600 } },
+      timestamp: new Date(Date.now() + afterMs).toISOString(),
+      message: { content: [{ type: 'text', text }] },
+    });
+
+  /** A run on account folder `dir` that writes `lines` into the record of `id` and prints `stdout`, failing. */
+  const runWriting = (dir: string, id: string, lines: string[], stdout: string) => async () => {
+    const folder = path.join(dir, 'projects', 'work');
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(path.join(folder, `${id}.jsonl`), lines.map((l) => `${l}`).join(String.fromCharCode(10)));
+    return { stdout, stderr: '', exitCode: 1 };
+  };
+
+  async function recordedFor(args: string[], run: () => Promise<{ stdout: string; stderr: string; exitCode: number }>, dir: string) {
+    const seen: RecordedRefusal[] = [];
+    await autoRotateHeadless(args, {
+      ...base,
+      accounts: [{ name: 'A', priority: 0, enabled: true, dir }],
+      loggedIn: new Set(['A']),
+      ledger: { caps: [] },
+      run,
+      confirmCap: (_account, _text, recorded) => {
+        if (recorded) seen.push(recorded);
+        return Promise.resolve({ limited: false });
+      },
+    });
+    return seen;
+  }
+
+  it('is the one it printed, of two runs resuming one conversation, though the other wrote later', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'cas-print-two-'));
+    const printed = JSON.stringify({ type: 'result', is_error: true, result: MINE, session_id: ID });
+    const seen = await recordedFor(
+      ['-p', '--resume', ID, 'hi'],
+      runWriting(dir, ID, [refusal(MINE, 10), refusal(THEIRS, 20)], printed),
+      dir,
+    );
+    expect(seen.map((r) => r.refusal.text)).toEqual([MINE]);
+    expect(await seen[0]?.shown?.()).toBe(true);
+  });
+
+  it('is read from the conversation a fork reports, not the one it was copied from', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'cas-print-fork-'));
+    const printed = JSON.stringify({ type: 'result', is_error: true, result: MINE, session_id: FORK });
+    const seen = await recordedFor(
+      ['-p', '--resume', ID, '--fork-session', '--output-format', 'json', 'hi'],
+      runWriting(dir, FORK, [refusal(MINE, 10)], printed),
+      dir,
+    );
+    expect(seen.map((r) => r.conversation)).toEqual([FORK]);
   });
 });

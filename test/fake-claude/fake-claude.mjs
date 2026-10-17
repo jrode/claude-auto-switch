@@ -362,6 +362,23 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
    * copied into a new record from an older one (a fork, a record Claude
    * wrote again) still carries its own.
    */
+  /**
+   * The limit a refusal names, as Claude 2.1.29x writes it: its type
+   * (FAKE_CLAUDE_LIMIT_TYPE, five_hour by default) and when it resets in
+   * epoch seconds (FAKE_CLAUDE_RESETS_AT, an hour on by default, "none" for
+   * no time).
+   */
+  const rateLimitInfo = () => {
+    const resets = process.env.FAKE_CLAUDE_RESETS_AT;
+    return {
+      status: 'rejected',
+      rateLimitType: process.env.FAKE_CLAUDE_LIMIT_TYPE ?? 'five_hour',
+      ...(resets === 'none' ? {} : { resetsAt: resets ? Number(resets) : Math.floor(Date.now() / 1000) + 3600 }),
+      overageStatus: 'rejected',
+      overageDisabledReason: 'org_level_disabled',
+      isUsingOverage: false,
+    };
+  };
   const refusalEntry = (extra = {}) => ({
     type: 'assistant',
     isSidechain: false,
@@ -369,6 +386,7 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
     error: 'rate_limit',
     apiError: 'usage_limit_reached',
     apiErrorStatus: 429,
+    apiErrorParams: { rate_limit_info: rateLimitInfo() },
     timestamp: new Date(Date.now() - (Number(process.env.FAKE_CLAUDE_REFUSAL_AGE_MS) || 0)).toISOString(),
     message: {
       model: '<synthetic>',
@@ -410,7 +428,13 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
      */
     const showRefusal = (entry) => {
       const text = entry.message.content[0].text;
-      if (!outputFormat) process.stdout.write(`${text}\n`);
+      if (!outputFormat && process.env.FAKE_CLAUDE_DRAW_BY_CELLS) {
+        // As Claude 2.1.302 draws: only the cells that changed, each moved to
+        // in turn, here from the last to the first, so the text never goes
+        // out in order.
+        const row = 12;
+        for (let i = text.length - 1; i >= 0; i--) process.stdout.write(`\x1b[${row};${i + 3}H${text[i]}`);
+      } else if (!outputFormat) process.stdout.write(`${text}\n`);
       else if (outputFormat === 'stream-json' && process.env.FAKE_CLAUDE_STREAM_REFUSALS) {
         process.stdout.write(`${JSON.stringify({ type: 'assistant', message: entry.message, session_id: printSession() })}\n`);
       }

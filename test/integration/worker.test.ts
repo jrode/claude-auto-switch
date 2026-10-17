@@ -11,6 +11,7 @@ import { workerCommand, WORKER_CARRY_ON, type WorkerIo } from '../../src/command
 import { getActive, setActive } from '../../src/state/active.js';
 import { loadConfig } from '../../src/config/config.js';
 import { leasePath } from '../../src/session/lease.js';
+import { sessionDirFor } from '../../src/session/session-dir.js';
 import { saveLedger } from '../../src/ledger/ledger.js';
 import { writeSwitchRequest } from '../../src/state/switch-request.js';
 import { saveToken } from '../../src/daemon/token-store.js';
@@ -750,6 +751,24 @@ describe('ccx worker (against fake-claude)', () => {
     expect(await workerCommand(context, ['hi'], { output: 'stream-json' }, [], capture().io)).toBe(0);
     expect(asked).toEqual(['A', 'A']);
     expect(launchesIn(runsLog).map((l) => l.marker)).toEqual(['A', 'B']);
+  });
+
+  it('says which conversation it is in, in its own folder, for another session deciding a limit', { timeout: 60_000 }, async () => {
+    // Another session reads this to know a worker is on its conversation too
+    // (session/other-writers), from before the worker's Claude has said so.
+    const { context, runsLog } = await setup(['A']);
+    process.env.FAKE_CLAUDE_IDLE_MS = '3000';
+    const running = workerCommand(context, ['hi'], {}, [], capture().io);
+    let launch: Launch | undefined;
+    for (let i = 0; i < 200 && !launch; i++) {
+      launch = launchesIn(runsLog)[0];
+      if (!launch) await sleep(50);
+    }
+    const report = JSON.parse(
+      readFileSync(path.join(sessionDirFor(process.pid, context.ctx), 'claude-report.json'), 'utf8'),
+    ) as { id?: string };
+    expect(report.id).toBe(valueAfter(launch?.args ?? [], '--session-id'));
+    expect(await running).toBe(0);
   });
 
   it('fails with the answer Claude gave when every account runs out', { timeout: 60_000 }, async () => {

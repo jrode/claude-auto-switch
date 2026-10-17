@@ -1,13 +1,13 @@
 /**
- * What a Claude this ccx started has itself shown: its terminal screen, or
- * the output of a headless run.
+ * What a headless Claude run ccx started has itself printed: a worker's, or
+ * a `claude -p` run's, whose output is its own stream.
  *
  * Claude's record of a conversation is one file that any Claude working on
- * that conversation appends to: ccx's own Desktop handoff in `same` mode, or
- * two runs resuming one id. A refusal in it may be another process's. Claude
- * never reloads that file when another process writes to it, so another
- * Claude's refusal never reaches this one's screen or output, and a refusal
- * this process showed is its own.
+ * that conversation appends to, so a refusal in it may be another process's.
+ * Claude never reloads that file when another process writes to it, so
+ * another Claude's refusal never reaches this run's output, and a refusal it
+ * printed is its own. A terminal screen is not read this way: Claude draws it
+ * by changed cells only, and repaints old text whole.
  */
 
 /** The text of a refusal as it can be found again in output, or null when too little of it to tell. */

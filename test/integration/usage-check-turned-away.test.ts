@@ -1,20 +1,11 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { addCommand } from '../../src/commands/add.js';
 import { runCommand } from '../../src/commands/run.js';
 import { setActive } from '../../src/state/active.js';
 import { loadConfig } from '../../src/config/config.js';
-import { sessionDirFor } from '../../src/session/session-dir.js';
 import type { CliContext } from '../../src/context.js';
 import type { LimitProbeResult } from '../../src/usage/limit-probe.js';
 import {
@@ -49,6 +40,9 @@ const ALSO_SET = [
   'FAKE_CLAUDE_REFUSE_AGAIN_AFTER_MS',
   'FAKE_CLAUDE_PROMPT_AFTER_MS',
   'FAKE_CLAUDE_REFUSAL_ENDS_RUN',
+  'FAKE_CLAUDE_RESETS_AT',
+  'FAKE_CLAUDE_LIMIT_TYPE',
+  'FAKE_CLAUDE_DRAW_BY_CELLS',
 ];
 /** The usage check answering, with a window this one measured. */
 const OUT = (resetAt: number): LimitProbeResult => ({
@@ -161,7 +155,8 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
         const { home, runsLog, context, asked } = await twoAccounts('cas-429-refused-', {
           A: [TURNED_AWAY],
         });
-        Object.assign(process.env, refusedOnA(runsLog));
+        const resetsAt = Math.floor(Date.now() / 1000) + 2 * 60 * 60;
+        Object.assign(process.env, refusedOnA(runsLog), { FAKE_CLAUDE_RESETS_AT: String(resetsAt) });
 
         expect(await runCommand(context, [])).toBe(0);
         const log = readLog(runsLog);
@@ -169,15 +164,15 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
         expect(launches(log).map((l) => l.marker)).toEqual(['A']);
         expect(prompts(log)).toEqual([expect.objectContaining({ marker: 'B', refused: false })]);
         expect(asked).toContain('A');
-        // Account-wide, with no window measured.
-        expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A' })]);
+        // The whole account, until the reset the refusal names.
+        expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A', capUntil: resetsAt * 1000 })]);
         expect(capsIn(home)[0]?.model).toBeUndefined();
         const events = eventsIn(home);
         expect(events.filter((e) => e.kind === 'cap-relief')).toHaveLength(1);
         const verdicts = events.filter((e) => e.kind === 'cap-verify').map((e) => e.msg);
         expect(verdicts).toEqual([
           expect.stringMatching(
-            /^the usage check could not answer \(status 429\), but Claude recorded the turn as refused \(usage_limit_reached\)/,
+            /^the usage check could not answer \(status 429\), but Claude recorded the turn as refused \(usage_limit_reached, five_hour\)/,
           ),
         ]);
       },
@@ -272,16 +267,39 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
     );
 
     it(
-      "keeps the end another session's check already recorded for the account",
+      "ends the limit at the reset the refusal names, over another session's record",
       { timeout: 60_000 },
       async () => {
-        // What happened on 10-16: another session's check confirmed A out
-        // until next week moments before, then the endpoint turned this
-        // session's check away. Its own refusal must not shorten that.
-        const { home, runsLog, context } = await twoAccounts('cas-429-known-', {
-          A: [TURNED_AWAY],
-        });
-        Object.assign(process.env, refusedOnA(runsLog, 2500));
+        // On 10-16 another session's check confirmed A out until next week
+        // moments before, then the endpoint turned this session's check away.
+        // The refusal's own reset is this turn's, and wins.
+        const { home, runsLog, context } = await twoAccounts('cas-429-reset-', { A: [TURNED_AWAY] });
+        const resetsAt = Math.floor(Date.now() / 1000) + 2 * 60 * 60;
+        Object.assign(process.env, refusedOnA(runsLog, 2500), { FAKE_CLAUDE_RESETS_AT: String(resetsAt) });
+        const known = { account: 'A', capUntil: Date.now() + 7 * 24 * 60 * 60_000, reason: 'usage_limit_reached', at: Date.now() };
+
+        const running = runCommand(context, []);
+        await waitFor(
+          'the launch on A',
+          () => launches(readLog(runsLog)),
+          (l) => l.length === 1,
+        );
+        writeFileSync(path.join(home, 'ledger.json'), JSON.stringify({ caps: [known] }), 'utf8');
+        expect(await running).toBe(0);
+
+        expect(prompts(readLog(runsLog))).toEqual([
+          expect.objectContaining({ marker: 'B', refused: false }),
+        ]);
+        expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A', capUntil: resetsAt * 1000 })]);
+      },
+    );
+
+    it(
+      "keeps the end another session's check recorded when the refusal names no reset",
+      { timeout: 60_000 },
+      async () => {
+        const { home, runsLog, context } = await twoAccounts('cas-429-known-', { A: [TURNED_AWAY] });
+        Object.assign(process.env, refusedOnA(runsLog, 2500), { FAKE_CLAUDE_RESETS_AT: 'none' });
         const knownUntil = Date.now() + 7 * 24 * 60 * 60_000;
         const known = { account: 'A', capUntil: knownUntil, reason: 'usage_limit_reached', at: Date.now() };
 
@@ -297,58 +315,88 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
         expect(prompts(readLog(runsLog))).toEqual([
           expect.objectContaining({ marker: 'B', refused: false }),
         ]);
-        expect(capsIn(home)).toEqual([
-          expect.objectContaining({ account: 'A', capUntil: knownUntil }),
-        ]);
+        expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A', capUntil: knownUntil })]);
       },
     );
 
     it(
-      'never moves on a refusal another Claude wrote into the same conversation',
+      'never moves while another live ccx session is on the same conversation',
       { timeout: 60_000 },
       async () => {
-        // Two Claudes on one conversation (the Desktop handoff in `same` mode,
-        // or two runs resuming one id) write one record. The other one is
-        // refused, stamped now, and this one shows nothing of it.
+        // Two Claudes on one conversation write one record, so a refusal in
+        // it may be the other one's. Here that other one is a ccx session,
+        // announced as ccx announces each, in a folder that says which
+        // conversation it is in.
         const { home, runsLog, context, asked } = await twoAccounts('cas-429-other-', {
           A: [TURNED_AWAY],
         });
-        Object.assign(process.env, {
-          FAKE_CLAUDE_RUNS_LOG: runsLog,
-          FAKE_CLAUDE_IDLE_MS: '6000',
-          FAKE_CLAUDE_SESSION_RECORD: '1',
-          FAKE_CLAUDE_TRANSCRIPT: '1',
-        });
+        Object.assign(process.env, refusedOnA(runsLog, 2500));
 
         const running = runCommand(context, []);
-        const folder = path.join(sessionDirFor(process.pid, context.ctx), 'projects', 'fake-project');
-        const record = await waitFor(
-          'the conversation record',
-          () => (existsSync(folder) ? readdirSync(folder).filter((f) => f.endsWith('.jsonl')) : []),
-          (files) => files.length === 1,
+        const [launch] = await waitFor(
+          'the launch on A',
+          () => launches(readLog(runsLog)),
+          (l) => l.length === 1,
         );
-        const otherClaudes = {
-          type: 'assistant',
-          isSidechain: false,
-          isApiErrorMessage: true,
-          error: 'rate_limit',
-          apiError: 'usage_limit_reached',
-          apiErrorStatus: 429,
-          timestamp: new Date().toISOString(),
-          message: { role: 'assistant', content: [{ type: 'text', text: 'Out of room on that account for now.' }] },
-        };
-        appendFileSync(path.join(folder, record[0] ?? ''), `${JSON.stringify(otherClaudes)}\n`);
+        const args = launch?.args ?? [];
+        const conversation = args[args.indexOf('--session-id') + 1] ?? '';
+        const theirs = mkdtempSync(path.join(tmpdir(), 'cas-429-theirs-'));
+        writeFileSync(path.join(theirs, 'claude-report.json'), JSON.stringify({ id: conversation }), 'utf8');
+        // A process that is alive for the whole test, as a running session's is.
+        const pid = process.ppid;
+        mkdirSync(path.join(home, 'sessions-live'), { recursive: true });
+        writeFileSync(
+          path.join(home, 'sessions-live', `A__${pid}.json`),
+          JSON.stringify({ account: 'A', pid, configDir: theirs, at: Date.now() }),
+          'utf8',
+        );
         expect(await running).toBe(0);
 
-        // Asked about, turned away, and not moved.
         expect(asked).toContain('A');
         expect(launches(readLog(runsLog)).map((l) => l.marker)).toEqual(['A']);
+        expect(prompts(readLog(runsLog))).toEqual([]);
         expect(capsIn(home)).toEqual([]);
-        expect(eventsIn(home).filter((e) => e.kind === 'cap-relief')).toEqual([]);
         expect(capVerdicts(home)).toContain(
           'Claude recorded a refused turn, but not switching yet: the usage check could not answer ' +
-            '(status 429), and this Claude did not show the refusal, so another may have written it',
+            `(status 429), and another ccx session (pid ${pid}) is on this conversation too, so the refusal may be its`,
         );
+      },
+    );
+
+    it(
+      'moves however Claude drew the refusal on its screen',
+      { timeout: 60_000 },
+      async () => {
+        // Claude 2.1.302 draws only the cells that changed, so the text of a
+        // refusal need not reach the screen in order, or at all.
+        const { home, runsLog, context } = await twoAccounts('cas-429-cells-', { A: [TURNED_AWAY] });
+        Object.assign(process.env, refusedOnA(runsLog), { FAKE_CLAUDE_DRAW_BY_CELLS: '1' });
+
+        expect(await runCommand(context, [])).toBe(0);
+        expect(prompts(readLog(runsLog))).toEqual([
+          expect.objectContaining({ marker: 'B', refused: false }),
+        ]);
+        expect(capsIn(home).map((c) => c.account)).toEqual(['A']);
+      },
+    );
+
+    it(
+      "takes a limit on one model as that model's, so the account goes on with the others",
+      { timeout: 60_000 },
+      async () => {
+        const { home, runsLog, context } = await twoAccounts('cas-429-opus-', { A: [TURNED_AWAY] });
+        const resetsAt = Math.floor(Date.now() / 1000) + 3 * 24 * 60 * 60;
+        Object.assign(process.env, refusedOnA(runsLog), {
+          FAKE_CLAUDE_LIMIT_TYPE: 'seven_day_opus',
+          FAKE_CLAUDE_RESETS_AT: String(resetsAt),
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        // Recorded against Opus alone, until its own reset; nothing account-wide.
+        expect(capsIn(home)).toEqual([
+          expect.objectContaining({ account: 'A', model: 'Opus', capUntil: resetsAt * 1000 }),
+        ]);
       },
     );
 

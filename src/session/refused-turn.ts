@@ -2,18 +2,19 @@ import type { Refusal } from './transcript.js';
 
 /**
  * Whether a refused turn in Claude's own record proves, on its own, that the
- * login now under the session is out of its usage limit. Asked only when
- * ccx's usage check cannot answer: the endpoint has a small budget shared by
- * every session on the machine, so it answers 429 exactly when many sessions
- * are busy, which is also when limits are met.
+ * login now under the session is out of a usage limit, and of which one.
+ * Asked only when ccx's usage check cannot answer: the endpoint has a small
+ * budget shared by every session on the machine, so it answers 429 exactly
+ * when many sessions are busy, which is also when limits are met.
  *
  * Text on the screen never proves it: a resumed conversation replays old
  * limit messages, and a conversation can be about limits. The record is
- * different, since Claude writes the API's own answer there. But an entry
- * speaks only for the turn it refused, so it proves something only when that
- * is the turn in front of the session now, on the login it is on now, when
- * this process itself showed it (see own-output: another Claude can write to
- * the same record), and when the API's code says how wide the limit is.
+ * different, since Claude writes the API's own answer there, with the limit
+ * and when it resets. But an entry speaks only for the turn it refused, so it
+ * proves something only when that is the turn in front of the session now,
+ * on the login it is on now, and when no other Claude ccx knows of is working
+ * on the same conversation, since every Claude on a conversation writes to
+ * its one record (see other-writers).
  */
 
 /**
@@ -23,12 +24,13 @@ import type { Refusal } from './transcript.js';
  * answered, and its refusal written, a little later: 10 s more covers a slow
  * answer, since a usage limit is refused when the request arrives.
  */
-const OLD_LOGIN_MS = 30_000 + 10_000;
+const LOGIN_KEPT_MS = 30_000;
+const OLD_LOGIN_MS = LOGIN_KEPT_MS + 10_000;
 
 /**
  * Refusals are judged within seconds of being written, or at the latest
  * when Claude exits; older than this, it is no longer the turn in front of
- * the session. Output is kept this long for the check (see own-output).
+ * the session.
  */
 export const REFUSAL_MAX_AGE_MS = 2 * 60_000;
 
@@ -36,34 +38,52 @@ export const REFUSAL_MAX_AGE_MS = 2 * 60_000;
 const CLOCK_SKEW_MS = 5_000;
 
 /**
- * The API's code for a turn refused because the account is out of its
- * session, weekly or monthly spend limit. Claude 2.1.292 to 2.1.302 wrote it
- * on every such refusal measured on one machine (over 470 on 10-16); 2.1.284
- * and older write no code. A limit on one model is another refusal (the
- * record's type names `model_requires_usage_credits` for one), and only this
- * code says the whole account is out.
+ * The API's code for a turn refused because a usage limit is spent. Claude
+ * 2.1.292 to 2.1.302 wrote it on every such refusal measured on one machine;
+ * 2.1.284 and older write no code. It is written for a limit on one model
+ * too, so which limit it was is read from the limit's own name.
  */
-const ACCOUNT_OUT = 'usage_limit_reached';
+const LIMIT_REACHED = 'usage_limit_reached';
+
+/**
+ * Claude's names for its limits (`rate_limit_info.rateLimitType`), as the
+ * 2.1.302 binary sorts them: the whole account's, or one model's, by the
+ * usage check's name for that model. Any other name ("seven_day_overage_included",
+ * or one added later) is not taken as either.
+ */
+const ACCOUNT_LIMITS = new Set(['five_hour', 'seven_day']);
+const MODEL_LIMITS: Record<string, string> = { seven_day_opus: 'Opus', seven_day_sonnet: 'Sonnet' };
 
 /** A refused turn from the record, with what tells whether it is the session's own turn now. */
 export interface RecordedRefusal {
   refusal: Refusal;
   /** When this Claude was started, by the clock the record's times are in. */
   launchedAt: number;
-  /** When a prompt was last typed at it; 0 when none has been seen. */
+  /** When a prompt was last typed at it, a carry-on prompt included; 0 when none has been seen. */
   promptAt: number;
+  /** The conversation whose record it is, when known. */
+  conversation: string | null;
+  /** The pid of the Claude this session runs, the one writer the record should have. */
+  claudePid: number | null;
   /**
-   * Whether this process put the refusal on its own screen or in its own
-   * output (see own-output). It may wait a moment: the record and the output
-   * are written together, and either can be read first.
+   * Whether this process's own output shows it: a worker's, or a `claude -p`
+   * run's, which is its own stream. Absent for a terminal session, whose
+   * screen Claude draws by changed cells only. It may wait a moment: the
+   * record and the output are written together, and either can be read first.
    */
-  shown: () => Promise<boolean>;
+  shown?: () => Promise<boolean>;
+  /** Another live Claude ccx knows of on the same conversation, in words, or null (see other-writers). */
+  otherWriter?: () => string | null;
 }
 
 /** What a refused turn proves on its own, and in words: what it was, or why it is not proof. */
 export interface RefusalProof {
   proves: boolean;
   why: string;
+  /** Set when the limit is one model's, by the usage check's name for it. */
+  model?: string;
+  /** When the limit resets, as the refusal itself says. */
+  resetAt?: number;
 }
 
 /**
@@ -77,25 +97,41 @@ export async function refusalProof(
 ): Promise<RefusalProof> {
   const { refusal, launchedAt, promptAt } = recorded;
   const not = (why: string): RefusalProof => ({ proves: false, why });
-  if (refusal.apiError !== ACCOUNT_OUT) {
-    return not(
-      `the refusal (${refusal.apiError ?? refusal.error}) does not say the account is out of its usage limit`,
-    );
+  if (refusal.apiError !== LIMIT_REACHED) {
+    return not(`the refusal (${refusal.apiError ?? refusal.error}) does not say a usage limit is spent`);
+  }
+  const type = refusal.limitType ?? '';
+  const model = MODEL_LIMITS[type];
+  if (!ACCOUNT_LIMITS.has(type) && model === undefined) {
+    return not(`the refusal does not say which limit it is (${type || 'no name'})`);
   }
   const at = refusal.at;
   if (at === null) return not('the refusal carries no time, so it may not be this turn');
   if (at > now + CLOCK_SKEW_MS) return not('the refusal is stamped in the future');
   if (at < launchedAt) return not('the refusal was recorded before this Claude started');
   if (at < now - REFUSAL_MAX_AGE_MS) return not('the refusal is more than 2 minutes old');
+  if (refusal.resetsAt !== undefined && refusal.resetsAt <= now) return not('the limit it names has reset since');
   if (at < promptAt) return not('a prompt was typed after the refusal');
-  // A login put in before Claude started is one it read fresh.
+  // A login put in before Claude started is one it read fresh. One put in
+  // while it ran may still be the one a request went out on, unless the turn
+  // began after Claude can have kept the old one.
   if (loginChangedAt > launchedAt) {
     if (at < loginChangedAt) return not('the refusal was recorded before the login under Claude changed');
-    if (at < loginChangedAt + OLD_LOGIN_MS) {
+    const turnOnNewLogin = promptAt >= loginChangedAt + LOGIN_KEPT_MS;
+    if (at < loginChangedAt + OLD_LOGIN_MS && !turnOnNewLogin) {
       return not('the refusal came within 40 s of the login changing under Claude, so it may be the old login');
     }
   }
+  const other = recorded.otherWriter?.() ?? null;
+  if (other !== null) return not(`${other} is on this conversation too, so the refusal may be its`);
   // Last, since it may wait.
-  if (!(await recorded.shown())) return not('this Claude did not show the refusal, so another may have written it');
-  return { proves: true, why: `Claude recorded the turn as refused (${ACCOUNT_OUT})` };
+  if (recorded.shown && !(await recorded.shown())) {
+    return not('this run did not print the refusal, so another may have written it');
+  }
+  return {
+    proves: true,
+    why: `Claude recorded the turn as refused (${LIMIT_REACHED}, ${type})`,
+    ...(model !== undefined ? { model } : {}),
+    ...(refusal.resetsAt !== undefined ? { resetAt: refusal.resetsAt } : {}),
+  };
 }

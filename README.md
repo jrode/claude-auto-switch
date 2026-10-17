@@ -115,9 +115,10 @@ wins.
 conversation's transcript, with error codes. ccx reads that record, never the
 screen, and confirms against the account's real usage before it acts. When the
 usage check cannot answer (its budget is shared by every session on the
-machine), a refusal Claude recorded for the current turn, with the code for an
-account out of its usage limit, confirms it instead, provided this Claude
-itself showed it: another Claude on the same conversation writes to the same
+machine), a refusal Claude recorded for the current turn confirms it instead,
+as wide as the record says (the whole account, or one model) and until the
+reset it names. It never does while ccx knows of another live Claude on the
+same conversation, since every Claude on a conversation writes to the same
 record. That covers sessions in the terminal, workers and `claude -p` runs
 whose conversation is named or reported in JSON, not yet the editor launch.
 Text on screen that talks about usage limits never moves a session.

@@ -62,6 +62,7 @@ import {
 import { copyUserSettings, ensureSharedProjects, ensureSharedUserConfig } from '../session/shared-root.js';
 import { confirmSessionCap, usageAnswer, type SessionCapDecision } from '../usage/confirm-cap.js';
 import { refusalProof, type RecordedRefusal } from '../session/refused-turn.js';
+import { otherLiveWriter } from '../session/other-writers.js';
 import { resolveSessionIdentity, maskEmail } from '../session/session-identity.js';
 import { createTerminalWriter } from '../ui/terminal-writer.js';
 import { readUsageSnapshot, refreshUsage, renewIdleLogin, snapshotAgeMs } from '../usage/usage-store.js';
@@ -710,6 +711,15 @@ export async function runInteractiveHotSwap(
    * soon after can be the old login's (session/refused-turn).
    */
   let loginChangedAt = 0;
+  /** Another live Claude ccx knows of on the conversation of `recorded`, in words, or null. */
+  const writerBesides = (recorded: RecordedRefusal): string | null =>
+    recorded.conversation === null
+      ? null
+      : otherLiveWriter(
+          recorded.conversation,
+          { sessionDir, claudePid: recorded.claudePid, configDirs: accounts.map((a) => a.dir) },
+          context.ctx,
+        );
 
   /**
    * Tell the rotation how WIDE a limit was, so a spent model does not read as a
@@ -776,8 +786,10 @@ export async function runInteractiveHotSwap(
         // a model it is not on is not a limit on it.
         {
           modelInUse: runningModel(),
-          // Judged after the usage check, so it sees what Claude has drawn by then.
-          ...(recorded ? { refusal: () => refusalProof(recorded, loginChangedAt) } : {}),
+          // Judged only once the usage check has no answer.
+          ...(recorded
+            ? { refusal: () => refusalProof({ ...recorded, otherWriter: () => writerBesides(recorded) }, loginChangedAt) }
+            : {}),
           ...(context.capProbe ? { probe: context.capProbe } : {}),
         },
       );
@@ -845,14 +857,13 @@ export async function runInteractiveHotSwap(
         }
       }
       if (decision.byRefusal) {
-        // Nothing measured this limit's window. One already on the ledger for
-        // the account, from a check that was answered (another session's,
-        // moments ago, when the endpoint is this busy), is the best there is,
-        // and replacing it with a guess would shorten or stretch a measured
-        // limit. Without one the configured backoff applies, as for any limit
-        // that came with no window.
+        // Until the reset the refusal names, which is this turn's own. Without
+        // one, the end already on the ledger for the account (another
+        // session's answered check, moments ago when the endpoint is this
+        // busy), and failing that the configured backoff.
         const owner = capOwner ?? current?.name ?? '';
-        limitedResetAt = accountCapEnd(loadLedger(context.ctx), owner, Date.now());
+        limitedResetAt =
+          decision.resetAt ?? (decision.model ? undefined : accountCapEnd(loadLedger(context.ctx), owner, Date.now()));
         notice(
           `the usage check could not answer (${usageAnswer(decision)}), ` +
             `but ${decision.refusalWhy ?? 'Claude recorded the turn as refused'}, which confirms the limit`,
@@ -2396,6 +2407,12 @@ export async function runInteractiveHotSwap(
        * long for a command line, goes in by standard input.
        */
       const launchChild = (childArgs: string[], stdin?: string): Promise<SessionOutcome> => {
+        // Which conversation this launch is in, kept in this session's own
+        // folder for another session deciding a limit on it (session/other-writers);
+        // Claude's own word replaces it as it comes. A fork's is not known
+        // until Claude says it.
+        const launched = forksConversation(childArgs) ? null : conversationIdIn(childArgs);
+        if (launched) rememberReport(sessionDir, { id: launched });
         if (!worker) return runPtySession({ ...base, args: childArgs });
         // Ended: nothing starts, and what the last launch printed stays as it was.
         if (interruption?.exitCode != null) {

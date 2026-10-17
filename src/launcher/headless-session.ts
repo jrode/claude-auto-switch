@@ -312,7 +312,14 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
     };
     // Nobody types at a headless Claude, so no prompt can come after a refusal.
     const recorded: RecordedRefusal | undefined = refusal
-      ? { refusal, launchedAt: startedAt, promptAt: 0, shown: () => shown(refusal) }
+      ? {
+          refusal,
+          launchedAt: startedAt,
+          promptAt: 0,
+          conversation,
+          claudePid: child.pid ?? null,
+          shown: () => shown(refusal),
+        }
       : undefined;
     const check = options.verifyCap ? options.verifyCap(text, recorded) : Promise.resolve(true);
     verifying = check

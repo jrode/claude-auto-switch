@@ -12,7 +12,7 @@ import type { Ledger } from '../ledger/ledger.schema.js';
 import type { CapDecision } from '../usage/confirm-cap.js';
 import { withModel } from '../usage/model-args.js';
 import { launchHeadless, type HeadlessRunner } from './launcher.js';
-import { conversationIdIn, reportedSessionId } from './conversation.js';
+import { conversationIdIn, forksConversation, reportedSessionId } from './conversation.js';
 import { refusalsSince } from '../session/transcript.js';
 import { outputShows } from '../session/own-output.js';
 import type { RecordedRefusal } from '../session/refused-turn.js';
@@ -240,11 +240,16 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
 
 /**
  * The refused turn in a finished run's own record, for when it is one Claude
- * itself recorded: the run failed, its record is found by the conversation
- * its arguments name or its JSON output reports (never by the newest file in
- * the folder, which a run beside it may have written), and it printed the
- * refusal. A plain-text run with no conversation flag reports no conversation,
- * so it has none.
+ * itself recorded: the run failed, and its record is found by the
+ * conversation its arguments name or its JSON output reports, never by the
+ * newest file in the folder, which a run beside it may have written. A fork
+ * is its own new conversation, which only the output reports. A plain-text
+ * run with neither has none to find.
+ *
+ * Of the refusals written since it started, the newest one it printed: two
+ * runs resuming one conversation write into one record, and each printed only
+ * its own. When it printed none, the newest, which the check then refuses as
+ * not shown.
  */
 function refusedIn(
   account: RotatableAccount,
@@ -253,11 +258,20 @@ function refusedIn(
   launchedAt: number,
 ): RecordedRefusal | undefined {
   if (run.exitCode === 0) return undefined;
-  const id = conversationIdIn(args) ?? reportedSessionId(run.stdout);
+  const reported = reportedSessionId(run.stdout);
+  const id = forksConversation(args) ? reported : (conversationIdIn(args) ?? reported);
   if (id === null) return undefined;
-  const refusal = refusalsSince(account.dir, id, launchedAt).pop();
-  if (!refusal) return undefined;
   const output = `${run.stdout}\n${run.stderr}`;
-  // Nobody types at a print-mode run.
-  return { refusal, launchedAt, promptAt: 0, shown: () => Promise.resolve(outputShows(output, refusal.text)) };
+  const refusals = refusalsSince(account.dir, id, launchedAt);
+  const refusal = refusals.find((r) => outputShows(output, r.text)) ?? refusals[0];
+  if (!refusal) return undefined;
+  return {
+    refusal,
+    launchedAt,
+    // Nobody types at a print-mode run, and its own Claude has exited.
+    promptAt: 0,
+    conversation: id,
+    claudePid: null,
+    shown: () => Promise.resolve(outputShows(output, refusal.text)),
+  };
 }

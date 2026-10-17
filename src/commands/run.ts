@@ -16,6 +16,7 @@ import { configHome } from '../config/paths.js';
 import { signedInAndNotRejected } from '../health/signed-in.js';
 import { confirmCap } from '../usage/confirm-cap.js';
 import { refusalProof } from '../session/refused-turn.js';
+import { otherLiveWriter } from '../session/other-writers.js';
 
 /** Show a one-time tip about the transparent shim, after an interactive session. */
 function maybeHintShim(context: CliContext): void {
@@ -120,7 +121,25 @@ export async function runCommand(
       confirmCap: (account, renderedText, recorded) =>
         confirmCap(account.dir, renderedText, {
           ...(context.capProbe ? { probe: context.capProbe } : {}),
-          ...(recorded ? { refusal: () => refusalProof(recorded, 0) } : {}),
+          ...(recorded
+            ? {
+                refusal: () =>
+                  refusalProof(
+                    {
+                      ...recorded,
+                      otherWriter: () =>
+                        recorded.conversation === null
+                          ? null
+                          : otherLiveWriter(
+                              recorded.conversation,
+                              { sessionDir: null, claudePid: null, configDirs: accounts.map((a) => a.dir) },
+                              context.ctx,
+                            ),
+                    },
+                    0,
+                  ),
+              }
+            : {}),
         }),
       modelPreference: context.config.rotation.modelPreference,
       modelStrategy: context.config.rotation.modelStrategy,

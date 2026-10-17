@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 /**
@@ -37,6 +37,14 @@ export interface Refusal {
    * working, and it meets the limit itself only at its own next request.
    */
   sidechain: boolean;
+  /**
+   * Which limit it was, by Claude's own name for it, when the entry says
+   * (`apiErrorParams.rate_limit_info.rateLimitType`): "five_hour",
+   * "seven_day", "seven_day_opus" and others.
+   */
+  limitType?: string;
+  /** When that limit resets, in milliseconds, when the entry says (`rate_limit_info.resetsAt`, in seconds). */
+  resetsAt?: number;
 }
 
 /** The refusal in one record entry, or null when the entry is anything else. */
@@ -49,6 +57,7 @@ export function refusalIn(entry: unknown): Refusal | null {
     error?: unknown;
     apiError?: unknown;
     apiErrorStatus?: unknown;
+    apiErrorParams?: { rate_limit_info?: { rateLimitType?: unknown; resetsAt?: unknown } | null } | null;
     timestamp?: unknown;
     message?: { content?: unknown };
   };
@@ -56,6 +65,10 @@ export function refusalIn(entry: unknown): Refusal | null {
   const error = typeof e.error === 'string' ? e.error : '';
   const status = typeof e.apiErrorStatus === 'number' ? e.apiErrorStatus : null;
   if (error !== 'rate_limit' && error !== 'billing_error' && status !== 429) return null;
+  const limit = e.apiErrorParams?.rate_limit_info;
+  const limitType = typeof limit?.rateLimitType === 'string' ? limit.rateLimitType : null;
+  const resetsAt =
+    typeof limit?.resetsAt === 'number' && Number.isFinite(limit.resetsAt) ? limit.resetsAt * 1000 : null;
   const content = Array.isArray(e.message?.content) ? (e.message.content as unknown[]) : [];
   const text = content
     .map((c) =>
@@ -71,6 +84,8 @@ export function refusalIn(entry: unknown): Refusal | null {
     text,
     at: Number.isFinite(at) ? at : null,
     sidechain: e.isSidechain === true,
+    ...(limitType !== null ? { limitType } : {}),
+    ...(resetsAt !== null ? { resetsAt } : {}),
   };
 }
 
@@ -231,25 +246,53 @@ function parsed(line: string): unknown {
   }
 }
 
+/** How much of a record is read at a time from its end; records grow to hundreds of megabytes. */
+const BACKWARD_CHUNK = 1 << 20;
+
 /**
  * The main thread's refused turns in the record of conversation `id` that
- * were written at or after `since`, oldest first; none when there is no
- * record. For a run that has ended, so the record is read whole.
+ * were written at or after `since`, newest first; none when there is no
+ * record. Read from the end, a chunk at a time, and only as far back as the
+ * first entry older than `since`: a run's own entries are the last ones.
  */
 export function refusalsSince(configDir: string, id: string, since: number): Refusal[] {
   const file = findTranscript(configDir, id);
-  if (!file) return [];
-  let text: string;
-  try {
-    text = readFileSync(file, 'utf8');
-  } catch {
-    return [];
-  }
+  const size = file ? sizeOf(file) : null;
+  if (!file || size === null) return [];
   const found: Refusal[] = [];
-  for (const line of text.split('\n')) {
-    if (!line.includes('"isApiErrorMessage":true')) continue;
-    const refusal = refusalIn(parsed(line));
-    if (refusal && !refusal.sidechain && refusal.at !== null && refusal.at >= since) found.push(refusal);
+  let end = size;
+  // Bytes after the last newline seen so far, which belong to the line the next chunk ends.
+  let carry = Buffer.alloc(0);
+  try {
+    while (end > 0) {
+      const start = Math.max(0, end - BACKWARD_CHUNK);
+      const bytes = Buffer.concat([readRange(file, start, end), carry]);
+      end = start;
+      let body = bytes;
+      carry = Buffer.alloc(0);
+      if (start > 0) {
+        // The first line may be cut by the chunk's start: it is finished by the next chunk.
+        const newline = bytes.indexOf(0x0a);
+        if (newline === -1) {
+          carry = bytes;
+          continue;
+        }
+        carry = bytes.subarray(0, newline);
+        body = bytes.subarray(newline + 1);
+      }
+      const lines = body.toString('utf8').split('\n').reverse();
+      for (const line of lines) {
+        if (line.trim() === '') continue;
+        const entry = parsed(line) as { timestamp?: unknown } | null;
+        const at = typeof entry?.timestamp === 'string' ? Date.parse(entry.timestamp) : NaN;
+        if (Number.isFinite(at) && at < since) return found;
+        if (!line.includes('"isApiErrorMessage":true')) continue;
+        const refusal = refusalIn(entry);
+        if (refusal && !refusal.sidechain && refusal.at !== null && refusal.at >= since) found.push(refusal);
+      }
+    }
+  } catch {
+    /* gone or unreadable midway: what was found */
   }
   return found;
 }

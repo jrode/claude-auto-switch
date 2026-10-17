@@ -447,6 +447,18 @@ describe('a usage check that gives no answer', () => {
     }
   });
 
+  it("scopes and times it as the record says: one model's limit, until the reset it names", async () => {
+    const opus = () =>
+      Promise.resolve({ proves: true, why: 'Claude recorded the turn as refused', model: 'Opus', resetAt: 777 });
+    const decision = await ask({ probe: answering(TURNED_AWAY).probe, refusal: opus });
+    expect(decision).toMatchObject({ limited: true, byRefusal: true, model: 'Opus', resetAt: 777 });
+    // Not proven, neither travels.
+    const unproven = () => Promise.resolve({ proves: false, why: 'no', model: 'Opus', resetAt: 777 });
+    const refused = await ask({ probe: answering(TURNED_AWAY).probe, refusal: unproven });
+    expect(refused.model).toBeUndefined();
+    expect(refused.resetAt).toBeUndefined();
+  });
+
   it('never confirms it on a refusal that does not prove it, or on none', async () => {
     for (const refusal of [doesNot, undefined]) {
       const decision = await ask({ probe: answering(TURNED_AWAY).probe, ...(refusal ? { refusal } : {}) });

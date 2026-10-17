@@ -248,8 +248,8 @@ export async function confirmSessionCap(
 
 /**
  * No answer from the usage check: a limit only when Claude's own record of
- * the refused turn proves it. Account-wide, as the refusal's own code says,
- * and with no window, since nothing measured one.
+ * the refused turn proves it, as wide as the record says (the account, or one
+ * model) and until the reset it names.
  */
 async function unanswered(
   detail: string,
@@ -257,10 +257,13 @@ async function unanswered(
 ): Promise<CapDecision> {
   // A judgement that fails proves nothing, the same as a probe that does.
   const proof = judge ? await judge().catch(() => undefined) : undefined;
+  const proved = proof?.proves === true ? proof : undefined;
   return {
-    limited: proof?.proves === true,
+    limited: proved !== undefined,
     unanswered: true,
-    ...(proof?.proves === true ? { byRefusal: true as const } : {}),
+    ...(proved ? { byRefusal: true as const } : {}),
+    ...(proved?.model !== undefined ? { model: proved.model } : {}),
+    ...(proved?.resetAt !== undefined ? { resetAt: proved.resetAt } : {}),
     ...(proof ? { refusalWhy: proof.why } : {}),
     detail,
   };

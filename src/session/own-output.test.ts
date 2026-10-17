@@ -4,8 +4,8 @@ import { createOutputLog, refusalKey, squeezed } from './own-output.js';
 const LIMIT = "You've hit your session limit · resets 6pm (America/New_York)";
 const ESC = String.fromCharCode(27);
 
-describe('telling whether a refusal is on this Claude’s own screen', () => {
-  it('finds it however the terminal drew it: in colour, in pieces, wrapped, with the cursor moved over spaces', () => {
+describe("telling whether a run's own output shows a refusal", () => {
+  it('finds it in colour, in pieces, wrapped, or with the cursor moved over spaces', () => {
     const log = createOutputLog({ keepMs: 60_000, maxChars: 100_000 });
     log.add(`${ESC}]0;claude${ESC}\\${ESC}[2K${ESC}[1A  ⎿  ${ESC}[31mYou've hit your`, 1000);
     log.add(`${ESC}[1Csession lim`, 1001);
