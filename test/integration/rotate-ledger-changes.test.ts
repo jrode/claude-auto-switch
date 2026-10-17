@@ -17,6 +17,15 @@ function acct(name: string, priority: number) {
   return { name, priority, enabled: true, dir: `/dir/${name}` };
 }
 
+const base = {
+  claude: { bin: 'node' },
+  accounts: [acct('A', 0), acct('B', 1)],
+  loggedIn: new Set(['A', 'B']),
+  defaultBackoffMinutes: 300,
+  out: () => {},
+  confirmCap: () => Promise.resolve({ limited: true }),
+};
+
 describe('the changes a headless run makes to the ledger', () => {
   it('keeps a limit another session records on the account while the run on it is going, though the run ends fine', async () => {
     // The run ran fine, which shows the limits recorded before it started are
@@ -35,13 +44,8 @@ describe('the changes a headless run makes to the ledger', () => {
     };
 
     const result = await autoRotateHeadless(['-p', 'hi'], {
-      claude: { bin: 'node' },
-      accounts: [acct('A', 0), acct('B', 1)],
-      loggedIn: new Set(['A', 'B']),
+      ...base,
       now: () => clock,
-      defaultBackoffMinutes: 300,
-      out: () => {},
-      confirmCap: () => Promise.resolve({ limited: true }),
       ledger: loadLedger(c),
       run,
       recordChange: (change) => updateLedger(c, (ledger) => applyLedgerChange(ledger, change)),
@@ -51,10 +55,37 @@ describe('the changes a headless run makes to the ledger', () => {
     // B's attempt started at 1010, and the other session recorded B at 1020.
     expect(result.changes).toEqual([
       { kind: 'capped', cap: expect.objectContaining({ account: 'A', now: 1_010 }) },
-      { kind: 'cleared', account: 'B', upTo: 1_010 },
+      { kind: 'ran', account: 'B', model: null, startedAt: 1_010 },
     ]);
     const caps = loadLedger(c).caps;
     expect(caps.map((cap) => cap.account).sort()).toEqual(['A', 'B']);
     expect(caps.find((cap) => cap.account === 'B')?.reason).toBe('another session');
+  });
+
+  it('carries the request on to the next account when the ledger cannot be written', async () => {
+    // A lost record of a limit costs one wasted attempt later; a lost request
+    // is the work itself.
+    const said: string[] = [];
+    let calls = 0;
+    const run = async (_bin: string, _args: string[], opts?: RunOptions) =>
+      opts?.env?.CLAUDE_CONFIG_DIR === '/dir/A'
+        ? { stdout: '', stderr: 'Usage limit reached.', exitCode: 1 }
+        : { stdout: 'done', stderr: '', exitCode: 0 };
+
+    const result = await autoRotateHeadless(['-p', 'hi'], {
+      ...base,
+      now: () => 1_000,
+      ledger: { caps: [] },
+      run,
+      out: (m) => said.push(m),
+      recordChange: () => {
+        calls += 1;
+        if (calls === 1) throw new Error('disk full');
+      },
+    });
+
+    expect(result).toMatchObject({ exitCode: 0, account: 'B' });
+    expect(calls).toBe(2);
+    expect(said).toContain('could not record that A is out on the ledger (disk full); carrying on');
   });
 });

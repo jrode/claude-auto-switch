@@ -5,7 +5,16 @@ import { select } from '../selector/selector.js';
 import { launchWatched, launchPassthrough } from '../launcher/launcher.js';
 import { claudeSubcommandIn } from '../launcher/subcommand.js';
 import { autoRotateHeadless } from '../launcher/rotating-run.js';
-import { loadLedger, updateLedger, applyLedgerChange, cappedNames, markCapped } from '../ledger/ledger.js';
+import {
+  loadLedger,
+  updateLedger,
+  applyLedgerChange,
+  cappedNames,
+  markCapped,
+  type LedgerChange,
+} from '../ledger/ledger.js';
+import { appendEvent } from '../events/log.js';
+import { thrownReason } from '../util/thrown-reason.js';
 import { preferredModel, roomOfFromSnapshot } from '../usage/account-room.js';
 import { getClaude, type CliContext } from '../context.js';
 import { hasAnyUsableAccount, runInteractiveHotSwap } from './session.js';
@@ -31,6 +40,26 @@ function maybeHintShim(context: CliContext): void {
     markHinted(home);
   } else {
     markCovered(home);
+  }
+}
+
+/**
+ * Apply one change a headless run made to the ledger as it stands now. A ledger
+ * that cannot be read or written loses that change, never the request: the run
+ * goes on to the next account, and the event log says what was not recorded.
+ */
+function recordRunChange(context: CliContext, change: LedgerChange): void {
+  try {
+    updateLedger(context.ctx, (ledger) => applyLedgerChange(ledger, change));
+  } catch (error) {
+    const what =
+      change.kind === 'capped' ? `that "${change.cap.account}" is out` : `that "${change.account}" ran fine`;
+    appendEvent(
+      configHome(context.ctx),
+      `could not record ${what} on the ledger (${thrownReason(error)})`,
+      Date.now(),
+      { kind: 'ledger-write-failed', data: { change } },
+    );
   }
 }
 
@@ -148,7 +177,7 @@ export async function runCommand(
       roomOf: roomOfFromSnapshot(context.ctx, Date.now(), context.config.rotation, preferredModel(context)),
       defaultBackoffMinutes: context.config.rotation.defaultBackoffMinutes,
       ledger: loadLedger(context.ctx),
-      recordChange: (change) => updateLedger(context.ctx, (ledger) => applyLedgerChange(ledger, change)),
+      recordChange: (change) => recordRunChange(context, change),
       out: context.out,
       writeOutput: (stdout, stderr) => {
         if (stdout) process.stdout.write(stdout);
@@ -180,7 +209,11 @@ export async function runCommand(
     // from the classification, so a replayed or quoted limit message could
     // bench an account for hours from here even though both rotation paths
     // had learned better.
-    const decision = await confirmCap(result.account.dir, watched.stderr);
+    const decision = await confirmCap(
+      result.account.dir,
+      watched.stderr,
+      context.capProbe ? { probe: context.capProbe } : {},
+    );
     if (decision.limited) {
       updateLedger(context.ctx, (ledger) =>
         markCapped(ledger, {

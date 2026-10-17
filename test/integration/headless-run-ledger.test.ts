@@ -7,6 +7,7 @@ import { addCommand } from '../../src/commands/add.js';
 import { runCommand } from '../../src/commands/run.js';
 import { setActive } from '../../src/state/active.js';
 import { loadConfig } from '../../src/config/config.js';
+import { readEvents } from '../../src/events/log.js';
 import type { CliContext } from '../../src/context.js';
 import type { LimitProbeResult } from '../../src/usage/limit-probe.js';
 
@@ -50,43 +51,54 @@ async function account(context: CliContext, home: string, name: string, capped: 
   );
 }
 
+/**
+ * Accounts A and B out of room, C with room, and D, which the run never gets
+ * to. The usage check calls `whenAsked` with the account it is asked about,
+ * then says that account is out.
+ */
+async function fourAccounts(
+  whenAsked: (name: string, home: string) => void,
+): Promise<{ home: string; context: CliContext; asked: string[] }> {
+  const home = mkdtempSync(path.join(tmpdir(), 'cas-headless-ledger-'));
+  const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };
+  const asked: string[] = [];
+  const context: CliContext = {
+    ctx,
+    config: loadConfig(ctx),
+    claude: { bin: process.execPath, prefixArgs: [fakeClaude] },
+    capProbe: (credentialsFile) => {
+      const name = (JSON.parse(readFileSync(credentialsFile, 'utf8')) as { account: string }).account;
+      asked.push(name);
+      whenAsked(name, home);
+      const out: LimitProbeResult = { verdict: 'limited', fiveHour: 1, sevenDay: 0.4, fiveHourReset: Date.now() + HOUR };
+      return Promise.resolve(out);
+    },
+    out: () => {},
+    err: () => {},
+    json: false,
+    quiet: false,
+  };
+  await account(context, home, 'A', true);
+  await account(context, home, 'B', true);
+  await account(context, home, 'C', false);
+  await account(context, home, 'D', false);
+  setActive('A', ctx);
+  return { home, context, asked };
+}
+
 describe('the ledger a headless run leaves (against fake-claude)', () => {
   it('keeps a limit another session recorded while the run went on, and records its own as it finds them', async () => {
-    const home = mkdtempSync(path.join(tmpdir(), 'cas-headless-ledger-'));
-    const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };
-    const asked: string[] = [];
     let onRecordWhenBWasAsked: string[] = [];
-    const context: CliContext = {
-      ctx,
-      config: loadConfig(ctx),
-      claude: { bin: process.execPath, prefixArgs: [fakeClaude] },
-      // The usage check, asked by the account whose login it is given: every
-      // account it is asked about is out.
-      capProbe: (credentialsFile) => {
-        const name = (JSON.parse(readFileSync(credentialsFile, 'utf8')) as { account: string }).account;
-        asked.push(name);
-        if (name === 'A') {
-          // Meanwhile another session finds D out and records it, as any
-          // change to the ledger does: read it, add the limit, write it back.
-          const now = Date.now();
-          const caps = [...capsIn(home), { account: 'D', capUntil: now + HOUR, reason: 'another session', at: now }];
-          writeFileSync(ledgerFile(home), JSON.stringify({ caps }), 'utf8');
-        }
-        if (name === 'B') onRecordWhenBWasAsked = accountsIn(home);
-        const out: LimitProbeResult = { verdict: 'limited', fiveHour: 1, sevenDay: 0.4, fiveHourReset: Date.now() + HOUR };
-        return Promise.resolve(out);
-      },
-      out: () => {},
-      err: () => {},
-      json: false,
-      quiet: false,
-    };
-    // In this order: A and B are out, C has room, and the run never gets to D.
-    await account(context, home, 'A', true);
-    await account(context, home, 'B', true);
-    await account(context, home, 'C', false);
-    await account(context, home, 'D', false);
-    setActive('A', ctx);
+    const { home, context, asked } = await fourAccounts((name, dir) => {
+      if (name === 'A') {
+        // Meanwhile another session finds D out and records it, as any
+        // change to the ledger does: read it, add the limit, write it back.
+        const now = Date.now();
+        const caps = [...capsIn(dir), { account: 'D', capUntil: now + HOUR, reason: 'another session', at: now }];
+        writeFileSync(ledgerFile(dir), JSON.stringify({ caps }), 'utf8');
+      }
+      if (name === 'B') onRecordWhenBWasAsked = accountsIn(dir);
+    });
 
     expect(await runCommand(context, ['-p', 'hi'])).toBe(0);
 
@@ -96,5 +108,21 @@ describe('the ledger a headless run leaves (against fake-claude)', () => {
     expect(onRecordWhenBWasAsked).toEqual(['A', 'D']);
     // Its own two limits, and the one another session recorded while it ran.
     expect(accountsIn(home)).toEqual(['A', 'B', 'D']);
+  }, 60_000);
+
+  it('goes on to the next account when a limit cannot be recorded, and says what was lost', async () => {
+    // The ledger cannot be read while A's limit is being recorded, and is
+    // whole again by the time B's is.
+    const { home, context, asked } = await fourAccounts((name, dir) => {
+      if (name === 'A') writeFileSync(ledgerFile(dir), '{ not json', 'utf8');
+      if (name === 'B') writeFileSync(ledgerFile(dir), JSON.stringify({ caps: [] }), 'utf8');
+    });
+
+    expect(await runCommand(context, ['-p', 'hi'])).toBe(0);
+
+    expect(asked).toEqual(['A', 'B']);
+    expect(accountsIn(home)).toEqual(['B']);
+    const failed = readEvents(home, 100).filter((e) => e.kind === 'ledger-write-failed');
+    expect(failed.map((e) => e.msg.split(' (')[0])).toEqual(['could not record that "A" is out on the ledger']);
   }, 60_000);
 });

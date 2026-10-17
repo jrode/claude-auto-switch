@@ -33,25 +33,34 @@ export function loadLedger(c: PathCtx = {}): Ledger {
   return readJsonFile(ledgerFilePath(c), LedgerSchema) ?? { caps: [] };
 }
 
+/** Set while a change runs, so a change that calls updateLedger itself is refused rather than written over. */
+let changing = false;
+
 /**
  * The one way to change the ledger: read it, apply `change` and write the
  * result, as one step under the ledger's lock, so a limit another process
  * records at the same moment is never written over. `change` is handed the
  * ledger as it is now and returns the new one; returning the one it was handed
- * writes nothing. Returns the ledger as it now stands.
+ * writes nothing. Returns the ledger as it now stands. A change must not call
+ * updateLedger: that throws, since it would wait on its own lock and its write
+ * would then be overwritten by the outer one.
  *
- * A lock that is not free within `waitMs` is not waited on further: the change
- * is written without it, and the event log says so. A holder only reads and
- * writes one small file, so one still holding it after seconds is stopped, or
- * gone with its pid now another program's. Waiting longer would freeze the
- * session that asked, and dropping the change would lose a limit for certain,
- * where writing loses one only if another process writes in that same moment.
+ * A lock that is not free within `waitMs`, or cannot be made at all, is not
+ * waited on further: the change is written without it, and the event log says
+ * so. Waiting longer would freeze the session that asked, and dropping the
+ * change would lose a limit for certain. Written past, a change and the
+ * holder's can still erase one another as every write could before 2.6.11: a
+ * holder that resumes after stalling writes back what it read before, over
+ * this change, and a holder that writes first is overwritten by it. A holder
+ * only reads and writes one small file, so one still holding the lock after
+ * seconds is stopped, or gone with its pid now another program's.
  */
 export function updateLedger(
   c: PathCtx,
   change: (ledger: Ledger) => Ledger,
   options: { waitMs?: number } = {},
 ): Ledger {
+  if (changing) throw new Error('updateLedger was called from inside a change to the ledger');
   const file = ledgerFilePath(c);
   const waitMs = options.waitMs ?? LOCK.waitMs;
   // The lock lives beside the ledger, so a first write needs the folder first.
@@ -59,16 +68,24 @@ export function updateLedger(
   const lock = acquireOwnedLock(`${file}.lock`, { ...LOCK, waitMs });
   try {
     const current = loadLedger(c);
-    const next = change(current);
+    changing = true;
+    let next: Ledger;
+    try {
+      next = change(current);
+    } finally {
+      changing = false;
+    }
     if (next === current) return current;
     writeJsonFile(file, next);
     if (!lock.held) {
+      const why = lock.unusable
+        ? `the lock could not be made (${lock.unusable})`
+        : `the lock was not free within ${waitMs / 1000} s`;
       appendEvent(
         configHome(c),
-        `ledger written without its lock (not free within ${waitMs / 1000} s); ` +
-          'a limit another session recorded at that moment may be lost',
+        `ledger written without its lock: ${why}; a change another session made at that moment may be lost`,
         Date.now(),
-        { kind: 'ledger-unlocked', data: { waitMs } },
+        { kind: 'ledger-unlocked', data: { waitMs, ...(lock.unusable ? { unusable: lock.unusable } : {}) } },
       );
     }
     return next;
@@ -225,30 +242,39 @@ export function clearAccount(ledger: Ledger, account: string): Ledger {
   return { caps: ledger.caps.filter((c) => c.account !== account) };
 }
 
+/** A run on `account` that started at `startedAt` and finished fine, on `model` (null when not known). */
+export interface FineRun {
+  account: string;
+  model: string | null;
+  startedAt: number;
+}
+
 /**
- * Remove the caps for an account recorded at or before `upTo`, keeping any
- * recorded later. Returns the same ledger when there is none to remove, so
- * updateLedger writes nothing.
- *
- * For a run that started at `upTo` and finished fine: the account worked after
- * the older limits were recorded. A later one came from a session that saw the
- * account refuse while the run was going, which the run cannot speak to.
+ * Remove what a run that finished fine shows is over, and nothing else: its
+ * account's account-wide caps, and its cap for the model it ran when that is
+ * known, recorded before it started. A cap on another model says nothing about
+ * this one, and one recorded once it had started, even in the same
+ * millisecond, may be another session seeing the account refuse while it ran.
+ * Keeping a cap only rests an account a little longer; a wrong clear sends
+ * sessions to one that is out. Returns the same ledger when there is none to
+ * remove, so updateLedger writes nothing.
  */
-export function clearAccountUpTo(ledger: Ledger, account: string, upTo: number): Ledger {
-  const caps = ledger.caps.filter((c) => c.account !== account || c.at > upTo);
+export function clearDisproved(ledger: Ledger, run: FineRun): Ledger {
+  const disproved = (c: CapRecord): boolean =>
+    c.account === run.account &&
+    c.at < run.startedAt &&
+    (!c.model || (run.model !== null && sameModel(c.model, run.model)));
+  const caps = ledger.caps.filter((c) => !disproved(c));
   return caps.length === ledger.caps.length ? ledger : { caps };
 }
 
 /**
- * One change a run made to the ledger, applied to the file as it stands when it
- * is written (updateLedger), never by writing back a copy read earlier.
+ * One thing a run found out, applied to the ledger as the file stands when it
+ * is written (updateLedger), never by writing back a copy read earlier: a
+ * limit it confirmed, or a run that finished fine.
  */
-export type LedgerChange =
-  | { kind: 'capped'; cap: MarkCappedInput }
-  | { kind: 'cleared'; account: string; upTo: number };
+export type LedgerChange = { kind: 'capped'; cap: MarkCappedInput } | ({ kind: 'ran' } & FineRun);
 
 export function applyLedgerChange(ledger: Ledger, change: LedgerChange): Ledger {
-  return change.kind === 'capped'
-    ? markCapped(ledger, change.cap)
-    : clearAccountUpTo(ledger, change.account, change.upTo);
+  return change.kind === 'capped' ? markCapped(ledger, change.cap) : clearDisproved(ledger, change);
 }

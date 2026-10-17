@@ -21,6 +21,7 @@ const base = {
   // with the text. What happens when it does NOT agree is the subject of its
   // own test below, because that is the case that used to cap healthy accounts.
   confirmCap: () => Promise.resolve({ limited: true }),
+  recordChange: () => {},
 };
 
 describe('autoRotateHeadless', () => {
@@ -253,8 +254,12 @@ describe('autoRotateHeadless', () => {
         ? { stdout: '', stderr: "you've reached your Fable 5 limit", exitCode: 1 }
         : { stdout: 'done on the fallback', stderr: '', exitCode: 0 };
     };
+    // A clock that moves, so the Fable limit is recorded before the Opus
+    // attempt starts and only its model can keep it on the ledger.
+    let clock = 1000;
     const result = await autoRotateHeadless(['-p', 'hi'], {
       ...base,
+      now: () => (clock += 10),
       accounts: [acct('A', 0)],
       loggedIn: new Set(['A']),
       ledger: { caps: [] },
@@ -267,6 +272,8 @@ describe('autoRotateHeadless', () => {
     expect(result.account).toBe('A');
     expect(invocations).toHaveLength(2);
     expect(invocations[1]!.join(' ')).toContain('--model opus');
+    // Running fine on Opus says nothing about Fable.
+    expect(result.ledger.caps.map((c) => `${c.account}:${c.model}`)).toEqual(['A:Fable']);
   });
 
   it('with most-room order, starts on the least-used account, not the lowest priority', async () => {

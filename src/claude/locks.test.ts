@@ -158,6 +158,22 @@ describe('acquireOwnedLock', () => {
     expect(readFileSync(lock, 'utf8')).toBe('4242');
   });
 
+  it('says why, and at once, when the lock cannot be made at all', () => {
+    // Not somebody holding it: nobody can, so waiting would change nothing.
+    const lock = path.join(dir(), 'x.lock');
+    const started = Date.now();
+    const h = acquireOwnedLock(lock, {
+      waitMs: 10_000,
+      staleMs: 5_000,
+      platform: 'linux',
+      create: () => {
+        throw Object.assign(new Error('too many open files'), { code: 'EMFILE' });
+      },
+    });
+    expect(h).toMatchObject({ held: false, unusable: 'EMFILE' });
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
   it('leaves no lock, and holds none, when the pid is written only in part', () => {
     const lock = path.join(dir(), 'x.lock');
     const h = acquireOwnedLock(lock, {

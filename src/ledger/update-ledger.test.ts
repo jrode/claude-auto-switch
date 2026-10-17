@@ -7,7 +7,7 @@ import { acquireOwnedLock } from '../claude/locks.js';
 import { readEvents } from '../events/log.js';
 import {
   applyLedgerChange,
-  clearAccountUpTo,
+  clearDisproved,
   ledgerFilePath,
   loadLedger,
   markCapped,
@@ -71,12 +71,36 @@ describe('updateLedger', () => {
       const written = updateLedger(c, capFor('A'), { waitMs: 200 });
       expect(accounts(written)).toEqual(['A']);
       expect(accounts(loadLedger(c))).toEqual(['A']);
-      expect(unlockedWrites(dir)).toHaveLength(1);
+      expect(unlockedWrites(dir).map((e) => e.msg)).toEqual([
+        'ledger written without its lock: the lock was not free within 0.2 s; ' +
+          'a change another session made at that moment may be lost',
+      ]);
       // And the holder's lock is still the holder's.
       expect(existsSync(lockFile)).toBe(true);
     } finally {
       holder.release();
     }
+  });
+
+  it('refuses a change that changes the ledger itself, and leaves the ledger and the lock as they were', () => {
+    // Left to run, the inner change would wait out its own lock, write past it,
+    // and then be overwritten by the outer one.
+    const { home: dir, c } = home();
+    updateLedger(c, capFor('A'));
+    const started = Date.now();
+    expect(() =>
+      updateLedger(c, (ledger) => {
+        updateLedger(c, capFor('B'));
+        return capFor('C')(ledger);
+      }),
+    ).toThrow('updateLedger was called from inside a change to the ledger');
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(accounts(loadLedger(c))).toEqual(['A']);
+    expect(existsSync(`${ledgerFilePath(c)}.lock`)).toBe(false);
+    // And the next change is not refused.
+    updateLedger(c, capFor('D'));
+    expect(accounts(loadLedger(c))).toEqual(['A', 'D']);
+    expect(unlockedWrites(dir)).toEqual([]);
   });
 
   it('takes over at once a lock left by a process that has exited', () => {
@@ -97,33 +121,58 @@ describe('updateLedger', () => {
 
 describe('a change a run made, applied to the ledger as it stands', () => {
   const run = 10_000;
+  const cap = (reason: string, at: number, model?: string) => ({
+    account: 'A',
+    capUntil: run + HOUR,
+    reason,
+    at,
+    ...(model ? { model } : {}),
+  });
+  const reasonsLeft = (ledger: Ledger): string[] => ledger.caps.map((c) => `${c.account}: ${c.reason}`);
 
   it('records a cap exactly as markCapped does', () => {
-    const cap = { account: 'A', now: run, resetAt: run + HOUR, reason: 'usage cap', model: 'Fable' };
-    expect(applyLedgerChange({ caps: [] }, { kind: 'capped', cap })).toEqual(markCapped({ caps: [] }, cap));
+    const input = { account: 'A', now: run, resetAt: run + HOUR, reason: 'usage cap', model: 'Fable' };
+    expect(applyLedgerChange({ caps: [] }, { kind: 'capped', cap: input })).toEqual(markCapped({ caps: [] }, input));
   });
 
-  it('clears the limits recorded up to when the run started, and keeps one recorded while it ran', () => {
-    // The run worked, so the older limits are over. A newer one is another
-    // session's answer about this account, which the run cannot overrule.
+  it('clears, after a run that finished fine, only what it disproves: account-wide limits and its own model', () => {
     const ledger: Ledger = {
       caps: [
-        { account: 'A', capUntil: run + HOUR, reason: 'before the run', at: run - 1 },
-        { account: 'A', capUntil: run + HOUR, reason: 'as the run started', at: run, model: 'Fable' },
-        { account: 'A', capUntil: run + HOUR, reason: 'while it ran', at: run + 1, model: 'Opus' },
+        cap('account-wide, before', run - 1),
+        cap('Opus, before', run - 1, 'Opus'),
+        cap('Fable, before', run - 1, 'Fable'),
+        cap('account-wide, while it ran', run + 1),
+        cap('Opus, while it ran', run + 1, 'Opus'),
         { account: 'B', capUntil: run + HOUR, reason: 'another account', at: run - 1 },
       ],
     };
-    const cleared = applyLedgerChange(ledger, { kind: 'cleared', account: 'A', upTo: run });
-    expect(cleared.caps.map((cap) => `${cap.account}: ${cap.reason}`)).toEqual([
-      'A: while it ran',
+    const ran = applyLedgerChange(ledger, { kind: 'ran', account: 'A', model: 'opus', startedAt: run });
+    expect(reasonsLeft(ran)).toEqual([
+      'A: Fable, before',
+      'A: account-wide, while it ran',
+      'A: Opus, while it ran',
       'B: another account',
     ]);
   });
 
+  it('keeps every model limit when the model the run used is not known', () => {
+    const ledger: Ledger = { caps: [cap('account-wide, before', run - 1), cap('Fable, before', run - 1, 'Fable')] };
+    const ran = applyLedgerChange(ledger, { kind: 'ran', account: 'A', model: null, startedAt: run });
+    expect(reasonsLeft(ran)).toEqual(['A: Fable, before']);
+  });
+
+  it('keeps a limit recorded in the very millisecond the run started', () => {
+    // Both times are Date.now() milliseconds, so another session's limit can
+    // tie the start. Kept, the account rests a little longer; cleared, sessions
+    // are sent to an account that is out.
+    const ledger: Ledger = { caps: [cap('account-wide, at the start', run), cap('Opus, at the start', run, 'Opus')] };
+    const ran = applyLedgerChange(ledger, { kind: 'ran', account: 'A', model: 'Opus', startedAt: run });
+    expect(ran).toBe(ledger);
+  });
+
   it('hands back the same ledger when there is nothing to clear, so nothing is written', () => {
     const ledger: Ledger = { caps: [{ account: 'B', capUntil: null, reason: 'x', at: 1 }] };
-    expect(clearAccountUpTo(ledger, 'A', run)).toBe(ledger);
-    expect(clearAccountUpTo(ledger, 'B', 0)).toBe(ledger);
+    expect(clearDisproved(ledger, { account: 'A', model: null, startedAt: run })).toBe(ledger);
+    expect(clearDisproved(ledger, { account: 'B', model: null, startedAt: 1 })).toBe(ledger);
   });
 });

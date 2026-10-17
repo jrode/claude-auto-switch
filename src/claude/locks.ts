@@ -48,8 +48,8 @@ export interface LockHandle {
   /** True when we actually hold the lock (false = proceeding without it). */
   held: boolean;
   /**
-   * Set when the lock folder could not be created at all (its error code, as
-   * EACCES), so nobody can hold it: not the same as somebody holding it now.
+   * Set when the lock could not be created at all (its error code, as EACCES
+   * or EMFILE), so nobody can hold it: not the same as somebody holding it now.
    */
   unusable?: string;
   release(): void;
@@ -201,7 +201,8 @@ export function acquireOwnedLock(lockFile: string, options: OwnedLockOptions): L
       heldHere.set(path.resolve(lockFile), token);
       return ownedHandle(lockFile, token, options.maxHoldMs ?? 60_000, now);
     } catch (err) {
-      if (!busy.includes((err as NodeJS.ErrnoException).code ?? '')) return { held: false, release: () => {} };
+      const code = (err as NodeJS.ErrnoException).code ?? '';
+      if (!busy.includes(code)) return { held: false, unusable: code || 'unknown error', release: () => {} };
     }
     if (abandoned() && takeOver(lockFile, abandoned, now(), options.staleMs)) continue;
     if (now() >= deadline) return { held: false, release: () => {} };

@@ -16,6 +16,7 @@ import { conversationIdIn, forksConversation, reportedSessionId } from './conver
 import { refusalsSince } from '../session/transcript.js';
 import { outputShows } from '../session/own-output.js';
 import type { RecordedRefusal } from '../session/refused-turn.js';
+import { thrownReason } from '../util/thrown-reason.js';
 
 /** An account the rotator can run: selectable plus its config dir. */
 export interface RotatableAccount extends SelectableAccount {
@@ -70,8 +71,12 @@ export interface AutoRotateDeps<T extends RotatableAccount> {
    * run ends: a limit is then on record for other sessions while the run goes
    * on, survives the run being stopped, and never overrules a change someone
    * else made after it.
+   *
+   * Required, like confirmCap: a caller that left it out would record nothing.
+   * It should report a change it cannot record itself; one that throws is
+   * still not allowed to stop the request.
    */
-  recordChange?: (change: LedgerChange) => void;
+  recordChange: (change: LedgerChange) => void;
   run?: HeadlessRunner;
   out: (message: string) => void;
   /** Emit the winning run's captured output (real CLI writes to std streams). */
@@ -106,7 +111,13 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
   const record = (change: LedgerChange): void => {
     ledger = applyLedgerChange(ledger, change);
     changes.push(change);
-    deps.recordChange?.(change);
+    try {
+      deps.recordChange(change);
+    } catch (error) {
+      // The request matters more than the record of it: carry on with it.
+      const what = change.kind === 'capped' ? `that ${change.cap.account} is out` : `that ${change.account} ran`;
+      deps.out(`could not record ${what} on the ledger (${thrownReason(error)}); carrying on`);
+    }
   };
   let rotations = 0;
   /**
@@ -194,7 +205,7 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
     }
     // By Claude's clock, which the record's times are in.
     const launchedAt = Date.now();
-    // By the clock caps are recorded with, which a success clears up to.
+    // By the clock caps are recorded with: a success clears only what came before.
     const startedAt = deps.now();
     const headless = await launchHeadless(runArgs, account, { claude: deps.claude, run: deps.run });
     const { classification } = headless;
@@ -258,7 +269,10 @@ export async function autoRotateHeadless<T extends RotatableAccount>(
     }
 
     deps.writeOutput?.(headless.stdout, headless.stderr);
-    if (classification.kind === 'ok') record({ kind: 'cleared', account: account.name, upTo: startedAt });
+    // The model it ran is the one in the arguments it was given, whoever chose it.
+    if (classification.kind === 'ok') {
+      record({ kind: 'ran', account: account.name, model: modelInArgs(runArgs), startedAt });
+    }
     return { exitCode: headless.exitCode, account: account.name, rotations, ledger, changes };
   }
 
