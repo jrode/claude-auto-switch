@@ -1918,6 +1918,23 @@ export async function runInteractiveHotSwap(
     return { name: picked.name, dir: picked.dir };
   };
 
+  /**
+   * Whether a limit met now has nowhere to go: no account besides the one the
+   * session is on that rotation would start on. A run started anyway, because
+   * every account looked out of room, lets its limits be only while this holds.
+   * It used to let them be for the whole run, so a session started that way
+   * and moved to a healthy account a minute later sat on that account's next
+   * limit for good, with nothing in the log. Asked when a limit turns up, from
+   * the ledger as it is then, so a reset or an account enabled meanwhile counts.
+   * What the swap loop sets aside is left out too: an account it would not
+   * move to is not somewhere to go, and acting on the limit then would end the
+   * session with nowhere to start it.
+   */
+  const nowhereToGo = (): boolean => {
+    const on = current?.name;
+    return pickAccount(new Set([...(on ? [on] : []), ...deadLogins(), ...setAsideNow()]), { quiet: true }) === null;
+  };
+
   // Ending a worker reaches it between launches too, so it stops Claude and
   // still lets the run below clean up.
   const interruption = worker?.interruption ?? null;
@@ -2357,7 +2374,9 @@ export async function runInteractiveHotSwap(
         const message =
           event.kind === 'typed'
             ? 'typed the carry-on prompt into the live session'
-            : event.kind === 'refused'
+            : event.kind === 'dismissed'
+              ? "closed Claude's usage-limit menu, which the move made moot, so the carry-on prompt can be typed"
+              : event.kind === 'refused'
               ? 'the turn was refused again after the move; Claude may still be on the login it had'
               : event.kind === 'relaunch'
                 ? `relaunching to hand the carry-on prompt over: ${event.why}`
@@ -2386,7 +2405,7 @@ export async function runInteractiveHotSwap(
         ...(context.idleBeforeRestartMs !== undefined ? { idleBeforeRestartMs: context.idleBeforeRestartMs } : {}),
         ...(context.refuteBackoffMs !== undefined ? { refuteBackoffMs: context.refuteBackoffMs } : {}),
         ...(terminalInput ? { input: terminalInput } : {}),
-        ...(runOptions?.ignoreLimits ? { ignoreLimits: true } : {}),
+        ...(runOptions?.ignoreLimits ? { ignoreLimits: nowhereToGo } : {}),
         ...(debugLog ? { debugLog } : {}),
         // Claude's own record of which conversation the child is in, kept
         // where `conversationId()` reads first. It is what keeps a swap in the
@@ -2430,7 +2449,7 @@ export async function runInteractiveHotSwap(
           verifyCap,
           verifySignedOut,
           limitGate,
-          ...(runOptions?.ignoreLimits ? { ignoreLimits: true } : {}),
+          ...(runOptions?.ignoreLimits ? { ignoreLimits: nowhereToGo } : {}),
           ...(stdin !== undefined ? { stdin } : {}),
           ...(interruption ? { interruption } : {}),
           onStdout: worker.onStdout,

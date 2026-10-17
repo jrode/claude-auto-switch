@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.10]
+
+### Fixed
+
+- **Claude's own usage-limit menu no longer holds a moved session.** On a
+  limit, Claude 2.1.280 opens `/rate-limit-options` by itself ("Stop and wait
+  for limit to reset", "Wait here, then continue automatically", "Switch to
+  usage credits") and waits on it until somebody answers. ccx moved the
+  session to an account with room, but its carry-on prompt cannot be typed
+  behind a menu, and while a subagent was still writing it would not restart
+  Claude either, so the session sat there, moved but stopped, until you
+  pressed a key. ccx now closes that menu (Esc, as you would) once it has
+  moved the session, and types the carry-on prompt in place, so subagents
+  and background work keep running. It closes only that menu: ccx reads
+  Claude's screen for the menu's own words, drawn just as Claude began
+  waiting, and any other dialog, a permission prompt say, is left alone.
+- **A session started anyway, because every account looked out of room,
+  watches for limits again once there is somewhere to go.** Such a session
+  let its limits be for its whole life. One started that way and moved to a
+  healthy account a minute later sat on that account's next limit for good,
+  with nothing in the log. It now lets a limit be only while no other
+  account could take the session, asked when the limit turns up, so a reset
+  or an account enabled meanwhile counts.
+
 ## [2.6.9]
 
 ### Fixed

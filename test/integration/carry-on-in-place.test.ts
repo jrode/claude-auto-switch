@@ -227,6 +227,57 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
     );
 
     it(
+      "closes Claude's own usage-limit menu and types the prompt, with a subagent still writing",
+      { timeout: 60_000 },
+      async () => {
+        // On a limit Claude opens /rate-limit-options by itself and waits on it
+        // (measured, 2.1.280). Behind it the prompt cannot be typed, and with a
+        // subagent writing a relaunch is not allowed either, so the session sat
+        // there, moved but stopped, until somebody pressed a key.
+        const session = live({
+          env: {
+            FAKE_CLAUDE_IDLE_MS: '20000',
+            FAKE_CLAUDE_REFUSE_AFTER_MS: '800',
+            FAKE_CLAUDE_LIMIT_MENU: '1',
+            FAKE_CLAUDE_SUBAGENT_WRITES_UNTIL_MS: '15000',
+            FAKE_CLAUDE_EXIT_AFTER_PROMPTS: '1',
+            FAKE_CLAUDE_EXIT_DELAY_MS: '1500',
+          },
+        });
+        expect((await session.outcome).kind).toBe('ok');
+
+        const log = session.log();
+        // The same Claude throughout, and its subagent with it.
+        expect(launches(log)).toHaveLength(1);
+        // Closed, and nothing typed into it on the way.
+        expect(log.filter((e) => e.type === 'menu').map((e) => e.open)).toEqual([true, false]);
+        expect(log.filter((e) => e.type === 'menu-key')).toEqual([]);
+        expect(prompts(log)).toEqual([
+          expect.objectContaining({ text: PROMPT, marker: 'B', refused: false }),
+        ]);
+        expect(session.events.map((e) => e.kind)).toEqual(['dismissed', 'typed', 'done']);
+      },
+    );
+
+    it(
+      'leaves any other dialog alone',
+      { timeout: 60_000 },
+      async () => {
+        // "waiting" with no usage-limit menu drawn: a permission prompt, say,
+        // whose answer is not ccx's to give. Nothing is pressed in it.
+        const session = live({
+          env: {
+            FAKE_CLAUDE_IDLE_MS: '20000',
+            FAKE_CLAUDE_REFUSE_AFTER_MS: '800',
+            FAKE_CLAUDE_STATUS: 'waiting',
+          },
+        });
+        await session.outcome;
+        expect(session.events.map((e) => e.kind)).not.toContain('dismissed');
+      },
+    );
+
+    it(
       'does not relaunch from behind a dialog while a subagent is still writing',
       { timeout: 60_000 },
       async () => {

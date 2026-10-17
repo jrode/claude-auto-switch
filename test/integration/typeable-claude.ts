@@ -25,7 +25,7 @@ export const ID = '77777777-8888-4999-8aaa-bbbbbbbbbbbb';
 export const PROMPT = 'Moved by ccx: carry on where you stopped.';
 
 export interface Entry {
-  type: 'launch' | 'reread' | 'prompt' | 'status' | 'subagent-refusal' | 'subagent-done';
+  type: 'launch' | 'reread' | 'prompt' | 'status' | 'subagent-refusal' | 'subagent-done' | 'menu' | 'menu-key';
   args?: string[];
   marker?: string | null;
   text?: string;
@@ -33,6 +33,8 @@ export interface Entry {
   status?: string;
   pid?: number;
   oauthToken?: string | null;
+  /** For a `menu` entry: whether Claude's usage-limit menu opened or closed. */
+  open?: boolean;
 }
 
 export function readLog(runsLog: string): Entry[] {
@@ -112,6 +114,7 @@ export const FAKE_ENV = [
   'FAKE_CLAUDE_EXIT_AFTER_PROMPTS',
   'FAKE_CLAUDE_EXIT_DELAY_MS',
   'FAKE_CLAUDE_GRANDCHILD',
+  'FAKE_CLAUDE_LIMIT_MENU',
 ];
 
 /** The fake as a Claude that can be typed into, on an account that refuses on A. */

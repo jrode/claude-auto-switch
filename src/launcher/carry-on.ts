@@ -27,7 +27,10 @@ import type { LiveStatus } from '../session/live-conversation.js';
  *    is handed over by relaunch instead of typed for ever.
  * 2. Claude is at its prompt. Its own record says so ("idle", or "shell" while
  *    a background command runs); "busy" covers a turn AND a running subagent,
- *    and "waiting" a dialog, where keys mean something else entirely.
+ *    and "waiting" a dialog, where keys mean something else entirely. The one
+ *    dialog ccx closes is Claude's own usage-limit menu, which it opens by
+ *    itself on the limit that started the move, and whose choices (wait for
+ *    the reset, usage credits) the move has made moot.
  * 3. The input box is empty. Either nobody has typed in this Claude at all, or
  *    the last key was the Enter that sends a prompt and Claude recorded a
  *    prompt since. A draft is never typed over, and once somebody presses a
@@ -64,6 +67,9 @@ export const CARRY_ON_TIMING: CarryOnTiming = {
 
 /** Typed at most this many times for one move. */
 const MAX_ATTEMPTS = 2;
+/** Claude's usage-limit menu is closed at most this many times for one move, this far apart. */
+const MAX_DISMISSALS = 3;
+const DISMISS_RETRY_MS = 5_000;
 
 /** What is known at one look. Both clocks are this machine's. */
 export interface CarryOnView {
@@ -80,6 +86,12 @@ export interface CarryOnView {
   readsPastes: boolean;
   /** When a subagent's record was last seen to grow; 0 for never. */
   subagentWroteAt: number;
+  /**
+   * Whether what Claude is waiting on is its own usage-limit menu: the one it
+   * opens by itself on a limit (/rate-limit-options), drawn since Claude began
+   * waiting. Any other dialog is not ccx's to answer.
+   */
+  limitMenuOpen: boolean;
 }
 
 /**
@@ -98,6 +110,8 @@ export type CarryOnStep =
   | { do: 'wait' }
   /** Type the prompt now, then call `typed`. */
   | { do: 'type' }
+  /** Close Claude's usage-limit menu now (Esc), then call `dismissed`. */
+  | { do: 'dismiss' }
   /** Over: delivered, not needed because somebody is there, or left untyped. */
   | { do: 'done'; outcome: 'delivered' | 'attended' | 'left'; why: string }
   /** It cannot be typed safely and the session is stalled: relaunch to deliver it. */
@@ -108,6 +122,8 @@ export interface CarryOn {
   step(view: CarryOnView): CarryOnStep;
   /** The prompt was just typed. */
   typed(now: number): void;
+  /** Claude's usage-limit menu was just told to close. */
+  dismissed(now: number): void;
   /**
    * The main thread's turn was just refused. `promptAt` as in the view, read
    * no earlier than the refusal.
@@ -142,6 +158,8 @@ export function createCarryOn(options: CarryOnOptions): CarryOn {
   let refusedTooOften = false;
   /** Since when Claude has been behind a dialog, or not saying what it is doing. */
   let blockedSince: number | null = null;
+  let dismissals = 0;
+  let dismissedAt = Number.NEGATIVE_INFINITY;
 
   const wait: CarryOnStep = { do: 'wait' };
   const giveUp = (why: string): CarryOnStep =>
@@ -167,6 +185,17 @@ export function createCarryOn(options: CarryOnOptions): CarryOn {
     }
     if (refusedTooOften)
       return giveUp('it was refused twice although the account it moved to has room');
+    // Claude's own usage-limit menu, which it opens by itself on a limit and
+    // which waits for an answer for as long as it is open: "Stop and wait for
+    // limit to reset", "Wait here, then continue automatically", "Switch to
+    // usage credits". The account under it has just been replaced, so none of
+    // those applies, and behind it the prompt can never be typed. Closing it
+    // puts Claude back at its prompt; measured on 2.1.280, Esc does that at
+    // once, with an empty input box. Nothing waits for the pickup first:
+    // closing a menu sends no request. Tried a few times, then the old way.
+    if (view.status?.status === 'waiting' && view.limitMenuOpen && dismissals < MAX_DISMISSALS) {
+      return view.now - dismissedAt >= DISMISS_RETRY_MS ? { do: 'dismiss' } : wait;
+    }
     if (view.now < notBefore) return wait;
     if (view.status === null || view.status.status === 'waiting') {
       blockedSince ??= view.now;
@@ -196,6 +225,11 @@ export function createCarryOn(options: CarryOnOptions): CarryOn {
       const subagentWriting =
         view.subagentWroteAt > 0 && view.now - view.subagentWroteAt < t.blockedMs;
       return view.status?.status === 'busy' || subagentWriting ? wait : step;
+    },
+    dismissed(now) {
+      dismissals += 1;
+      dismissedAt = now;
+      blockedSince = null;
     },
     typed(now) {
       typedAt = now;

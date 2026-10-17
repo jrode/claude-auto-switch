@@ -48,7 +48,8 @@ export interface HeadlessSessionOptions {
   verifyCap?: (renderedText: string, recorded?: RecordedRefusal) => Promise<boolean>;
   /** As runPtySession's: resolves true only when the login is confirmed finished. */
   verifySignedOut?: () => Promise<boolean>;
-  ignoreLimits?: boolean;
+  /** As runPtySession's: asked when a limit turns up, or `true` for the whole run. */
+  ignoreLimits?: boolean | (() => boolean);
   /** As runPtySession's: which refused turns are held back or passed over. */
   limitGate?: RefusalGate;
   /** Ending the worker: an end stops this run, and one that came first means no run starts. */
@@ -273,6 +274,8 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
    * it is asked about again.
    */
   let askedBeforePrinted: { text: string; hit: Hit; refusal: Refusal } | null = null;
+  const limitsIgnored = (): boolean =>
+    typeof options.ignoreLimits === 'function' ? options.ignoreLimits() : options.ignoreLimits === true;
   /** What Claude showed when its login was turned away, once confirmed finished; and a check in flight. */
   let signedOut: string | null = null;
   let checkingLogin: Promise<void> | null = null;
@@ -291,7 +294,7 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
    * still counts when it comes back.
    */
   const evidence = (text: string, hit: Hit, refusal?: Refusal): void => {
-    if (options.ignoreLimits || capped || switchTo || interruptedBy !== null) return;
+    if (capped || switchTo || interruptedBy !== null || limitsIgnored()) return;
     if (verifying) {
       held = { text, hit, ...(refusal ? { refusal } : {}) };
       return;
@@ -375,7 +378,7 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
     recordReadable = recordReadable || seen.readable;
     // Not a limit, so watched even when limits are not.
     if (seen.signedOut !== null) loginEvidence(seen.signedOut);
-    if (options.ignoreLimits) return;
+    if (seen.refusals.length === 0 || limitsIgnored()) return;
     for (const refusal of seen.refusals) {
       // A subagent's refusal ends nothing here: a headless run cannot be moved
       // under a live Claude, and its main thread meets the same limit at its
@@ -441,8 +444,8 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
         interruptedBy === null &&
         !recordReadable &&
         exitCode !== 0 &&
-        !options.ignoreLimits &&
-        !options.limitGate?.held()
+        !options.limitGate?.held() &&
+        !limitsIgnored()
       ) {
         const hit = matchesCapText(tail);
         if (hit) evidence(tail, { reason: hit.reason, ...(hit.resetAt !== undefined ? { resetAt: hit.resetAt } : {}) });

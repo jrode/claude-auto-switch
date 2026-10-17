@@ -482,12 +482,36 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
     // not refuse.
     const refuseOn = process.env.FAKE_CLAUDE_REFUSE_ON;
     const refusesHere = !refuseOn || refuseOn.split(',').includes(readMarker() ?? '');
+    // Claude's own usage-limit menu, which it opens by itself on a limit
+    // (measured, 2.1.280) when FAKE_CLAUDE_LIMIT_MENU is set: it says "waiting"
+    // while open, a key is a choice in it rather than text, and Esc closes it.
+    let menuOpen = false;
+    const openLimitMenu = () => {
+      if (!process.env.FAKE_CLAUDE_LIMIT_MENU || menuOpen) return;
+      menuOpen = true;
+      process.stdout.write(
+        '\r\n❯ /rate-limit-options\r\n  What do you want to do?\r\n' +
+          '  ❯ 1. Stop and wait for limit to reset\r\n' +
+          '    2. Wait here, then continue automatically at Oct 22, 1pm\r\n' +
+          '    3. Switch to usage credits\r\n',
+      );
+      setStatus('waiting');
+      if (runsLog) appendFileSync(runsLog, `${JSON.stringify({ type: 'menu', open: true })}\n`, 'utf8');
+    };
+    const closeLimitMenu = () => {
+      menuOpen = false;
+      setStatus(resting ?? 'idle');
+      if (runsLog) appendFileSync(runsLog, `${JSON.stringify({ type: 'menu', open: false })}\n`, 'utf8');
+    };
     const refuse = () => {
       if (!refusesHere) return;
       const signedOut = process.env.FAKE_CLAUDE_REFUSE_AS === 'signed-out';
       const entry = signedOut ? signedOutEntry() : refusalEntry();
       appendFileSync(transcript, `${JSON.stringify(entry)}\n`);
-      if (!signedOut) showRefusal(entry);
+      if (!signedOut) {
+        showRefusal(entry);
+        openLimitMenu();
+      }
       // Print mode ends the run on a refused turn, with an error result and
       // exit 1, where the terminal app stays up and waits.
       if (process.env.FAKE_CLAUDE_REFUSAL_ENDS_RUN && outputFormat) {
@@ -603,6 +627,7 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
           if (refused) showRefusal(answer);
           turnRunning = false;
           setStatus(resting);
+          if (refused) openLimitMenu();
           if (!refused) answered += 1;
           // Done once it has answered as many prompts as the test waits for,
           // after a moment for whoever is watching to see the answer.
@@ -644,7 +669,15 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
         /* not a terminal */
       }
       process.stdin.on('data', (chunk) => {
-        pending += chunk.toString('utf8');
+        const text = chunk.toString('utf8');
+        // The menu takes every key while it is open: Esc closes it, and
+        // anything else is a choice in it, never text in the input box.
+        if (menuOpen) {
+          if (text === '\x1b') closeLimitMenu();
+          else if (runsLog) appendFileSync(runsLog, `${JSON.stringify({ type: 'menu-key', text })}\n`, 'utf8');
+          return;
+        }
+        pending += text;
         read();
       });
       process.stdin.resume();
