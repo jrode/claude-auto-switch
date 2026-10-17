@@ -93,14 +93,33 @@ describe('acquireOwnedLock', () => {
     expect(readFileSync(lock, 'utf8')).toBe(`${process.pid} the-new-holder`);
   });
 
-  it('leaves its lock, on release, when the takeover guard is held, since whoever holds it is taking the lock over', () => {
-    // Removing it unguarded could remove the lock that takeover makes next.
+  it('leaves a lock held past the longest hold, on release, when the takeover guard is held', () => {
+    // Whoever holds the guard is taking the lock over, and removing it
+    // unguarded could remove the lock that takeover makes next.
     const lock = path.join(dir(), 'x.lock');
-    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000 });
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    minutesAgo(lock, 2);
     mkdirSync(`${lock}.takeover`);
     h.release();
     expect(existsSync(lock)).toBe(true);
     expect(owner(lock)).toBe(String(process.pid));
+  });
+
+  it('removes a lock held past the longest hold, on release, under the takeover guard', () => {
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    minutesAgo(lock, 2);
+    h.release();
+    expect(existsSync(lock)).toBe(false);
+    expect(existsSync(`${lock}.takeover`)).toBe(false);
+  });
+
+  it('removes a lock held briefly, on release, without the takeover guard, which no takeover can need yet', () => {
+    const lock = path.join(dir(), 'x.lock');
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    mkdirSync(`${lock}.takeover`); // even one left behind does not hold it up
+    h.release();
+    expect(existsSync(lock)).toBe(false);
   });
 
   it('removes its own lock on release, and the takeover guard with it', () => {

@@ -189,7 +189,7 @@ export function acquireOwnedLock(lockFile: string, options: OwnedLockOptions): L
   for (;;) {
     try {
       create(lockFile, content);
-      return ownedHandle(lockFile, content);
+      return ownedHandle(lockFile, content, options.maxHoldMs ?? 60_000, now);
     } catch (err) {
       if (!busy.includes((err as NodeJS.ErrnoException).code ?? '')) return { held: false, release: () => {} };
     }
@@ -210,7 +210,10 @@ function createOwnedLockFile(file: string, content: string): void {
   }
 }
 
-function ownedHandle(lockFile: string, content: string): LockHandle {
+/** How long before the longest hold a release stops trusting that no takeover can begin. */
+const RELEASE_MARGIN_MS = 5_000;
+
+function ownedHandle(lockFile: string, content: string, maxHoldMs: number, now: () => number): LockHandle {
   let released = false;
   return {
     held: true,
@@ -219,21 +222,29 @@ function ownedHandle(lockFile: string, content: string): LockHandle {
       released = true;
       // Only while the lock is still this acquisition's: a holder that ran past
       // the longest hold may have been taken over, by another process or by
-      // another task of this one, and the lock is then the new holder's. And
-      // only under the takeover guard, so no takeover can remove this lock and
-      // make its own between the look and the removal. Without the guard the
-      // lock is left: whoever holds the guard is taking it over.
+      // another task of this one, and the lock is then the new holder's.
+      //
+      // A running holder's lock is taken over only once it is older than the
+      // longest hold, so a younger one cannot be replaced between the look and
+      // the removal. An older one is looked at and removed under the takeover
+      // guard, and left when the guard cannot be had: whoever holds the guard
+      // is taking it over. Most holds are short, and pay nothing for the guard.
+      const since = mtimeMs(lockFile);
+      const young = since !== null && now() - since < Math.max(0, maxHoldMs - RELEASE_MARGIN_MS);
       const guard = `${lockFile}.takeover`;
-      if (!takeGuard(guard)) return;
+      const guarded = !young && takeGuard(guard);
+      if (!young && !guarded) return;
       try {
         if (readLock(lockFile) === content) rmSync(lockFile, { force: true });
       } catch {
         /* already gone */
       } finally {
-        try {
-          rmdirSync(guard);
-        } catch {
-          /* already gone */
+        if (guarded) {
+          try {
+            rmdirSync(guard);
+          } catch {
+            /* already gone */
+          }
         }
       }
     },
