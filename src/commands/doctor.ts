@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { browserPortReachable } from '../login/browser.js';
 import { findKeepalive } from '../keepalive/crontab.js';
@@ -12,6 +12,9 @@ import {
 import { isHeadlessSession } from '../util/headless.js';
 import { auditSessionAccount } from './doctor-session-account.js';
 import { configHome, profilesDir } from '../config/paths.js';
+import { configFilePath } from '../config/config.js';
+import { CREDENTIALS_FILE, PREVIOUS_FILE } from '../accounts/credential-vault.js';
+import { TOKEN_FILE } from '../daemon/token-store.js';
 import { detectEditors } from '../editor/settings.js';
 import { readEditorEnvVar } from '../editor/install.js';
 import { editorTargetAccount } from '../editor/junction.js';
@@ -63,9 +66,19 @@ export interface DoctorCheck {
   note?: boolean;
 }
 
+/** A folder as git sees it from inside. */
+export interface GitTracked {
+  /** The top folder of the repository the folder is in, symbolic links resolved as git does. */
+  repo: string;
+  /** The files git tracks under the folder, relative to it, with forward slashes. */
+  files: string[];
+  /** Why git found the repository but could not list its files, so nothing there was checked. */
+  unreadable?: string;
+}
+
 export interface DoctorDeps {
-  /** Tracked file list (defaults to `git ls-files`); injected in tests. */
-  gitTrackedFiles?: () => string[];
+  /** What git tracks under a folder, null outside a work tree (runs git by default); injected in tests. */
+  gitTracked?: (folder: string) => GitTracked | null;
   /** Claude resolver, standing in for the whole search; injected in tests. */
   resolveClaude?: () => ClaudeInvoker;
   /** The search for Claude, repairing nothing; injected in tests. */
@@ -90,28 +103,192 @@ export interface DoctorDeps {
   fetchImpl?: typeof fetch;
 }
 
-/** Files that must never be committed. */
-const SECRET_PATTERNS = [
-  /(^|[\\/])\.credentials\.json$/,
-  /(^|[\\/])accounts\.json$/,
-  /(^|[\\/])ledger\.json$/,
-  /(^|[\\/])oauth-token$/,
-  /(^|[\\/])session-debug\.log$/,
-  /(^|[\\/])last-setup-token-output\.txt$/,
-  /(^|[\\/])profiles[\\/]/,
-];
+/**
+ * Login files, by name. These names mean a login wherever they turn up, so
+ * they are all doctor looks for outside ccx's own folders, where a folder
+ * called `profiles` or a file called `accounts.json` is somebody else's.
+ */
+const LOGIN_FILES = new Set([CREDENTIALS_FILE, PREVIOUS_FILE, TOKEN_FILE]);
 
-/** Fail if any credential or profile file is tracked in git. */
-export function auditGitSafety(trackedFiles: string[]): DoctorCheck {
-  const dangerous = trackedFiles.filter((f) => SECRET_PATTERNS.some((re) => re.test(f)));
+/** How many tracked files a finding names before it only counts the rest. */
+const SHOWN_FILES = 5;
+
+/** A folder git is asked about. */
+interface GitPlace {
+  folder: string;
+  /** How the report names it; a repository on its own goes by its location. */
+  name?: string;
+  /** Only login files count; otherwise every file does but ccx's settings and git's own. */
+  loginsOnly: boolean;
+}
+
+/**
+ * Is anything of ccx's, or a Claude login, tracked in git? Asked of ccx's
+ * folders themselves, so a dotfiles repository is caught wherever doctor
+ * runs. Its settings file may be kept in one on purpose; nothing else there
+ * may. In `~/.claude` and in the repository doctor runs in, only a login file
+ * counts.
+ */
+export function auditGitSafety(context: CliContext, deps: DoctorDeps = {}): DoctorCheck {
+  const tracked = deps.gitTracked ?? gitTrackedUnder;
+  // Paths here keep their case: where a filesystem tells `CONFIG.JSON` from
+  // `config.json`, only the second is ccx's settings.
+  const settings = path.resolve(configFilePath(context.ctx));
+  const places: GitPlace[] = ccxFolders(context).map((folder, i) => ({
+    folder,
+    name: `${i === 0 ? "ccx's folder" : "ccx's profile folder"} ${folder}`,
+    loginsOnly: false,
+  }));
+  try {
+    const claude = defaultClaudeRoot(context.ctx);
+    places.push({ folder: claude, name: `Claude's folder ${claude}`, loginsOnly: true });
+  } catch {
+    /* no home folder, so no Claude folder to ask about */
+  }
+  const working = workingFolder();
+  const workingRepo = working === null ? null : tracked(working);
+  if (workingRepo) places.push({ folder: workingRepo.repo, loginsOnly: true });
+
+  const counts = (place: GitPlace, file: string): boolean => {
+    const name = path.posix.basename(file);
+    if (place.loginsOnly) return LOGIN_FILES.has(name);
+    return name !== '.gitignore' && path.resolve(place.folder, file) !== settings;
+  };
+
+  // Several places can reach one file (the working repository can be the one
+  // tracking ccx's folder), so each is reported only where it is first found.
+  const reported = new Set<string>();
+  const findings: string[] = [];
+  const unchecked: string[] = [];
+  for (const place of places) {
+    const inGit = tracked(place.folder);
+    if (!inGit) continue;
+    if (inGit.unreadable) {
+      const message = `could not check the git repository at ${inGit.repo}: ${inGit.unreadable}`;
+      if (!unchecked.includes(message)) unchecked.push(message);
+      continue;
+    }
+    const base = realFolder(place.folder);
+    const files = inGit.files.filter((file) => {
+      const key = path.resolve(base, file);
+      if (!counts(place, file) || reported.has(key)) return false;
+      reported.add(key);
+      return true;
+    });
+    if (files.length > 0) findings.push(describeTracked(place, inGit.repo, files));
+  }
+  if (findings.length === 0 && unchecked.length === 0) {
+    return {
+      name: 'git-safety',
+      ok: true,
+      detail: "ccx's folders and Claude's logins are not tracked in git",
+    };
+  }
+  // A repository git cannot list is worth knowing about, but is no failure.
   return {
     name: 'git-safety',
-    ok: dangerous.length === 0,
-    detail:
-      dangerous.length === 0
-        ? 'no credential or profile files are tracked in git'
-        : `secrets tracked in git: ${dangerous.join(', ')}`,
+    ok: findings.length === 0,
+    detail: [...findings, ...unchecked].join('; '),
+    ...(findings.length === 0 ? { note: true } : {}),
   };
+}
+
+/** ccx's folder first, then where profiles are kept and each account's own folder, once each. */
+function ccxFolders(context: CliContext): string[] {
+  const folders = [configHome(context.ctx), profilesDir(context.config, context.ctx)];
+  try {
+    folders.push(...listAccounts(context.ctx).map((account) => account.dir));
+  } catch {
+    /* an unreadable account list is the accounts check's to report */
+  }
+  return folders.filter(
+    (folder, i) => folders.findIndex((other) => path.resolve(other) === path.resolve(folder)) === i,
+  );
+}
+
+function describeTracked(place: GitPlace, repo: string, files: string[]): string {
+  const listed =
+    files.length > SHOWN_FILES
+      ? `${files.slice(0, SHOWN_FILES).join(', ')} and ${files.length - SHOWN_FILES} more`
+      : files.join(', ');
+  const count = place.loginsOnly
+    ? `${files.length} login file${files.length === 1 ? '' : 's'}`
+    : `${files.length} of its files`;
+  if (!place.name) return `the git repository at ${repo} tracks ${count}: ${listed}`;
+  if (samePath(realFolder(place.folder), repo)) {
+    return `${place.name} is a git repository that tracks ${count}: ${listed}`;
+  }
+  return `${place.name} is in the git repository at ${repo}, which tracks ${count}: ${listed}`;
+}
+
+/** The folder doctor was started in, or null when it has been deleted since. */
+function workingFolder(): string | null {
+  try {
+    return process.cwd();
+  } catch {
+    return null;
+  }
+}
+
+function realFolder(folder: string): string {
+  try {
+    return realpathSync.native(folder);
+  } catch {
+    return path.resolve(folder);
+  }
+}
+
+/**
+ * Variables that change which repository git finds for a folder: those a git
+ * hook exports to point at its own, and the ceiling people with their home
+ * folder in git set so other folders do not look part of it, which would
+ * hide exactly that repository here.
+ */
+const REPOSITORY_VARIABLES = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_COMMON_DIR',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_PREFIX',
+  'GIT_CEILING_DIRECTORIES',
+];
+
+/**
+ * Asks git from inside the folder. Null when it is in no work tree, is
+ * missing, or git cannot run; a repository whose files git cannot list says
+ * so, since passing it would vouch for files nobody read.
+ */
+export function gitTrackedUnder(folder: string): GitTracked | null {
+  if (!existsSync(folder)) return null;
+  const env = { ...process.env };
+  for (const name of REPOSITORY_VARIABLES) delete env[name];
+  const git = (...args: string[]): string =>
+    execFileSync('git', ['-C', folder, ...args], {
+      encoding: 'utf8',
+      env,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 15_000,
+      // Node's default, 1 MiB, is shorter than a large repository's list of files.
+      maxBuffer: 64 * 1024 * 1024,
+      windowsHide: true,
+    });
+  let top: string;
+  try {
+    top = git('rev-parse', '--show-toplevel').trim();
+  } catch {
+    return null;
+  }
+  if (top.length === 0) return null;
+  const repo = path.resolve(top);
+  try {
+    const files = git('ls-files', '-z')
+      .split('\0')
+      .filter((file) => file.length > 0);
+    return { repo, files };
+  } catch {
+    return { repo, files: [], unreadable: 'git could not list its files' };
+  }
 }
 
 function auditConfig(context: CliContext): DoctorCheck {
@@ -243,17 +420,6 @@ function headless(context: CliContext, deps: DoctorDeps): boolean {
     deps.headless ??
     isHeadlessSession(context.ctx.env ?? process.env, context.ctx.platform ?? process.platform)
   );
-}
-
-function defaultTrackedFiles(): string[] {
-  try {
-    return execFileSync('git', ['ls-files'], { encoding: 'utf8' })
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
-  } catch {
-    return [];
-  }
 }
 
 /**
@@ -703,7 +869,6 @@ export async function runDoctor(
   context: CliContext,
   deps: DoctorDeps = {},
 ): Promise<{ checks: DoctorCheck[]; ok: boolean }> {
-  const trackedFiles = (deps.gitTrackedFiles ?? defaultTrackedFiles)();
   const checks = [
     auditConfig(context),
     ...auditShells(context, deps),
@@ -717,7 +882,7 @@ export async function runDoctor(
     auditSharedLogins(context),
     await auditIdentities(context, deps),
     auditCaps(context),
-    auditGitSafety(trackedFiles),
+    auditGitSafety(context, deps),
     auditRealClaude(context, deps),
     auditEditor(context),
     await auditBrowserPort(context, deps),

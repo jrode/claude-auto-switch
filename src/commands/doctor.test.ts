@@ -1,16 +1,26 @@
-import { describe, it, expect } from 'vitest';
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { afterEach, describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
-  auditGitSafety,
   auditShells,
   auditSharedHistory,
   auditSharedLogins,
   auditCaps,
   doctorCommand,
+  runDoctor,
   type DoctorCheck,
 } from './doctor.js';
+import { configHome } from '../config/paths.js';
 import type { BrokenNpmInstall, ClaudeSearch } from '../launcher/real-claude.js';
 import { nodeRepairFs, stampOf, type RepairMemory } from '../launcher/claude-repair.js';
 import { settingsPath } from '../statusline/settings-install.js';
@@ -49,15 +59,266 @@ function wireStatusline(c: CliContext): void {
   );
 }
 
-describe('auditGitSafety', () => {
-  it('passes when no secrets are tracked', () => {
-    expect(auditGitSafety(['src/cli.ts', 'README.md', 'package.json']).ok).toBe(true);
+describe('git safety', () => {
+  const startedIn = process.cwd();
+  afterEach(() => process.chdir(startedIn));
+
+  // Nothing from the environment may point git at another repository, such as
+  // this one's when the tests run from a git hook: `add` would stage into it.
+  const gitEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')),
+  );
+  const git = (dir: string, args: string[], input = ''): string =>
+    execFileSync('git', ['-C', dir, ...args], {
+      env: gitEnv,
+      input,
+      encoding: 'utf8',
+      stdio: 'pipe',
+    });
+
+  const freshFolder = (): string => mkdtempSync(path.join(tmpdir(), 'cas-git-'));
+  const real = (folder: string): string => realpathSync.native(folder);
+
+  /** A new git repository that tracks `files`, each made with placeholder text. */
+  function repoTracking(files: string[]): string {
+    const dir = freshFolder();
+    git(dir, ['init', '-q']);
+    for (const file of files) {
+      mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+      writeFileSync(path.join(dir, file), '{}\n', 'utf8');
+    }
+    if (files.length > 0) git(dir, ['add', '-f', '--', ...files]);
+    return dir;
+  }
+
+  /** A home folder laid out as on a real machine: ccx's folder and ~/.claude side by side. */
+  function machine(home = freshFolder()): CliContext {
+    const ctx = {
+      env: {
+        CLAUDE_AUTO_SWITCH_HOME: path.join(home, '.claude-auto-switch'),
+        HOME: home,
+        USERPROFILE: home,
+        DISPLAY: ':0',
+      } as NodeJS.ProcessEnv,
+    };
+    return {
+      ctx,
+      config: loadConfig(ctx),
+      // Never the real claude, which the accounts check runs once there are accounts.
+      claude: { bin: path.join(home, 'no-claude-here') },
+      out: () => {},
+      json: false,
+      quiet: false,
+    };
+  }
+
+  /** The git safety check of a whole doctor run, in whatever folder this process is in. */
+  async function check(context: CliContext): Promise<DoctorCheck> {
+    const { checks } = await runDoctor(context, {
+      resolveClaude: () => ({ bin: '/real/claude' }),
+      checkBrowserPort: () => Promise.resolve(true),
+      shellPlans: [],
+      headless: false,
+      skipNetwork: true,
+    });
+    const found = checks.find((c) => c.name === 'git-safety');
+    if (!found) throw new Error('doctor ran no git safety check');
+    return found;
+  }
+
+  /** The same, with doctor started in `folder` (by default one in no repository). */
+  function gitSafety(context: CliContext, folder = freshFolder()): Promise<DoctorCheck> {
+    process.chdir(folder);
+    return check(context);
+  }
+
+  it("passes in a repository whose own profiles folder, accounts.json and ledger.json are not ccx's", async () => {
+    // The case from issue #147: a load generator's settings in another project.
+    const work = repoTracking([
+      'accounts.json',
+      'apps/traffic-gen/profiles/merchant/default.json',
+      'apps/traffic-gen/profiles/shopper/default.json',
+      'ledger.json',
+    ]);
+    expect(await gitSafety(machine(), work)).toMatchObject({
+      ok: true,
+      detail: "ccx's folders and Claude's logins are not tracked in git",
+    });
   });
 
-  it('fails when a credential or profile file is tracked', () => {
-    expect(auditGitSafety(['accounts.json']).ok).toBe(false);
-    expect(auditGitSafety(['ledger.json']).ok).toBe(false);
-    expect(auditGitSafety(['profiles/work/.credentials.json']).ok).toBe(false);
+  it("fails when ccx's folder is in a repository that tracks its files, naming the folder, the repository and the files", async () => {
+    // A dotfiles repository of the home folder, and doctor run from elsewhere.
+    const home = repoTracking([
+      '.claude-auto-switch/.gitignore',
+      '.claude-auto-switch/accounts.json',
+      '.claude-auto-switch/config.json',
+      '.claude-auto-switch/ledger.json',
+      '.claude-auto-switch/profiles/work/.credentials.json',
+    ]);
+    const context = machine(home);
+    expect(await gitSafety(context)).toMatchObject({
+      ok: false,
+      detail:
+        `ccx's folder ${configHome(context.ctx)} is in the git repository at ${real(home)}, ` +
+        'which tracks 3 of its files: accounts.json, ledger.json, profiles/work/.credentials.json',
+    });
+  });
+
+  it("leaves ccx's settings file and a .gitignore to a dotfiles repository that keeps them", async () => {
+    const home = repoTracking(['.claude-auto-switch/.gitignore', '.claude-auto-switch/config.json']);
+    expect((await gitSafety(machine(home))).ok).toBe(true);
+  });
+
+  it('in the repository it runs in, flags only login files, by exact name, and names the repository', async () => {
+    const work = repoTracking([
+      'accounts.json',
+      'apps/traffic-gen/profiles/merchant/default.json',
+      'backup/.credentials.json',
+      'backup/.credentials.prev.json',
+      'docs/oauth-token.md',
+      'ledger.json',
+      'tools/oauth-token',
+    ]);
+    // Started in a subfolder, it still reads the whole repository.
+    expect(await gitSafety(machine(), path.join(work, 'apps'))).toMatchObject({
+      ok: false,
+      detail:
+        `the git repository at ${real(work)} tracks 3 login files: ` +
+        'backup/.credentials.json, backup/.credentials.prev.json, tools/oauth-token',
+    });
+  });
+
+  it("asks about a profiles folder kept outside ccx's folder, and about each account's own folder", async () => {
+    const profiles = repoTracking(['work/.credentials.json']);
+    const stray = repoTracking(['oauth-token', 'settings.json']);
+    const context = machine();
+    context.config = { ...context.config, profilesDir: profiles };
+    addAccount({ name: 'stray', dir: stray, enabled: true }, context.ctx);
+    expect((await gitSafety(context)).detail).toBe(
+      [
+        `ccx's profile folder ${profiles} is a git repository that tracks 1 of its files: work/.credentials.json`,
+        `ccx's profile folder ${stray} is a git repository that tracks 2 of its files: oauth-token, settings.json`,
+      ].join('; '),
+    );
+  });
+
+  it("in ~/.claude, flags only a login: CLAUDE.md, settings and skills kept in git are fine", async () => {
+    const kept = ['.claude/CLAUDE.md', '.claude/settings.json', '.claude/skills/notes/SKILL.md'];
+    expect((await gitSafety(machine(repoTracking(kept)))).ok).toBe(true);
+
+    const home = repoTracking([...kept, '.claude/.credentials.json']);
+    expect(await gitSafety(machine(home))).toMatchObject({
+      ok: false,
+      detail:
+        `Claude's folder ${path.join(home, '.claude')} is in the git repository at ${real(home)}, ` +
+        'which tracks 1 login file: .credentials.json',
+    });
+  });
+
+  it("names a file once when the repository it runs in is the one tracking ccx's folder", async () => {
+    const home = repoTracking([
+      '.claude-auto-switch/profiles/work/.credentials.json',
+      '.claude/.credentials.json',
+    ]);
+    const context = machine(home);
+    expect((await gitSafety(context, home)).detail).toBe(
+      [
+        `ccx's folder ${configHome(context.ctx)} is in the git repository at ${real(home)}, ` +
+          'which tracks 1 of its files: profiles/work/.credentials.json',
+        `Claude's folder ${path.join(home, '.claude')} is in the git repository at ${real(home)}, ` +
+          'which tracks 1 login file: .credentials.json',
+      ].join('; '),
+    );
+  });
+
+  it('names the first five files and counts the rest', async () => {
+    const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((name) => `sessions/${name}/.claude.json`);
+    const home = repoTracking(files.map((file) => `.claude-auto-switch/${file}`));
+    expect((await gitSafety(machine(home))).detail).toContain(
+      `tracks 7 of its files: ${files.slice(0, 5).join(', ')} and 2 more`,
+    );
+  });
+
+  it('reads a list of tracked files longer than Node lets a command print by default', async () => {
+    // Past 1 MiB of output Node stops the command, and the list goes unread.
+    // Index entries alone, without files on disk, keep this quick.
+    const home = repoTracking([]);
+    mkdirSync(path.join(home, '.claude-auto-switch'));
+    const blob = git(home, ['hash-object', '-w', '--stdin']).trim();
+    const entries = Array.from(
+      { length: 20_000 },
+      (_, i) => `100644 ${blob}\t.claude-auto-switch/sessions/${String(i).padStart(40, '0')}/state.json`,
+    );
+    git(home, ['update-index', '--add', '--index-info'], `${entries.join('\n')}\n`);
+    expect((await gitSafety(machine(home))).detail).toContain('which tracks 20000 of its files');
+  });
+
+  it('says a repository whose files git cannot list was not checked, once, instead of passing it', async () => {
+    const home = repoTracking(['.claude-auto-switch/accounts.json', '.claude/settings.json']);
+    writeFileSync(path.join(home, '.git', 'index'), 'not an index\n', 'utf8');
+    // ccx's folder, ~/.claude and the working folder all lead to this one repository.
+    expect(await gitSafety(machine(home), home)).toMatchObject({
+      ok: true,
+      note: true,
+      detail: `could not check the git repository at ${real(home)}: git could not list its files`,
+    });
+  });
+
+  it("tells files apart by case, so only ccx's own config.json is let through", async () => {
+    // Index entries alone, so a filesystem that ignores case can hold both names.
+    const home = repoTracking([]);
+    mkdirSync(path.join(home, '.claude-auto-switch'));
+    const blob = git(home, ['hash-object', '-w', '--stdin']).trim();
+    const entries = ['CONFIG.JSON', 'Notes.json', 'config.json', 'notes.json'].map(
+      (name) => `100644 ${blob}\t.claude-auto-switch/${name}`,
+    );
+    git(home, ['update-index', '--add', '--index-info'], `${entries.join('\n')}\n`);
+    expect((await gitSafety(machine(home))).detail).toContain(
+      'which tracks 3 of its files: CONFIG.JSON, Notes.json, notes.json',
+    );
+  });
+
+  // Only Linux's filesystem holds two folders whose names differ only in case.
+  it.runIf(process.platform === 'linux')(
+    "asks about a profiles folder whose name differs from ccx's folder only in case",
+    async () => {
+      const home = repoTracking(['.CLAUDE-AUTO-SWITCH/work/.credentials.json']);
+      const context = machine(home);
+      context.config = { ...context.config, profilesDir: path.join(home, '.CLAUDE-AUTO-SWITCH') };
+      expect((await gitSafety(context)).detail).toContain('tracks 1 of its files: work/.credentials.json');
+    },
+  );
+
+  it('finds the repository of a home folder kept in git, past a ceiling that hides it', async () => {
+    const home = repoTracking(['.claude-auto-switch/accounts.json']);
+    const before = process.env.GIT_CEILING_DIRECTORIES;
+    process.env.GIT_CEILING_DIRECTORIES = real(home);
+    try {
+      expect(await gitSafety(machine(home))).toMatchObject({ ok: false });
+    } finally {
+      if (before === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+      else process.env.GIT_CEILING_DIRECTORIES = before;
+    }
+  });
+
+  it("asks about each folder's own repository while a git hook's variables point elsewhere", async () => {
+    const other = repoTracking(['backup/.credentials.json']);
+    const before = process.env.GIT_DIR;
+    process.env.GIT_DIR = path.join(other, '.git');
+    try {
+      expect((await gitSafety(machine())).ok).toBe(true);
+    } finally {
+      if (before === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = before;
+    }
+  });
+
+  // Windows will not delete the folder a process is in.
+  it.skipIf(process.platform === 'win32')('still runs when the folder it was started in has been deleted', async () => {
+    const gone = freshFolder();
+    process.chdir(gone);
+    rmSync(gone, { recursive: true });
+    expect((await check(machine())).ok).toBe(true);
   });
 });
 
@@ -84,7 +345,7 @@ describe('auditShells', () => {
     return c;
   };
   const quietDeps = {
-    gitTrackedFiles: () => ['src/cli.ts'],
+    gitTracked: () => null,
     resolveClaude: () => ({ bin: '/real/claude' }),
     checkBrowserPort: () => Promise.resolve(true),
     skipNetwork: true,
@@ -330,7 +591,7 @@ describe('auditCaps', () => {
 
 describe('doctorCommand', () => {
   const cleanDeps = {
-    gitTrackedFiles: () => ['src/cli.ts'],
+    gitTracked: () => null,
     resolveClaude: () => ({ bin: '/real/claude' }),
     checkBrowserPort: () => Promise.resolve(true),
     shellPlans: [],
@@ -397,9 +658,11 @@ describe('doctorCommand', () => {
 
   it('reports the problem and how to fix it when something is wrong', async () => {
     const lines: string[] = [];
-    const code = await doctorCommand(context(lines), {
+    const c = context(lines);
+    const code = await doctorCommand(c, {
       ...cleanDeps,
-      gitTrackedFiles: () => ['accounts.json'],
+      gitTracked: (folder) =>
+        folder === configHome(c.ctx) ? { repo: folder, files: ['accounts.json'] } : null,
     });
     expect(code).toBe(1);
     const out = lines.join('\n');
@@ -463,7 +726,7 @@ describe('auditSharedLogins', () => {
 
 describe('doctor on a machine nobody is at', () => {
   const serverDeps = {
-    gitTrackedFiles: () => ['src/cli.ts'],
+    gitTracked: () => null,
     resolveClaude: () => ({ bin: '/real/claude' }),
     checkBrowserPort: () => Promise.resolve(false),
     shellPlans: [],
@@ -570,7 +833,7 @@ describe('doctor and a Claude Code npm install that has lost its program', () =>
     const run = doctorCommand(
       c,
       {
-        gitTrackedFiles: () => ['src/cli.ts'],
+        gitTracked: () => null,
         findClaude: () => search,
         repairClaude: () => {
           repairs.push('repaired');

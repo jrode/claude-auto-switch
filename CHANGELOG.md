@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
-## [2.6.12]
+## [2.6.13]
 
 ### Fixed
 
@@ -20,9 +20,10 @@ semantic versioning.
     `--resume=<id>` included, and no `--from-pr`, `--teleport`, or `--cloud`
     and its old name `--remote`), ccx starts each launch with a new
     conversation of its own, `--session-id <uuid>`, before any `--`, and
-    reads the record by that id when the run fails. Nothing else changes for the person: each run was a
-    new conversation before too, and `--continue` afterwards picks up the
-    newest conversation in the folder whoever chose its id.
+    reads the record by that id when the run fails. Nothing else changes for
+    the person: each run was a new conversation before too, and `--continue`
+    afterwards picks up the newest conversation in the folder whoever chose
+    its id.
   - A flag the person passed is left exactly as typed, since Claude refuses
     `--session-id` beside `--resume` or `--continue` without
     `--fork-session`.
@@ -32,6 +33,30 @@ semantic versioning.
   - Still not covered, now said in the README with the reasons: the editor
     launch, a `claude -p` run with headless rotation turned off, and the
     launch ccx falls back to when no account has a login.
+
+## [2.6.12]
+
+### Fixed
+
+- **`ccx doctor`'s git safety check no longer reports other projects' files
+  as ccx secrets (#147).** It matched the files of whatever repository it ran
+  in against names such as `profiles/`, `accounts.json` and `ledger.json`, so
+  a load generator's `profiles` folder in another project failed it. It also
+  never looked at ccx's own folder unless it ran inside that folder's
+  repository, so a dotfiles repository tracking `~/.claude-auto-switch` went
+  unnoticed from anywhere else. Now:
+  - It asks git about ccx's folder (`~/.claude-auto-switch`, or the one you
+    set), the profiles folder and each account's folder, and fails when a
+    repository tracks any file in them other than `config.json`, ccx's
+    settings, which a dotfiles repository may keep on purpose. It names the
+    folder, the repository and the files.
+  - In `~/.claude` and in the repository it runs in, it looks only for login
+    files, by exact name: `.credentials.json`, `.credentials.prev.json` and
+    `oauth-token`. Your CLAUDE.md, settings and skills in git are fine.
+  - A repository whose list of files was over 1 MiB passed without being
+    read: Node stopped git partway, and that read as no repository. Lists
+    up to 64 MiB are read now, and a repository whose files git still
+    cannot list is reported as not checked instead of passing.
 
 ## [2.6.11]
 
