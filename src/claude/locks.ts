@@ -166,7 +166,9 @@ export interface OwnedLockOptions {
  * Which acquisition in this process holds each lock file now. Other processes
  * are told apart by the pid in the file, since no two live processes share
  * one; acquisitions inside this process share the pid, so this tells them
- * apart, and a takeover by this same process replaces the entry.
+ * apart, and a takeover by this same process replaces the entry. This holds
+ * while one copy of this module serves the whole process, with no worker
+ * threads taking locks, as in ccx today.
  */
 const heldHere = new Map<string, symbol>();
 

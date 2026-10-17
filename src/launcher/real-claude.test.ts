@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   declaredProgramSize,
   findRealClaude,
+  isWholeWindowsProgram,
   resolveRealClaude,
   whereItIsUsuallyInstalled,
   type ClaudeFs,
@@ -449,6 +450,35 @@ describe('an install npm may still be writing (Windows)', () => {
       }).broken[0]?.busy;
     expect(at(1_000)).toBe(true);
     expect(at(3_000)).toBe(false);
+  });
+
+  it('reads a program whole whose section with no raw data points past its end, as Windows ignores it', () => {
+    const program = Buffer.from(windowsProgram(1024), 'latin1');
+    program.writeUInt16LE(2, 0x46); // a second section
+    program.writeUInt32LE(0, 0x148 + 40 + 16); // with no raw data
+    program.writeUInt32LE(100_000, 0x148 + 40 + 20); // at an offset far past the file
+    const fs = memoryWindowsFs({ [NESTED]: program.toString('latin1') });
+    expect(isWholeWindowsProgram(fs, NESTED)).toBe(true);
+    expect(declaredProgramSize(program)).toBe(1024);
+  });
+
+  it('reads a program whole whose certificate table ends up to 7 bytes past the file, its padding unwritten', () => {
+    const signedTo = (end: number): MemoryFs => {
+      const program = Buffer.from(windowsProgram(1024), 'latin1');
+      program.writeUInt32LE(1000, 0x58 + 112 + 4 * 8); // the certificate table starts inside the section's bytes
+      program.writeUInt32LE(end - 1000, 0x58 + 112 + 4 * 8 + 4);
+      return memoryWindowsFs({ [NESTED]: program.toString('latin1') });
+    };
+    expect(isWholeWindowsProgram(signedTo(1024 + 7), NESTED)).toBe(true);
+    expect(isWholeWindowsProgram(signedTo(1024 + 8), NESTED)).toBe(false);
+  });
+
+  it('still starts an .exe that is not one of Claude Code own npm files, though it reads as short', () => {
+    // The length rule was checked against Claude Code's program only; a Scoop
+    // shim or another packager's program is judged as before.
+    const other = 'C:\\Users\\me\\scoop\\shims\\claude.exe';
+    const fs = memoryWindowsFs({ [other]: windowsProgram(4096, 2048) });
+    expect(findRealClaude({ findCandidates: () => [other], platform: 'win32', fs, arch: 'x64', now: () => NOW }).bin).toBe(other);
   });
 
   it('reads how long a PE32 program is, whose data directories sit elsewhere', () => {

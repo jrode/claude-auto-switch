@@ -215,10 +215,13 @@ describe('acquireOwnedLock', () => {
   });
 
   it('takes over a running holder past the longest hold, since its pid may have been reused', () => {
+    // Another process's pid, reported running, so only the age can let it go.
     const lock = path.join(dir(), 'x.lock');
-    writeFileSync(lock, String(process.pid), 'utf8');
+    writeFileSync(lock, '4242', 'utf8');
     minutesAgo(lock, 2);
-    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000 });
+    const isRunning = (pid: number): boolean => pid === 4242;
+    expect(acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 180_000, isRunning }).held).toBe(false);
+    const h = acquireOwnedLock(lock, { waitMs: 0, staleMs: 5_000, maxHoldMs: 60_000, isRunning });
     expect(h.held).toBe(true);
     h.release();
   });

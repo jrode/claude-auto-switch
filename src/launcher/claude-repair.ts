@@ -280,48 +280,51 @@ function repairOne(
     );
   }
   const now = (deps.now ?? Date.now)();
+  const busyWhy = `${install.folder} changed moments ago, so npm may still be installing it`;
   if (install.busy) {
-    const why = `${install.folder} changed moments ago, so npm may still be installing it`;
     // A whole platform program can be put in place beside a running npm, as
     // its own setup step does; a second npm on the same folder cannot run
     // beside it, so nothing starts one while the install may be busy.
     if (!(force && install.platformProgram)) {
       return notRepaired(
-        `${why}; ccx leaves it alone until nothing in it has changed for ${SETTLED_MS / 60_000} minutes, ` +
+        `${busyWhy}; ccx leaves it alone until nothing in it has changed for ${SETTLED_MS / 60_000} minutes, ` +
           `${aboutTime(install.settlesInMs ?? 0)} more. Start Claude or run ccx doctor --fix again then`,
       );
     }
-    deps.say(`ccx: ${why}; putting its program in place anyway, as ccx doctor --fix asks`);
   }
   // A program shorter than its headers say is one npm is still downloading, or
   // install.cjs still copying, or one left when either died. Windows may not
   // move a change time while a handle writes, so the file's own size is what
   // shows whether it still grows: nothing is replaced, and no npm is started,
-  // until each such file has stayed one size for STALLED_MS.
+  // until each such file has stayed one size for STALLED_MS. Every file's size
+  // is written down on the same pass, so two such files wait once, not twice.
   if (install.platformProgram) sizes.set(install.platformProgram, null); // whole now: nothing to watch
   const watched = [
     ...(install.state === 'cut-short' ? [install.program] : []),
     ...(install.partialProgram && !install.platformProgram ? [install.partialProgram.file] : []),
   ];
+  const waiting: string[] = [];
   for (const file of watched) {
     const size = fs.size(file) ?? -1;
     const seen = sizes.get(file);
     const since = seen ? Date.parse(seen.at) : Number.NaN;
     if (!seen || seen.size !== size || Number.isNaN(since) || now - since < -CLOCK_AHEAD_MS) {
       sizes.set(file, { size, at: new Date(now).toISOString() });
-      return notRepaired(
+      waiting.push(
         `${file} is shorter than its own headers say (${size} bytes), so it may still be being written. ` +
           `ccx repairs it only once it has stayed that size for ${STALLED_MS / 60_000} minutes`,
       );
-    }
-    if (now - since < STALLED_MS) {
-      return notRepaired(
+    } else if (now - since < STALLED_MS) {
+      waiting.push(
         `${file} has stayed at ${size} bytes for ${aboutTime(Math.max(0, now - since))}; ccx repairs it once ` +
           `that reaches ${STALLED_MS / 60_000} minutes, ${aboutTime(STALLED_MS - Math.max(0, now - since))} more`,
       );
     }
-    // It stopped growing long ago, so what is there was left by a writer that died.
+    // Otherwise it stopped growing long ago, so what is there was left by a writer that died.
   }
+  if (waiting.length > 0) return notRepaired(waiting.join('; '));
+  // Said only once the repair is really going ahead.
+  if (install.busy) deps.say(`ccx: ${busyWhy}; putting its program in place anyway, as ccx doctor --fix asks`);
   // When Claude starts anyway, what the repair says is kept back unless it worked.
   const heldBack: string[] = [];
   const repairDeps = options.quiet ? { ...deps, say: (line: string) => void heldBack.push(line) } : deps;

@@ -846,6 +846,39 @@ describe('when the repair is allowed to run', () => {
     expect(h.npmCalls).toEqual([]);
   });
 
+  it('waits ten minutes once, not once a file, when bin\\claude.exe and the platform program are both cut short', () => {
+    const start = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(
+      missingInstall({ [BIN]: windowsProgram(4096, 2048), [NESTED]: windowsProgram(4096, 1024) }),
+    );
+    const h = harness(fs, {
+      npm: (f) => {
+        f.put(BIN, WINDOWS_PROGRAM);
+        f.put(NESTED, WINDOWS_PROGRAM);
+        return { status: 0 };
+      },
+    });
+    const at = (ms: number): LaunchDeps => ({ ...h.deps, now: () => ms, run: { repairTried: false } });
+    messageOf(() => resolveClaudeForLaunch(at(start)));
+    expect(h.npmCalls).toEqual([]);
+    expect(resolveClaudeForLaunch(at(start + 11 * 60_000)).bin).toBe(BIN);
+    expect(h.npmCalls).toHaveLength(1);
+  });
+
+  it('says "anyway" with doctor --fix only when it really goes ahead', () => {
+    // Busy, and bin\claude.exe cut short and not yet watched for ten minutes:
+    // the repair waits, so it must not first say it is going ahead.
+    const now = Date.parse('2026-10-16T22:00:00Z');
+    const fs = memoryWindowsFs(placeholderInstall({ [BIN]: windowsProgram(4096, 2048), [NESTED]: WINDOWS_PROGRAM }), {
+      modified: { [`${PREFIX}\\node_modules\\@anthropic-ai`]: now - 60_000 },
+    });
+    const h = harness(fs);
+    const failures = repairClaudeInstalls({ ...h.deps, now: () => now }, { force: true });
+    expect(failures.join('\n')).toContain('shorter than its own headers say');
+    expect(h.said.some((line) => line.includes('anyway'))).toBe(false);
+    expect(fs.content(BIN)).toBe(windowsProgram(4096, 2048));
+  });
+
   it('drops the size it kept of a platform program once that program is whole', () => {
     const fs = memoryWindowsFs(placeholderInstall({ [NESTED]: WINDOWS_PROGRAM }));
     const h = harness(fs);

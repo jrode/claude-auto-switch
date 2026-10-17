@@ -296,10 +296,13 @@ function pickOnWindows(
   execPath: string,
 ): { bin: string; prefixArgs: string[] } | undefined {
   const p = path.win32;
-  // A program cut short of its own headers is half copied, and is not started
-  // wherever it is found: npm's own bin\claude.exe arrives here directly from
-  // the default prefixes (%APPDATA%\npm, C:\Program Files\nodejs).
-  const whole = (exe: string): boolean => isWindowsProgram(fs, exe) !== false && !isCutShortWindowsProgram(fs, exe);
+  // One of Claude Code's own npm files cut short of its own headers is half
+  // copied, and is not started wherever it is found: npm's bin\claude.exe
+  // arrives here directly from the default prefixes (%APPDATA%\npm,
+  // C:\Program Files\nodejs). Any other .exe is judged as before, since the
+  // length rule was checked against Claude Code's program and no other.
+  const whole = (exe: string): boolean =>
+    isWindowsProgram(fs, exe) !== false && !(isClaudeNpmProgram(exe) && isCutShortWindowsProgram(fs, exe));
   const directExe = candidates.find((c) => /\.exe$/i.test(c) && whole(c));
   if (directExe) return { bin: directExe, prefixArgs: [] };
 
@@ -370,11 +373,15 @@ export function isWindowsProgram(fs: ClaudeFs, file: string): boolean | null {
  * time while the handle writing it is still open.
  */
 export function isWholeWindowsProgram(fs: ClaudeFs, file: string): boolean {
-  const size = fs.size(file);
-  const head = fs.readStart(file, 64 * 1024);
-  if (size === null || head === null) return false;
-  const declared = declaredProgramSize(head);
-  return declared !== null && size >= declared;
+  return shortOfHeaders(fs, file) === false;
+}
+
+/** Whether a file is one of Claude Code's own npm programs: the package's bin\claude.exe, or a platform package's. */
+function isClaudeNpmProgram(file: string): boolean {
+  return (
+    endsWithParts(file, [...NPM_PACKAGE, 'bin', 'claude.exe']) ||
+    Object.values(PLATFORM_PACKAGES).some((name) => endsWithParts(file, ['node_modules', '@anthropic-ai', name, 'claude.exe']))
+  );
 }
 
 /**
@@ -383,11 +390,23 @@ export function isWholeWindowsProgram(fs: ClaudeFs, file: string): boolean {
  * never refuses a program it does not understand.
  */
 export function isCutShortWindowsProgram(fs: ClaudeFs, file: string): boolean {
+  return shortOfHeaders(fs, file) === true;
+}
+
+/**
+ * How far a certificate table may end past the file. The table's length is
+ * rounded up to eight bytes, and a signer need not write the padding.
+ */
+const SIGNATURE_PADDING = 7;
+
+/** True when shorter than its headers say, false when not, null when they cannot be read. */
+function shortOfHeaders(fs: ClaudeFs, file: string): boolean | null {
   const size = fs.size(file);
   const head = fs.readStart(file, 64 * 1024);
-  if (size === null || head === null) return false;
-  const declared = declaredProgramSize(head);
-  return declared !== null && size < declared;
+  if (size === null || head === null) return null;
+  const extent = programExtent(head);
+  if (extent === null) return null;
+  return size < extent.sections || size + SIGNATURE_PADDING < extent.signature;
 }
 
 /**
@@ -397,6 +416,18 @@ export function isCutShortWindowsProgram(fs: ClaudeFs, file: string): boolean {
  * Null when the headers cannot be read from `head`.
  */
 export function declaredProgramSize(head: Uint8Array): number | null {
+  const extent = programExtent(head);
+  if (extent === null) return null;
+  const end = Math.max(extent.sections, extent.signature);
+  return end > 0 ? end : null;
+}
+
+/**
+ * Where a program's sections end and where its signature ends (0 when it has
+ * none). A section with no raw data takes no room in the file, whatever its
+ * offset says, as Windows reads it.
+ */
+function programExtent(head: Uint8Array): { sections: number; signature: number } | null {
   const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
   const u16 = (at: number): number | null => (at >= 0 && at + 2 <= head.length ? view.getUint16(at, true) : null);
   const u32 = (at: number): number | null => (at >= 0 && at + 4 <= head.length ? view.getUint32(at, true) : null);
@@ -411,23 +442,25 @@ export function declaredProgramSize(head: Uint8Array): number | null {
   // The data directories, after the optional header's fixed part (PE32+ or PE32).
   const directories = magic === 0x20b ? optional + 112 : magic === 0x10b ? optional + 96 : null;
   if (directories === null) return null;
-  let end = 0;
+  let signature = 0;
   const directoryCount = u32(directories - 4);
   if (directoryCount !== null && directoryCount > 4) {
     // Directory 4 is the certificate table, whose address is a file offset.
     const signatureAt = u32(directories + 4 * 8);
     const signatureSize = u32(directories + 4 * 8 + 4);
     if (signatureAt === null || signatureSize === null) return null;
-    if (signatureSize > 0) end = signatureAt + signatureSize;
+    if (signatureSize > 0) signature = signatureAt + signatureSize;
   }
+  let sectionsEnd = 0;
   const table = optional + optionalSize;
   for (let i = 0; i < sections; i++) {
     const rawSize = u32(table + i * 40 + 16);
     const rawAt = u32(table + i * 40 + 20);
     if (rawSize === null || rawAt === null) return null;
-    end = Math.max(end, rawAt + rawSize);
+    if (rawSize > 0) sectionsEnd = Math.max(sectionsEnd, rawAt + rawSize);
   }
-  return end > 0 ? end : null;
+  if (sectionsEnd === 0 && signature === 0) return null;
+  return { sections: sectionsEnd, signature };
 }
 
 const NPM_PACKAGE = ['node_modules', '@anthropic-ai', 'claude-code'];
