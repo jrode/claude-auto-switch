@@ -1926,10 +1926,13 @@ export async function runInteractiveHotSwap(
    * and moved to a healthy account a minute later sat on that account's next
    * limit for good, with nothing in the log. Asked when a limit turns up, from
    * the ledger as it is then, so a reset or an account enabled meanwhile counts.
+   * What the swap loop sets aside is left out too: an account it would not
+   * move to is not somewhere to go, and acting on the limit then would end the
+   * session with nowhere to start it.
    */
   const nowhereToGo = (): boolean => {
     const on = current?.name;
-    return pickAccount(new Set([...(on ? [on] : []), ...deadLogins()]), { quiet: true }) === null;
+    return pickAccount(new Set([...(on ? [on] : []), ...deadLogins(), ...setAsideNow()]), { quiet: true }) === null;
   };
 
   // Ending a worker reaches it between launches too, so it stops Claude and
