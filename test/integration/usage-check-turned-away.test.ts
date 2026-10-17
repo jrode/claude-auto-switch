@@ -44,6 +44,8 @@ const ALSO_SET = [
   'FAKE_CLAUDE_RESETS_AT',
   'FAKE_CLAUDE_LIMIT_TYPE',
   'FAKE_CLAUDE_DRAW_BY_CELLS',
+  'FAKE_CLAUDE_SAY',
+  'FAKE_CLAUDE_EXIT_CODE',
 ];
 /** The usage check answering, with a window this one measured. */
 const OUT = (resetAt: number): LimitProbeResult => ({
@@ -516,6 +518,20 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
   },
 );
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The conversation a launch was given with `--session-id`, or null. */
+const conversationOf = (args: string[] = []): string | null => {
+  const at = args.indexOf('--session-id');
+  return at === -1 ? null : (args[at + 1] ?? null);
+};
+
+/** A launch's arguments without the conversation ccx gave it. */
+const asTyped = (args: string[] = []): string[] => {
+  const at = args.indexOf('--session-id');
+  return at === -1 ? args : [...args.slice(0, at), ...args.slice(at + 2)];
+};
+
 /** Accounts signed in as the fake claude reports it, for a print-mode run's health check. */
 function signInForPrint(home: string, scenario: Record<string, Record<string, unknown>> = {}): void {
   for (const name of ['A', 'B']) {
@@ -570,4 +586,122 @@ describe('a print-mode run whose limit meets a turned-away usage check (against 
     expect(launches(readLog(runsLog))).toEqual([]);
     expect(capsIn(home)).toEqual([]);
   });
+
+  it(
+    'rotates a plain-text run on its own record, found by the conversation ccx gave it',
+    { timeout: 60_000 },
+    async () => {
+      // Plain text reports no conversation, so the person's `claude -p "..."`
+      // had no record ccx could find until ccx named the conversation itself.
+      const { home, runsLog, context, asked } = await twoAccounts('cas-429-print-text-', { A: [TURNED_AWAY] });
+      signInForPrint(home);
+      Object.assign(process.env, {
+        FAKE_CLAUDE_RUNS_LOG: runsLog,
+        FAKE_CLAUDE_IDLE_MS: '1500',
+        FAKE_CLAUDE_SESSION_RECORD: '1',
+        FAKE_CLAUDE_TRANSCRIPT: '1',
+        FAKE_CLAUDE_REFUSE_ON: 'A',
+        FAKE_CLAUDE_REFUSE_AFTER_MS: '300',
+        FAKE_CLAUDE_REFUSAL_ENDS_RUN: '1',
+      });
+
+      expect(await runCommand(context, ['-p', 'hi'])).toBe(0);
+      expect(asked).toContain('A');
+      const runs = launches(readLog(runsLog));
+      expect(runs.map((l) => l.marker)).toEqual(['A', 'B']);
+      // A new conversation for each launch, and the person's arguments as typed.
+      const [onA, onB] = runs.map((l) => conversationOf(l.args));
+      expect(onA).toEqual(expect.stringMatching(UUID));
+      expect(onB).toEqual(expect.stringMatching(UUID));
+      expect(onB).not.toBe(onA);
+      expect(runs.map((l) => asTyped(l.args))).toEqual([
+        ['-p', 'hi'],
+        ['-p', 'hi'],
+      ]);
+      expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A', reason: 'usage_limit_reached' })]);
+    },
+  );
+
+  it(
+    'never rotates a plain-text run on limit words alone, with no refusal in the record ccx named',
+    { timeout: 60_000 },
+    async () => {
+      const { home, runsLog, context, asked } = await twoAccounts('cas-429-print-text-words-', {
+        A: [TURNED_AWAY],
+      });
+      signInForPrint(home);
+      const said: string[] = [];
+      context.out = (message) => said.push(message);
+      // The answer talks about a limit and the run fails; nothing is refused.
+      Object.assign(process.env, {
+        FAKE_CLAUDE_RUNS_LOG: runsLog,
+        FAKE_CLAUDE_IDLE_MS: '300',
+        FAKE_CLAUDE_SESSION_RECORD: '1',
+        FAKE_CLAUDE_TRANSCRIPT: '1',
+        FAKE_CLAUDE_SAY: 'Usage limit reached. Try again later.',
+        FAKE_CLAUDE_EXIT_CODE: '1',
+      });
+
+      expect(await runCommand(context, ['-p', 'hi'])).toBe(1);
+      expect(asked).toEqual(['A']);
+      const runs = launches(readLog(runsLog));
+      expect(runs.map((l) => l.marker)).toEqual(['A']);
+      // ccx named the conversation and its record was there to read.
+      const id = conversationOf(runs[0]?.args);
+      expect(id).toEqual(expect.stringMatching(UUID));
+      expect(existsSync(path.join(home, 'profiles', 'A', 'projects', 'fake-project', `${id}.jsonl`))).toBe(true);
+      expect(capsIn(home)).toEqual([]);
+      expect(said).toContain('A printed limit-looking text, but it is not actually capped (status 429); not rotating');
+    },
+  );
+
+  it(
+    'never rotates a plain-text run while another live ccx session is on the conversation ccx gave it',
+    { timeout: 60_000 },
+    async () => {
+      const { home, runsLog, context } = await twoAccounts('cas-429-print-text-other-', { A: [TURNED_AWAY] });
+      signInForPrint(home);
+      const said: string[] = [];
+      context.out = (message) => said.push(message);
+      Object.assign(process.env, {
+        FAKE_CLAUDE_RUNS_LOG: runsLog,
+        FAKE_CLAUDE_IDLE_MS: '6000',
+        FAKE_CLAUDE_SESSION_RECORD: '1',
+        FAKE_CLAUDE_TRANSCRIPT: '1',
+        FAKE_CLAUDE_REFUSE_ON: 'A',
+        FAKE_CLAUDE_REFUSE_AFTER_MS: '2500',
+        FAKE_CLAUDE_REFUSAL_ENDS_RUN: '1',
+      });
+
+      const running = runCommand(context, ['-p', 'hi']);
+      const [launch] = await waitFor(
+        'the launch on A',
+        () => launches(readLog(runsLog)),
+        (l) => l.length === 1,
+      );
+      // Another ccx session announces that it is in the same conversation, as
+      // the terminal case does, before A's turn is refused.
+      const theirs = mkdtempSync(path.join(tmpdir(), 'cas-429-print-theirs-'));
+      writeFileSync(
+        path.join(theirs, 'claude-report.json'),
+        JSON.stringify({ id: conversationOf(launch?.args) }),
+        'utf8',
+      );
+      const pid = process.ppid;
+      mkdirSync(path.join(home, 'sessions-live'), { recursive: true });
+      writeFileSync(
+        path.join(home, 'sessions-live', `A__${pid}.json`),
+        JSON.stringify({ account: 'A', pid, configDir: theirs, at: Date.now() }),
+        'utf8',
+      );
+      expect(await running).toBe(1);
+
+      expect(launches(readLog(runsLog)).map((l) => l.marker)).toEqual(['A']);
+      expect(capsIn(home)).toEqual([]);
+      expect(said).toContain(
+        `A had a turn refused, but it is not actually capped (status 429; another ccx session (pid ${pid}) ` +
+          'is on this conversation too, so the refusal may be its); not rotating',
+      );
+    },
+  );
 });

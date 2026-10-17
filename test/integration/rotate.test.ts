@@ -6,6 +6,8 @@ import { autoRotateHeadless } from '../../src/launcher/rotating-run.js';
 import type { RecordedRefusal } from '../../src/session/refused-turn.js';
 import type { RunOptions } from '../../src/util/exec.js';
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function acct(name: string, priority: number) {
   return { name, priority, enabled: true, dir: `/dir/${name}` };
 }
@@ -325,7 +327,11 @@ describe("the refused turn a print-mode run's own record holds", () => {
     return { stdout, stderr: '', exitCode: 1 };
   };
 
-  async function recordedFor(args: string[], run: () => Promise<{ stdout: string; stderr: string; exitCode: number }>, dir: string) {
+  async function recordedFor(
+    args: string[],
+    run: (bin: string, argv: string[]) => Promise<{ stdout: string; stderr: string; exitCode: number }>,
+    dir: string,
+  ) {
     const seen: RecordedRefusal[] = [];
     await autoRotateHeadless(args, {
       ...base,
@@ -367,6 +373,37 @@ describe("the refused turn a print-mode run's own record holds", () => {
     expect(await seen[0]?.shown?.()).toBe(false);
   });
 
+  /** A plain-text run that writes `lines` into the record of the conversation it was given, prints `stdout` and fails. */
+  const plainRunWriting = (dir: string, lines: string[], stdout: string) => async (_bin: string, argv: string[]) => {
+    const at = argv.indexOf('--session-id');
+    const id = at === -1 ? undefined : argv[at + 1];
+    if (id !== undefined) {
+      const folder = path.join(dir, 'projects', 'work');
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(path.join(folder, `${id}.jsonl`), lines.join(String.fromCharCode(10)));
+    }
+    return { stdout, stderr: '', exitCode: 1 };
+  };
+
+  it('is found for a plain-text run by the conversation ccx gave it', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'cas-print-plain-'));
+    const seen = await recordedFor(['-p', 'hi'], plainRunWriting(dir, [refusal(MINE, 10)], `${MINE}\n`), dir);
+    expect(seen.map((r) => r.refusal.text)).toEqual([MINE]);
+    expect(seen[0]?.conversation).toEqual(expect.stringMatching(UUID));
+    expect(await seen[0]?.shown?.()).toBe(true);
+  });
+
+  it('proves nothing for a plain-text run that did not print it', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'cas-print-plain-unshown-'));
+    const seen = await recordedFor(
+      ['-p', 'hi'],
+      plainRunWriting(dir, [refusal(THEIRS, 10)], 'Something else went wrong.\n'),
+      dir,
+    );
+    expect(seen).toHaveLength(1);
+    expect(await seen[0]?.shown?.()).toBe(false);
+  });
+
   it('is read from the conversation a fork reports, not the one it was copied from', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'cas-print-fork-'));
     const printed = JSON.stringify({ type: 'result', is_error: true, result: MINE, session_id: FORK });
@@ -376,5 +413,76 @@ describe("the refused turn a print-mode run's own record holds", () => {
       dir,
     );
     expect(seen.map((r) => r.conversation)).toEqual([FORK]);
+  });
+});
+
+describe('the conversation ccx gives a print-mode run', () => {
+  const ID = '33333333-4444-4555-8666-777777777777';
+
+  /** The arguments each launch was given: A out of room, B fine. */
+  async function launchedWith(args: string[]): Promise<string[][]> {
+    const seen: string[][] = [];
+    const run = async (_bin: string, argv: string[], opts?: RunOptions) => {
+      seen.push(argv);
+      return opts?.env?.CLAUDE_CONFIG_DIR === '/dir/A'
+        ? { stdout: '', stderr: 'Usage limit reached.', exitCode: 1 }
+        : { stdout: 'ok', stderr: '', exitCode: 0 };
+    };
+    await autoRotateHeadless(args, { ...base, ledger: { caps: [] }, run });
+    return seen;
+  }
+
+  const idIn = (argv: string[] | undefined): string | undefined =>
+    argv === undefined ? undefined : argv[argv.indexOf('--session-id') + 1];
+
+  it('is a new one for each launch when the person named none', async () => {
+    const seen = await launchedWith(['-p', 'hi']);
+    expect(seen).toHaveLength(2);
+    const [onA, onB] = seen.map(idIn);
+    expect(seen).toEqual([
+      ['-p', 'hi', '--session-id', onA],
+      ['-p', 'hi', '--session-id', onB],
+    ]);
+    expect(onA).toEqual(expect.stringMatching(UUID));
+    expect(onB).toEqual(expect.stringMatching(UUID));
+    expect(onB).not.toBe(onA);
+  });
+
+  it('goes before a `--`, after which Claude reads everything as the prompt', async () => {
+    const [argv] = await launchedWith(['-p', '--', '--continue']);
+    expect(argv).toEqual(['-p', '--session-id', idIn(argv), '--', '--continue']);
+    expect(idIn(argv)).toEqual(expect.stringMatching(UUID));
+  });
+
+  // Each spelling a person can name a conversation with, beside a command line
+  // with none, which ccx then names itself.
+  it.each<[string, string[]]>([
+    ['--resume <id>', ['-p', '--resume', ID, 'hi']],
+    ['--resume=<id>', ['-p', `--resume=${ID}`, 'hi']],
+    ['--resume, the picker', ['-p', 'hi', '--resume']],
+    ['-r <id>', ['-p', '-r', ID, 'hi']],
+    ['-r<id>', ['-p', `-r${ID}`, 'hi']],
+    ['--continue', ['-p', '--continue', 'hi']],
+    ['-c', ['-p', '-c', 'hi']],
+    ['-c in a cluster', ['-p', '-pc', 'hi']],
+    ['--session-id <id>', ['-p', '--session-id', ID, 'hi']],
+    ['--session-id=<id>', ['-p', `--session-id=${ID}`, 'hi']],
+    ['--fork-session', ['-p', '--fork-session', 'hi']],
+    ['--from-pr', ['-p', '--from-pr', '123', 'hi']],
+    ['--teleport', ['-p', '--teleport', 'hi']],
+    ['--cloud', ['-p', '--cloud', 'hi']],
+    ['--remote', ['-p', '--remote', 'hi']],
+  ])('is the one named with %s, the command line left as typed', async (_form, named) => {
+    for (const argv of await launchedWith(named)) expect(argv).toEqual(named);
+    const [bare] = await launchedWith(['-p', 'hi']);
+    expect(bare).toEqual(['-p', 'hi', '--session-id', idIn(bare)]);
+  });
+
+  it('never takes an option value or the prompt for a conversation flag', async () => {
+    // `-dc` is --debug with the filter "c", not -d and -c.
+    const typed = ['-p', '-dc', '--name', 'resume', 'continue the refactor'];
+    const [argv] = await launchedWith(typed);
+    expect(argv).toEqual([...typed, '--session-id', idIn(argv)]);
+    expect(idIn(argv)).toEqual(expect.stringMatching(UUID));
   });
 });

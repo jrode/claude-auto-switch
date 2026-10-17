@@ -95,6 +95,10 @@ const readObject = (file) => {
 const printMode = args.includes('-p') || args.includes('--print');
 const formatAt = args.indexOf('--output-format');
 const outputFormat = printMode && formatAt >= 0 ? args[formatAt + 1] : null;
+// Print mode answering as text, with no format or `--output-format text`: the
+// 2.1.302 binary prints the result once, on standard output, a refused turn's
+// own words included, and draws nothing before it.
+const textAnswer = printMode && (!outputFormat || outputFormat === 'text');
 const VALUE_FLAGS = new Set([
   '--output-format',
   '--session-id',
@@ -452,6 +456,7 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
      */
     const showRefusal = (entry) => {
       const text = entry.message.content[0].text;
+      if (textAnswer) return; // printed as the run's answer when it ends, below
       if (!outputFormat && process.env.FAKE_CLAUDE_DRAW_BY_CELLS) {
         // As Claude 2.1.302 draws: only the cells that changed, each moved to
         // in turn, here from the last to the first, so the text never goes
@@ -513,8 +518,9 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
         openLimitMenu();
       }
       // Print mode ends the run on a refused turn, with an error result and
-      // exit 1, where the terminal app stays up and waits.
-      if (process.env.FAKE_CLAUDE_REFUSAL_ENDS_RUN && outputFormat) {
+      // exit 1, where the terminal app stays up and waits. As text, the
+      // result is the refusal's own words.
+      if (process.env.FAKE_CLAUDE_REFUSAL_ENDS_RUN && printMode) {
         const failed = {
           type: 'result',
           subtype: 'error_during_execution',
@@ -522,8 +528,8 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
           result: 'Out of room on this account for now.',
           session_id: printSession(),
         };
-        if (outputFormat === 'text') process.stderr.write(`${failed.result}\n`, () => process.exit(1));
-        else process.stdout.write(`${JSON.stringify(failed)}\n`, () => process.exit(1));
+        const answer = textAnswer ? failed.result : JSON.stringify(failed);
+        process.stdout.write(`${answer}\n`, () => process.exit(1));
       }
     };
     const after = Number(process.env.FAKE_CLAUDE_REFUSE_AFTER_MS) || 0;
@@ -914,15 +920,17 @@ const runsUntilEnded =
 // that ends on a relaunch does not wait out the first launch's time again.
 const stayMs = (!firstLaunch && process.env.FAKE_CLAUDE_RESUMED_IDLE_MS) || process.env.FAKE_CLAUDE_IDLE_MS;
 const idleMs = runsUntilEnded ? 60_000 : Number(stayMs) || 0;
+// How a run that ends by itself exits: 0, unless a test asks for a failure.
+const endCode = Number(process.env.FAKE_CLAUDE_EXIT_CODE) || 0;
 if (idleMs > 0) {
   setTimeout(() => {
     // Simulate Claude re-reading its credential file from disk (its ~30s cache
     // TTL) before the run ends, so a seamless in-place swap is observable.
     if (runsLog) appendFileSync(runsLog, `${JSON.stringify({ type: 'reread', marker: readMarker() })}\n`, 'utf8');
-    printResult(() => process.exit(0));
+    printResult(() => process.exit(endCode));
   }, idleMs);
 } else {
-  printResult(() => process.exit(0));
+  printResult(() => process.exit(endCode));
 }
 
 

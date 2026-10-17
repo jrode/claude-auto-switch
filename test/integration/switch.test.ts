@@ -60,6 +60,7 @@ describe('switch integration (against fake-claude)', () => {
     const dirOfB = getAccount('B', context.ctx)?.dir ?? '';
     const record = JSON.parse(readFileSync(path.join(dirOfB, 'fake-last-run.json'), 'utf8'));
     expect(record.configDir).toBe(dirOfB);
-    expect(record.args).toEqual(['-p', 'hi']);
+    // As typed, in a conversation ccx named so it can find the run's record.
+    expect(record.args).toEqual(['-p', 'hi', '--session-id', expect.stringMatching(/^[0-9a-f-]{36}$/)]);
   });
 });
