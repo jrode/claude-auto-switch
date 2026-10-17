@@ -871,13 +871,12 @@ export async function runInteractiveHotSwap(
       // reads as "the account is fine" to anyone watching. It sent the operator,
       // and me, looking in the wrong place for an hour.
       // An unanswered check says what would settle it.
-      const seen = recorded ? 'Claude recorded a refused turn' : 'limit text on screen';
       notice(
-        decided?.unanswered
-          ? `${seen}, but not switching yet: the usage check could not answer ` +
-              `(${usageAnswer(decided)}), ` +
+        `${recorded ? 'Claude recorded a refused turn' : 'limit text on screen'}, but not switching` +
+          (decided?.unanswered
+            ? ` yet: the usage check could not answer (${usageAnswer(decided)}), ` +
               `and ${proof?.why ?? 'Claude has not recorded the turn as refused'}`
-          : `${seen}, but not switching: ${refusalReason ?? 'the API reported room'}`,
+            : `: ${refusalReason ?? 'the API reported room'}`),
         { kind: 'cap-verify', ...(refusalData ? { data: refusalData } : {}) },
       );
     }
