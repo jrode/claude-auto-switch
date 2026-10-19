@@ -13,7 +13,9 @@ ccx artifacts                         # the pages ccx has recorded, and who owns
 
 For one call, ccx holds the session on the account the page belongs on: it
 moves the session there in place when it is on another one, sends the call,
-and moves it straight back. When the session is on that account already,
+and moves it back, waiting up to 15 seconds for that to finish. If the move back
+fails or takes longer, Claude's next request can still go out as the page's
+account. When the session is on that account already,
 ccx still holds it there and has Claude pick up the login in its folder, since
 Claude can be up to 30 seconds behind an ordinary move. Two calls for the same
 account at once share one move, and the session goes back after the later
