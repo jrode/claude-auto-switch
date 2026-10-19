@@ -21,22 +21,51 @@ MCP server, a trusted folder) is merged back into your own `settings.json` and
 `~/.claude.json`, and logged. If you changed the same setting elsewhere, yours
 wins.
 
-**Detecting a spent account.** Claude writes every refused turn into the
-conversation's transcript, with error codes. ccx reads that record, never the
-screen, and confirms against the account's real usage before it acts. When the
-usage check cannot answer (its budget is shared by every session on the
-machine), only one kind of refusal confirms it instead: one Claude recorded
-for the current turn with the code for a spent usage limit
-(`usage_limit_reached`) and a limit it can name. It holds as wide as that
-limit, the whole account or one model, until the reset the refusal names.
-When it names none, an account-wide limit keeps the end another session
-already recorded for the account, if there is one; anything else takes the
-configured backoff. Any other refusal waits for the usage check, and even the
-right one never counts while ccx knows of another live Claude on the same
-conversation, since every Claude on a conversation writes to the same record.
-That covers sessions in the terminal, workers and `claude -p` runs whose
-conversation is named or reported in JSON, not yet the editor launch. Text on
-screen that talks about usage limits never moves a session.
+**Detecting a spent account.**
+
+- Claude writes every refused turn into the conversation's transcript, with
+  error codes. ccx reads that record, not the screen, so text that talks about
+  limits never moves a session. Where Claude's printed words are all ccx has (a
+  terminal before its record can be read, a print run's output, an editor
+  chat's closing words), they only start the usage check. ccx knows Claude
+  2.1.302's wording ("You've hit your session limit · resets 6pm", including a
+  spend limit on usage credits) and ignores its usage gauge and its fast mode's
+  own limit, after which Claude goes on at standard speed.
+- Before acting, ccx confirms the limit against the account's real usage. When
+  that check can't answer (its budget is shared by every session on the
+  machine), one kind of refusal confirms it instead: one Claude recorded for
+  the current turn with `usage_limit_reached` and a limit it names. It holds as
+  wide as that limit, the whole account or one model, until the reset it names.
+  With no reset named, an account-wide limit keeps the end another session
+  already recorded for the account, and anything else takes the configured
+  backoff. It never counts while ccx knows of another live Claude on the same
+  conversation, because they all write to one record.
+- This covers terminal sessions, workers, `claude -p` runs through ccx, and
+  editor chats started by `ccx-claude` (below). A `claude -p` run that names no
+  conversation (no `--resume`, `--continue`, `--session-id`, `--fork-session`,
+  `--from-pr`, `--teleport`, `--cloud` or its old name `--remote`) gets one of
+  ccx's own (`--session-id`), so its record can be found. ccx reads these flags
+  as Claude does, short ones in a cluster too (`-pc` is print mode with
+  `--continue`), and puts every flag it adds before any `--`.
+- Two launches still wait for the usage check, because ccx can't tell that a
+  refusal there was the run's own: a `claude -p` run with headless rotation
+  turned off (its answer goes straight to you, not through ccx), and the launch
+  ccx falls back to when no account has a login (a whole terminal session, which
+  ccx looks at only once it ends).
+
+**Editor chats through `ccx-claude`.** When the Claude Code extension starts
+Claude through `ccx-claude` (its `claudeCode.claudeProcessWrapper` setting), one
+Claude serves a whole chat and its output goes to the editor, not through ccx.
+ccx follows that Claude's records instead: the conversation it is in (a `/clear`
+included) and its refused turns, judged by the same rules as in a terminal. A
+confirmed limit is recorded once for as long as it lasts, and the editor's next
+chat starts on the next account; the chat that met it stays on its account until
+it is closed. When a chat closes, a check still under way gets 4 s to be written
+down. The extension has Claude write its debug log to standard error: ccx passes
+all of it to the editor, never reads it as a limit, and keeps only the last
+65,536 characters of the rest. `ccx on` and `ccx editor on` work differently:
+they point the editor's `CLAUDE_CONFIG_DIR` at the active account, and no ccx
+process runs beside the editor's Claude.
 
 **Detecting a finished login.** A login can be revoked long before its stored
 expiry: signed out at claude.ai, or the account put on hold. ccx asks Anthropic
