@@ -19,6 +19,7 @@ import { getActive, setActive } from '../../src/state/active.js';
 import { markCapped, updateLedger } from '../../src/ledger/ledger.js';
 import { moveEditorToActive, retireEditor, setUpEditor } from '../../src/editor/folder.js';
 import { acquireOwnedLock } from '../../src/claude/locks.js';
+import { processIsAlive } from '../../src/session/lease.js';
 import { noteEditorChat } from '../../src/editor/editor-chats.js';
 import type { CliContext } from '../../src/context.js';
 import type { PathCtx } from '../../src/config/paths.js';
@@ -981,6 +982,7 @@ const isRealFolder = (dir: string): boolean => {
 };
 interface Launch {
   at: number;
+  pid: number;
   args: string[];
   applied: { print: boolean; sessionId: string | null };
   folder: { configDir: string | null; settings: unknown };
@@ -1586,3 +1588,67 @@ describe.skipIf(process.platform === 'win32')('an editor chat ended by the exten
     },
   );
 });
+
+describe.skipIf(process.platform === 'win32')(
+  'a chat through ccx-claude whose Claude will not end when asked (against fake-claude)',
+  () => {
+    afterEach(() => {
+      for (const child of opened.splice(0)) {
+        child.stdin?.end();
+        if (child.exitCode === null) child.kill();
+      }
+    });
+
+    describe.each<Mode>(['wrapper', 'direct'])('%s mode', (mode) => {
+      /** A chat whose Claude ignores SIGTERM, and the note ccx-claude made of it. */
+      async function stubbornChat(
+        prefix: string,
+      ): Promise<{ chat: Chat; claude: number; note: string }> {
+        const { home } = await twoAccounts(prefix, { A: [ROOM] });
+        const chat = openChat(
+          home,
+          [],
+          { FAKE_CLAUDE_REFUSE_ON: '', FAKE_CLAUDE_IGNORE_TERM: '1', ...LOG_LAUNCH(home) },
+          mode,
+        );
+        chat.send('hello');
+        expect(await chat.answered(1)).toBe(true);
+        const claude = launchesIn(path.join(home, 'runs.jsonl'))[0]!.pid;
+        const note = path.join(home, 'editor-chats', `${claude}.json`);
+        expect(existsSync(note)).toBe(true);
+        return { chat, claude, note };
+      }
+
+      it(
+        'leaves no note of its Claude when it gives up on it after the time it was given',
+        { timeout: 60_000 },
+        async () => {
+          const { chat, claude, note } = await stubbornChat('cas-editor-note-giveup-');
+
+          chat.signal('SIGTERM');
+          expect(await chat.exited).toBe(143);
+
+          // Claude is still running, which is not what clears the note.
+          expect(processIsAlive(claude)).toBe(true);
+          expect(existsSync(note)).toBe(false);
+        },
+      );
+
+      it(
+        'leaves no note of its Claude when it is asked to end a second time',
+        { timeout: 60_000 },
+        async () => {
+          const { chat, claude, note } = await stubbornChat('cas-editor-note-second-');
+
+          chat.signal('SIGTERM');
+          await sleep(300);
+          chat.signal('SIGTERM');
+          expect(await chat.exited).toBe(143);
+
+          expect(processIsAlive(claude)).toBe(true);
+          expect(existsSync(note)).toBe(false);
+        },
+      );
+    });
+  },
+);

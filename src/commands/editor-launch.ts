@@ -461,8 +461,15 @@ function watchEditorLaunch(
   return {
     started(claude) {
       child = claude;
-      if (folder.onEditor && claude.pid !== undefined)
-        forgetChat = noteEditorChat(context.ctx, claude.pid, folder.dir);
+      if (folder.onEditor && claude.pid !== undefined) {
+        const forget = noteEditorChat(context.ctx, claude.pid, folder.dir);
+        // ccx-claude can end without `finished`: it gives up on a Claude that will not end, or is told to end twice.
+        process.once('exit', forget);
+        forgetChat = () => {
+          process.removeListener('exit', forget);
+          forget();
+        };
+      }
       watch = createRecordWatch({
         configDir: folder.dir,
         startsNew,
