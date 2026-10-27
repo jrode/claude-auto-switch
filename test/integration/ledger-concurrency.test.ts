@@ -204,6 +204,7 @@ const REFUSING: Record<string, string> = {
 describe('two processes changing the limits ledger at once', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    delete process.env.FAKE_CLAUDE_SCENARIO;
   });
 
   it('ccx cap waits for a change already in progress, and both limits are kept', async () => {
@@ -291,6 +292,8 @@ describe('two processes changing the limits ledger at once', () => {
       return 'limited';
     };
     setActive('A', context.ctx);
+    // Claude runs on the editor's folder, which has no scenario of its own: it follows A's, which is capped.
+    process.env.FAKE_CLAUDE_SCENARIO = path.join(home, 'profiles', 'A', 'fake-scenario.json');
     expect(await editorLaunch(context, ['chat'])).toBe(1);
     const { code, stderr } = await other.exited;
     expect(code, stderr).toBe(0);

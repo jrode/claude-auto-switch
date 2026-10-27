@@ -17,6 +17,9 @@ import { signedInAndNotRejected } from '../health/signed-in.js';
 import { appendEvent } from '../events/log.js';
 import { ensureEditorReady } from './editor-ready.js';
 import { configHome } from '../config/paths.js';
+import { setUpEditor } from '../editor/folder.js';
+import { editorFolderPath } from '../editor/folder-login.js';
+import { noteEditorChat } from '../editor/editor-chats.js';
 import {
   confirmCap,
   refusalConfirmed,
@@ -48,6 +51,31 @@ async function pickAccount(context: CliContext): Promise<Account | undefined> {
   const picked = await selectHealthy(context, accounts, capped, active);
   if (picked) setActive(picked.name, context.ctx);
   return picked;
+}
+
+/** The folder a launch runs Claude on. */
+interface ClaudeFolder {
+  dir: string;
+  /** The editor's own folder, which ccx keeps on the active account, rather than the account's. */
+  onEditor: boolean;
+}
+
+/**
+ * Bring the editor's folder up on the active account and run Claude on it, as
+ * the editor's extension is set to do: the user's own Claude but for the
+ * login. When it cannot be brought up, the launch runs on the account's own
+ * folder, which holds only a login, and says why.
+ */
+async function claudeFolder(context: CliContext, chosen: Account): Promise<ClaudeFolder> {
+  const up = await setUpEditor(context, { launch: true });
+  if (up.state !== 'not-ready') return { dir: editorFolderPath(context.ctx), onEditor: true };
+  appendEvent(
+    configHome(context.ctx),
+    `the editor's folder is not ready (${up.why}), so this chat runs on ${chosen.name}'s own folder`,
+    Date.now(),
+  );
+  ensureEditorReady(chosen.dir, context.ctx);
+  return { dir: chosen.dir, onEditor: false };
 }
 
 /** How often an editor's Claude's records are read while it runs: as often as a terminal session's. */
@@ -96,8 +124,8 @@ interface EditorWatch {
  * (session/refused-turn), and what it prints goes to the editor, not through
  * ccx. So its refused turns are read from Claude's own records while it runs,
  * by the watch a terminal session uses (session/record-watch): the
- * conversation from the per-process record Claude keeps in the account's
- * folder, followed when the process moves to another (a /clear), and that
+ * conversation from the per-process record Claude keeps in the folder it runs
+ * on, followed when the process moves to another (a /clear), and that
  * conversation's record as it grows. Its standard error is still read once it
  * has ended, for what only that shows.
  *
@@ -108,14 +136,20 @@ interface EditorWatch {
  * and a check that confirms nothing holds the next ones back as a terminal
  * session's does (session/check-backoff).
  */
-function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: string[]): EditorWatch {
+function watchEditorLaunch(
+  context: CliContext,
+  chosen: Account,
+  folder: ClaudeFolder,
+  claudeArgs: string[],
+): EditorWatch {
   const home = configHome(context.ctx);
   const startsNew = !wantsExistingConversation(claudeArgs);
   // An existing chat comes with `--resume=<id>`, and the extension starts its
   // Claude to send the turn the person just wrote, which can be refused before
   // the per-process record is first read.
   const resumes = startsNew || forksConversation(claudeArgs) ? null : conversationIdIn(claudeArgs);
-  // An editor's Claude keeps its per-process record in the account's folder.
+  // An editor's Claude keeps its per-process record in the folder it runs on;
+  // the editor's links that to ~/.claude/sessions, which the lookup reads too.
   const writers: WriterLookup = {
     sessionDir: null,
     configDirs: () => listAccounts(context.ctx).map((a) => a.dir),
@@ -133,6 +167,8 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
   let watch: RecordWatch | null = null;
   let child: ChildProcess | null = null;
   let timer: NodeJS.Timeout | null = null;
+  /** Ends the note that this Claude runs on the editor's folder (editor-chats). */
+  let forgetChat: (() => void) | null = null;
   /** The check under way for a refused turn. */
   let checking: Promise<void> | null = null;
   /**
@@ -287,7 +323,8 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
   return {
     started(claude) {
       child = claude;
-      watch = createRecordWatch({ configDir: chosen.dir, startsNew, launchedAt: Date.now(), resumes });
+      if (folder.onEditor && claude.pid !== undefined) forgetChat = noteEditorChat(context.ctx, claude.pid);
+      watch = createRecordWatch({ configDir: folder.dir, startsNew, launchedAt: Date.now(), resumes });
       timer = setInterval(() => {
         try {
           look(true);
@@ -305,6 +342,8 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
     async finished(result) {
       if (timer) clearInterval(timer);
       timer = null;
+      forgetChat?.();
+      forgetChat = null;
       ending = true;
       // A refusal written just before Claude exited. Its per-process record went
       // with it, so the conversation is the one last seen.
@@ -363,8 +402,8 @@ async function runFollowed(
 
 /**
  * WRAPPER mode: run the EXACT command an editor hands us (e.g. `<claude> ...args`)
- * on the chosen account, with inherited stdio so the extension's protocol is
- * untouched. While it runs, and once it has ended, a confirmed limit is
+ * on the editor's own folder, with inherited stdio so the extension's protocol
+ * is untouched. While it runs, and once it has ended, a confirmed limit is
  * recorded and the active account moved, so the next chat starts elsewhere.
  * This is what the editor's claudeProcessWrapper setting points at.
  */
@@ -375,19 +414,20 @@ export async function wrapperLaunch(context: CliContext, argv: string[], deps: W
     if (argv.length === 0) return 0;
     return (await spawnWatched(argv[0]!, argv.slice(1))).exitCode;
   }
-  ensureEditorReady(chosen.dir, context.ctx);
-  const watch = watchEditorLaunch(context, chosen, argv.slice(1));
+  const folder = await claudeFolder(context, chosen);
+  const watch = watchEditorLaunch(context, chosen, folder, argv.slice(1));
   return runFollowed(
     watch,
-    (started) => spawnWatched(argv[0]!, argv.slice(1), { CLAUDE_CONFIG_DIR: chosen.dir }, started),
+    (started) => spawnWatched(argv[0]!, argv.slice(1), { CLAUDE_CONFIG_DIR: folder.dir }, started),
     deps,
   );
 }
 
 /**
  * DIRECT mode: resolve the real claude and run it with the given claude args on
- * the chosen account. Used when ccx-claude is invoked directly (not via an
- * editor that passes the full command).
+ * the editor's own folder. Used when ccx-claude is invoked directly (not via an
+ * editor that passes the full command), as Conductor does with
+ * `claude_code_executable_path`.
  */
 export async function editorLaunch(context: CliContext, args: string[], deps: WrapperDeps = {}): Promise<number> {
   const claude = getClaude(context);
@@ -395,11 +435,11 @@ export async function editorLaunch(context: CliContext, args: string[], deps: Wr
   if (!chosen) {
     return (await launchWatched(args, { name: '', dir: '' }, { claude })).exitCode;
   }
-  ensureEditorReady(chosen.dir, context.ctx);
-  const watch = watchEditorLaunch(context, chosen, args);
+  const folder = await claudeFolder(context, chosen);
+  const watch = watchEditorLaunch(context, chosen, folder, args);
   return runFollowed(
     watch,
-    (started) => launchWatched(args, { name: chosen.name, dir: chosen.dir }, { claude }, started),
+    (started) => launchWatched(args, { name: chosen.name, dir: folder.dir }, { claude }, started),
     deps,
   );
 }

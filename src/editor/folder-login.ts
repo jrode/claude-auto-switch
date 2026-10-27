@@ -34,8 +34,9 @@ import type { Editor } from './settings.js';
  * On macOS Claude keeps a login in a Keychain item named after the config folder
  * exactly as it was given it (`keychainService`), then in the folder's file. The
  * name comes from the text in the editor's setting, which can spell the folder
- * differently from ccx (a trailing separator, another case on macOS), so every
- * read and write here goes through the spellings the editors pass.
+ * differently from ccx (a trailing separator, another case on macOS), or from
+ * ccx's own path, which `ccx-claude` passes, so every read and write here goes
+ * through each of those spellings.
  */
 
 /** Where the editor's folder is: the path `ccx editor on` puts in the editor's setting. */
@@ -91,8 +92,9 @@ export function isEditorFolder(c: PathCtx = {}): boolean {
 const EDITORS: readonly Editor[] = ['cursor', 'vscode'];
 
 /**
- * The CLAUDE_CONFIG_DIR texts the editors are set to that land on `folder`,
- * or ccx's own path when none does (an editor set up by hand, or none yet).
+ * The CLAUDE_CONFIG_DIR texts a Claude on `folder` may have been given: those
+ * the editors are set to that land on it, and ccx's own path, which is the text
+ * `ccx-claude` gives every Claude it runs there.
  */
 export function folderSpellings(folder: string, c: PathCtx = {}): string[] {
   const found = new Set<string>();
@@ -105,7 +107,8 @@ export function folderSpellings(folder: string, c: PathCtx = {}): string[] {
     }
     if (value !== null && landsOn(value, folder, c)) found.add(value);
   }
-  return found.size > 0 ? [...found] : [folder];
+  found.add(folder);
+  return [...found];
 }
 
 /** The editors whose CLAUDE_CONFIG_DIR names the editor's folder. */

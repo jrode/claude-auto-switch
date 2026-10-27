@@ -48,6 +48,7 @@ import {
 import { removeSessionDir } from '../session/session-dir.js';
 import { processIsAlive } from '../session/lease.js';
 import { editorPointerAccount, editorTargetAccount, syncEditorPointerIfEnabled } from './junction.js';
+import { editorChatNoted } from './editor-chats.js';
 import {
   editorFolderLogin,
   editorFolderPath,
@@ -167,9 +168,21 @@ export function refreshEditor(context: CliContext): Promise<EditorUp> {
   return bringEditorUp(context, { move: false, setUp: false });
 }
 
-/** Set the editor up on its folder (`ccx editor on`, `ccx on`), made when it has none, on the active account. */
-export function setUpEditor(context: CliContext): Promise<EditorUp> {
-  return bringEditorUp(context, { move: true, setUp: true });
+/**
+ * Set the editor up on its folder (`ccx editor on`, `ccx on`, a `ccx-claude`
+ * launch), made when it has none, on the active account. A launch is an editor
+ * on the folder as a setting naming it is, so it keeps a retirement that is
+ * pending from happening.
+ */
+export function setUpEditor(
+  context: CliContext,
+  options: { launch?: boolean } = {},
+): Promise<EditorUp> {
+  return bringEditorUp(context, {
+    move: true,
+    setUp: true,
+    ...(options.launch ? { launch: true } : {}),
+  });
 }
 
 /**
@@ -185,7 +198,7 @@ const EDITOR_MOVE_RETRY_MS = 10_000;
 
 async function bringEditorUp(
   context: CliContext,
-  how: { move: boolean; setUp: boolean; lockWaitMs?: number },
+  how: { move: boolean; setUp: boolean; lockWaitMs?: number; launch?: boolean },
 ): Promise<EditorUp> {
   const c = context.ctx;
   const dir = editorFolderPath(c);
@@ -194,7 +207,7 @@ async function bringEditorUp(
       // Turned off with an editor chat open in it, or with something it holds
       // not handed back: retired once it can be, and kept in step until then,
       // for a chat still running on it.
-      if (editorsOnFolder(c).length > 0) clearRetirePending(c);
+      if (how.launch || editorsOnFolder(c).length > 0) clearRetirePending(c);
       else if (retireEditor(context) === 'retired') {
         return { state: 'not-ready', why: 'no editor is set to the folder, and ccx has retired it' };
       }
@@ -689,9 +702,12 @@ const LOCK_IN_USE_MS = 10_000;
  * folder's `sessions`. ccx's own folder links that to ~/.claude/sessions, where
  * every Claude's record is and none says which folder it runs on, so any
  * editor chat there counts, but for one started at or after `startedBefore`
- * (an editor setting no longer naming the folder by then).
+ * (an editor setting no longer naming the folder by then). So does a Claude
+ * `ccx-claude` noted as running there (editor-chats), whose record names no
+ * editor.
  */
-function editorChatsOpen(folder: string, startedBefore?: number): boolean {
+function editorChatsOpen(c: PathCtx, folder: string, startedBefore?: number): boolean {
+  if (editorChatNoted(c, startedBefore)) return true;
   let names: string[];
   try {
     names = readdirSync(path.join(folder, 'sessions'));
@@ -774,7 +790,7 @@ async function moveIntoFolder(context: CliContext): Promise<Moved> {
   const c = context.ctx;
   const dir = editorFolderPath(c);
   const target = readTarget(dir);
-  const chatsOpen = target !== null && editorChatsOpen(target);
+  const chatsOpen = target !== null && editorChatsOpen(c, target);
   if (chatsOpen && !waitedLongEnough(c)) return 'deferred';
   const item = firstItem(editorFolderLogin(c));
   let owner: string | null = null;
@@ -806,7 +822,7 @@ function finishLateMerge(c: PathCtx): void {
     } catch {
       return;
     }
-    if (typeof target === 'string' && editorChatsOpen(target)) return;
+    if (typeof target === 'string' && editorChatsOpen(c, target)) return;
     const writer = userFileWriter(c);
     let merged = true;
     for (const a of listAccounts(c)) {
@@ -950,7 +966,7 @@ export function retireEditor(context: CliContext, spellings?: string[]): 'retire
     return 'retired';
   }
   const since = retirePendingSince(c) ?? Date.now();
-  if (editorChatsOpen(dir, since)) {
+  if (editorChatsOpen(c, dir, since)) {
     markRetirePending(c, since);
     return 'held';
   }
@@ -1053,7 +1069,7 @@ export function rememberEditorSpellings(context: CliContext, spellings: string[]
 async function takeOverFolder(context: CliContext): Promise<Moved> {
   const c = context.ctx;
   const dir = editorFolderPath(c);
-  if (editorChatsOpen(dir)) return 'deferred';
+  if (editorChatsOpen(c, dir)) return 'deferred';
   let text: string | null = null;
   try {
     text = readFolderLogin(editorFolderLogin(c));
@@ -1073,7 +1089,7 @@ function takeOverNow(c: PathCtx, text: string | null, owner: string | null): Mov
   const dir = editorFolderPath(c);
   // Looked at again under the lock: another ccx may have taken it over, or its Claude come back.
   if (kindOf(dir) !== 'other' || !isDirectory(dir)) return kindOf(dir) === 'folder' ? 'moved' : 'deferred';
-  if (editorChatsOpen(dir) || readFolderLogin(editorFolderLogin(c)) !== text) return 'deferred';
+  if (editorChatsOpen(c, dir) || readFolderLogin(editorFolderLogin(c)) !== text) return 'deferred';
   const accounts = listAccounts(c);
   const wanted = (owner ?? '').trim().toLowerCase();
   const account =
@@ -1160,7 +1176,7 @@ function finishTakeOver(c: PathCtx): void {
     const writer = userFileWriter(c);
     const left = folders.filter((folder) => {
       if (!existsSync(folder)) return false;
-      if (editorChatsOpen(folder)) return true;
+      if (editorChatsOpen(c, folder)) return true;
       // Its own files kept aside again too: one whose first keeping failed would go with the folder.
       const merged =
         adoptFolderHistory(folder, 'editor', c, writer, true) &&
