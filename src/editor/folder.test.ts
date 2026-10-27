@@ -19,9 +19,11 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { addCommand } from '../commands/add.js';
 import { useCommand } from '../commands/use.js';
 import { editorCommand } from '../commands/editor.js';
+import { editorLaunch } from '../commands/editor-launch.js';
 import { setActive } from '../state/active.js';
 import { loadConfig } from '../config/config.js';
 import { installEditorEnvVar, readEditorEnvVar } from './install.js';
@@ -33,7 +35,6 @@ import { readKeychainCredential } from '../accounts/keychain.js';
 import type { CliContext } from '../context.js';
 import { refreshEditor, retireEditor, setUpEditor, takeUpEditorRenewal } from './folder.js';
 import { acquireOwnedLock } from '../claude/locks.js';
-import { folderSpellings } from './folder-login.js';
 import { noteEditorChat } from './editor-chats.js';
 
 /**
@@ -65,6 +66,9 @@ vi.mock('../accounts/keychain.js', () => {
   };
 });
 
+const fakeClaude = fileURLToPath(
+  new URL('../../test/fake-claude/fake-claude.mjs', import.meta.url),
+);
 const HOURS = 3_600_000;
 const emailOf = (name: string): string => `${name.toLowerCase()}@example.com`;
 /** A login of `name`'s, generation `gen`: a renewal is the next generation, with a later expiry. */
@@ -282,23 +286,32 @@ describe('the editor has a Claude folder of its own', () => {
     expect(keychain.has(s.folder)).toBe(false);
   });
 
-  it("also writes the item named after the folder as ccx-claude gives it to its Claudes, when the editor's setting spells it another way", async () => {
+  it("gives ccx-claude's Claude the folder as the editor's setting spells it, so one Keychain item holds the login and a renewal goes home", async () => {
     const s = await scene();
-    await editorOn(s);
+    // The only editor setting that names the folder is VS Code's, with a trailing separator.
     const spelled = `${s.folder}${path.sep}`;
-    expect(installEditorEnvVar('cursor', 'CLAUDE_CONFIG_DIR', spelled, s.context.ctx).ok).toBe(
+    expect(installEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', spelled, s.context.ctx).ok).toBe(
       true,
     );
-    // Claude's first save in each: the editor's, named after its setting, and a ccx-claude Claude's, named after the folder.
+
+    // A launch through ccx-claude, which makes the folder, gives Claude exactly the text the setting has.
+    const launching = { ...s.context, claude: { bin: process.execPath, prefixArgs: [fakeClaude] } };
+    expect(await editorLaunch(launching, ['chat'])).toBe(0);
+    const ran = JSON.parse(read(path.join(s.folder, 'fake-last-run.json')) ?? '{}') as {
+      configDir?: string;
+    };
+    expect(ran.configDir).toBe(spelled);
+
+    // That Claude renewed A's login in the item named after that text, and A's profile holds the older one.
     keychain.set(spelled, login('A', 2));
-    keychain.set(s.folder, login('A', 2));
     rmSync(path.join(s.folder, '.credentials.json'));
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-1');
+    await use(s, 'B', () => tokenOf(keychain.get(spelled)) === 'a-B-1');
 
-    expect(folderSpellings(s.folder, s.context.ctx)).toEqual([spelled, s.folder]);
-    await use(s, 'B', () => tokenOf(keychain.get(s.folder)) === 'a-B-1');
-
-    expect(tokenOf(keychain.get(s.folder))).toBe('a-B-1');
+    // The renewal went home before the move replaced it, and no second item was written.
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
     expect(tokenOf(keychain.get(spelled))).toBe('a-B-1');
+    expect(keychain.has(s.folder)).toBe(false);
   });
 
   it.skipIf(process.platform === 'win32')(
@@ -1126,24 +1139,6 @@ describe('ccx editor off', () => {
     const spelled = `${s.folder}${path.sep}`;
     expect(installEditorEnvVar('cursor', 'CLAUDE_CONFIG_DIR', spelled, s.context.ctx).ok).toBe(true);
     keychain.set(spelled, login('A', 2));
-    rmSync(path.join(s.folder, '.credentials.json'));
-
-    expect(await editorCommand(s.context, 'off')).toBe(0);
-
-    expect(keychain.has(spelled)).toBe(false);
-    expect(keychain.has(s.folder)).toBe(false);
-    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
-  });
-
-  it('leaves no login behind in the item named after the folder itself either', async () => {
-    const s = await scene();
-    await editorOn(s);
-    const spelled = `${s.folder}${path.sep}`;
-    expect(installEditorEnvVar('cursor', 'CLAUDE_CONFIG_DIR', spelled, s.context.ctx).ok).toBe(
-      true,
-    );
-    keychain.set(spelled, login('A', 2));
-    keychain.set(s.folder, login('A', 2));
     rmSync(path.join(s.folder, '.credentials.json'));
 
     expect(await editorCommand(s.context, 'off')).toBe(0);

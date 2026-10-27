@@ -24,7 +24,7 @@ import {
   takeUpEditorRenewal,
   type EditorUp,
 } from '../editor/folder.js';
-import { editorFolderPath, readEditorRecord } from '../editor/folder-login.js';
+import { editorFolderPath, folderSpellings, readEditorRecord } from '../editor/folder-login.js';
 import { noteEditorChat } from '../editor/editor-chats.js';
 import {
   confirmCap,
@@ -67,7 +67,10 @@ async function pickAccount(context: CliContext): Promise<Account | undefined> {
 
 /** The folder a launch runs Claude on. */
 interface ClaudeFolder {
+  /** Where ccx reads and writes it. */
   dir: string;
+  /** The text Claude is given as its CLAUDE_CONFIG_DIR, which names the Keychain item it keeps its login in. */
+  given: string;
   /** The editor's own folder, which ccx keeps on the active account, rather than the account's. */
   onEditor: boolean;
 }
@@ -80,7 +83,9 @@ interface ClaudeFolder {
  * later event, and the launch runs on the folder as it is, since it holds the
  * user's setup. Only a launch with no folder to run on, or a folder with no
  * working login, runs on the account's own folder, which holds only a login,
- * and says why.
+ * and says why. Claude is given the folder as an editor's setting spells it,
+ * when one lands on it, so every Claude there keeps its login in one Keychain
+ * item and a renewal is never in a second one that the next move overwrites.
  */
 async function claudeFolder(context: CliContext, chosen: Account): Promise<ClaudeFolder> {
   const home = configHome(context.ctx);
@@ -93,7 +98,7 @@ async function claudeFolder(context: CliContext, chosen: Account): Promise<Claud
         Date.now(),
       );
       ensureEditorReady(chosen.dir, context.ctx);
-      return { dir: chosen.dir, onEditor: false };
+      return { dir: chosen.dir, given: chosen.dir, onEditor: false };
     }
     appendEvent(
       home,
@@ -101,7 +106,8 @@ async function claudeFolder(context: CliContext, chosen: Account): Promise<Claud
       Date.now(),
     );
   }
-  return { dir: editorFolderPath(context.ctx), onEditor: true };
+  const dir = editorFolderPath(context.ctx);
+  return { dir, given: folderSpellings(dir, context.ctx)[0] ?? dir, onEditor: true };
 }
 
 /** How often an editor's Claude's records are read while it runs: as often as a terminal session's. */
@@ -556,7 +562,8 @@ export async function wrapperLaunch(context: CliContext, argv: string[], deps: W
   const watch = watchEditorLaunch(context, chosen, folder, argv.slice(1));
   return runFollowed(
     watch,
-    (started) => spawnWatched(argv[0]!, argv.slice(1), { CLAUDE_CONFIG_DIR: folder.dir }, started),
+    (started) =>
+      spawnWatched(argv[0]!, argv.slice(1), { CLAUDE_CONFIG_DIR: folder.given }, started),
     deps,
   );
 }
@@ -577,7 +584,7 @@ export async function editorLaunch(context: CliContext, args: string[], deps: Wr
   const watch = watchEditorLaunch(context, chosen, folder, args);
   return runFollowed(
     watch,
-    (started) => launchWatched(args, { name: chosen.name, dir: folder.dir }, { claude }, started),
+    (started) => launchWatched(args, { name: chosen.name, dir: folder.given }, { claude }, started),
     deps,
   );
 }

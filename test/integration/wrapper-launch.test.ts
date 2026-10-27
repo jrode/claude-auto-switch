@@ -7,6 +7,7 @@ import { addCommand } from '../../src/commands/add.js';
 import { useCommand } from '../../src/commands/use.js';
 import { wrapperLaunch } from '../../src/commands/editor-launch.js';
 import { loadConfig } from '../../src/config/config.js';
+import { installEditorEnvVar } from '../../src/editor/install.js';
 import { getActive } from '../../src/state/active.js';
 import { loadLedger } from '../../src/ledger/ledger.js';
 import type { CliContext } from '../../src/context.js';
@@ -17,7 +18,14 @@ const fakeClaude = fileURLToPath(new URL('../fake-claude/fake-claude.mjs', impor
 
 function makeContext(home: string, verdict: LimitVerdict = 'limited'): CliContext {
   // A home of its own, so the editor's folder and your ~/.claude are the test's too.
-  const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };
+  const ctx = {
+    env: {
+      CLAUDE_AUTO_SWITCH_HOME: home,
+      HOME: home,
+      USERPROFILE: home,
+      APPDATA: path.join(home, 'AppData'),
+    },
+  };
   return {
     ctx,
     config: loadConfig(ctx),
@@ -84,6 +92,24 @@ describe("wrapperLaunch (runs the editor-supplied command on the editor's folder
     expect(readFileSync(path.join(folder, 'CLAUDE.md'), 'utf8')).toBe('my memory');
     expect(existsSync(path.join(dirA, 'fake-last-run.json'))).toBe(false);
     expect(getActive(context.ctx)).toBe('A'); // no cap, stays put
+  });
+
+  it("gives the editor's command the folder as an editor setting spells it", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-wrap-spelled-'));
+    const context = makeContext(home);
+    const dirA = path.join(home, 'profiles', 'A');
+    await addCommand(context, 'A', { dir: dirA, login: false });
+    seed(dirA, false);
+    useCommand(context, 'A');
+    const folder = path.join(home, 'editor-active');
+    // A trailing separator names another Keychain item on macOS, which the editor's own Claudes read.
+    const spelled = `${folder}${path.sep}`;
+    expect(installEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', spelled, context.ctx).ok).toBe(true);
+
+    expect(await wrapperLaunch(context, [process.execPath, fakeClaude, 'chat'])).toBe(0);
+
+    const record = JSON.parse(readFileSync(path.join(folder, 'fake-last-run.json'), 'utf8'));
+    expect(record.configDir).toBe(spelled);
   });
 
   it('flips the active account to a healthy one when the command caps', async () => {
