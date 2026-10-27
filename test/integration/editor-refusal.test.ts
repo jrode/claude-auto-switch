@@ -1275,7 +1275,7 @@ describe.each<Mode>(['wrapper', 'direct'])(
     );
 
     it(
-      'records no limit for an account the editor has moved off while the check on it was under way',
+      'records the limit of an account the editor has moved off while the check on it was under way, and moves nothing',
       { timeout: 60_000 },
       async () => {
         const { home, ctx, context } = await twoAccounts('cas-editor-moved-away-', {
@@ -1291,15 +1291,15 @@ describe.each<Mode>(['wrapper', 'direct'])(
         await moveEditorToActive(context);
         expect(editorRecord(home)?.account).toBe('B');
         release(home);
-        await until(() => timesSaid(home, /not recording A's limit/) === 1);
+        await until(() => timesSaid(home, /^the editor had already moved to B$/) === 1);
 
-        // A's limit is not recorded for a folder that no longer holds A, and nothing moves it again.
-        expect(
-          timesSaid(home, /not recording A's limit: the editor moved to B while it was checked$/),
-        ).toBe(1);
-        expect(capsIn(home)).toEqual([]);
+        // A is spent whichever account the editor holds now, so its limit is recorded. The editor is
+        // already where it should be, so no next account is picked and nothing is moved.
+        expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A' })]);
+        expect(said(home, 'A hit its limit (editor)')).toBe(1);
         expect(getActive(ctx)).toBe('B');
-        expect(said(home, 'A hit its limit (editor)')).toBe(0);
+        expect(editorRecord(home)?.account).toBe('B');
+        expect(timesSaid(home, /^the editor (moved|has not moved|stays)/)).toBe(0);
         expect(await chat.close()).toBe(0);
       },
     );

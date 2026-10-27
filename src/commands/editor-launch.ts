@@ -288,16 +288,7 @@ function watchEditorLaunch(
       );
       return;
     }
-    // Asked again after the check: the editor may have moved on, or the limit been recorded, here or elsewhere.
-    const holdsNow = holder();
-    if (holdsNow.name !== account.name) {
-      appendEvent(
-        home,
-        `${seen}, but not recording ${account.name}'s limit: the editor moved to ${holdsNow.name} while it was checked`,
-        Date.now(),
-      );
-      return;
-    }
+    // Asked again after the check: it may have been recorded meanwhile, here or elsewhere.
     if (covered(account, decision.model)) return;
     if (decision.byRefusal) {
       appendEvent(home, `in the editor, ${refusalConfirmed(decision)}`, Date.now(), {
@@ -332,6 +323,12 @@ function watchEditorLaunch(
       }),
     );
     appendEvent(home, `${account.name} hit its limit (editor)`, Date.now());
+    // The account is spent whichever one the folder holds. If it moved on while the check ran, it is already elsewhere.
+    const holdsNow = holder();
+    if (holdsNow.name !== account.name) {
+      appendEvent(home, `the editor had already moved to ${holdsNow.name}`, Date.now());
+      return;
+    }
     const next = await selectHealthy(
       context,
       listAccounts(context.ctx),
