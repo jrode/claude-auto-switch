@@ -729,11 +729,11 @@ const LOCK_IN_USE_MS = 10_000;
  * every Claude's record is and none says which folder it runs on, so any
  * editor chat there counts, but for one started at or after `startedBefore`
  * (an editor setting no longer naming the folder by then). So does a Claude
- * `ccx-claude` noted as running there (editor-chats), whose record names no
- * editor.
+ * `ccx-claude` noted as running on `folder` (editor-chats), whose record names
+ * no editor, and on no other folder.
  */
-function editorChatsOpen(c: PathCtx, folder: string, startedBefore?: number): boolean {
-  if (editorChatNoted(c, startedBefore)) return true;
+export function editorChatsOpen(c: PathCtx, folder: string, startedBefore?: number): boolean {
+  if (editorChatNoted(c, folder, startedBefore)) return true;
   let names: string[];
   try {
     names = readdirSync(path.join(folder, 'sessions'));

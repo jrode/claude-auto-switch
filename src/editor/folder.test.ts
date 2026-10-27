@@ -33,7 +33,13 @@ import { renewIdleLogin } from '../usage/usage-store.js';
 import { listAccounts } from '../accounts/registry.js';
 import { readKeychainCredential } from '../accounts/keychain.js';
 import type { CliContext } from '../context.js';
-import { refreshEditor, retireEditor, setUpEditor, takeUpEditorRenewal } from './folder.js';
+import {
+  editorChatsOpen,
+  refreshEditor,
+  retireEditor,
+  setUpEditor,
+  takeUpEditorRenewal,
+} from './folder.js';
 import { acquireOwnedLock } from '../claude/locks.js';
 import { noteEditorChat } from './editor-chats.js';
 
@@ -1304,7 +1310,7 @@ describe('a Claude ccx-claude runs on the editor folder', () => {
     await editorOn(s);
     const claude = stayingProcess();
     try {
-      const ended = noteEditorChat(s.context.ctx, claude.pid);
+      const ended = noteEditorChat(s.context.ctx, claude.pid, s.folder);
 
       expect(retireEditor(s.context)).toBe('held');
       expect(isRealFolder(s.folder)).toBe(true);
@@ -1317,11 +1323,28 @@ describe('a Claude ccx-claude runs on the editor folder', () => {
     }
   });
 
+  it("holds the retirement of the editor folder, but not the merge into an account's folder or a taken-over copy", async () => {
+    const s = await scene();
+    await editorOn(s);
+    const claude = stayingProcess();
+    try {
+      noteEditorChat(s.context.ctx, claude.pid, s.folder);
+
+      expect(editorChatsOpen(s.context.ctx, s.folder)).toBe(true);
+      expect(retireEditor(s.context)).toBe('held');
+      // A Conductor user always has a chat open, and that must not hold off what is done to other folders.
+      expect(editorChatsOpen(s.context.ctx, s.dirOf('A'))).toBe(false);
+      expect(editorChatsOpen(s.context.ctx, `${s.folder}.taken-over`)).toBe(false);
+    } finally {
+      await claude.end();
+    }
+  });
+
   it('counts for nothing once its process is gone, and its note is cleared', async () => {
     const s = await scene();
     await editorOn(s);
     const claude = stayingProcess();
-    noteEditorChat(s.context.ctx, claude.pid);
+    noteEditorChat(s.context.ctx, claude.pid, s.folder);
     await claude.end();
     const note = path.join(s.ccx, 'editor-chats', `${claude.pid}.json`);
     expect(existsSync(note)).toBe(true);

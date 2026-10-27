@@ -462,7 +462,7 @@ function watchEditorLaunch(
     started(claude) {
       child = claude;
       if (folder.onEditor && claude.pid !== undefined)
-        forgetChat = noteEditorChat(context.ctx, claude.pid);
+        forgetChat = noteEditorChat(context.ctx, claude.pid, folder.dir);
       watch = createRecordWatch({
         configDir: folder.dir,
         startsNew,
