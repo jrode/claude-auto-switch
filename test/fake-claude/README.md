@@ -28,12 +28,12 @@ Its behavior is driven by a **scenario** JSON, resolved in this order:
   invocation to `<CLAUDE_CONFIG_DIR>/fake-last-run.json` and exits 0.
 - a run reads its arguments the way the real CLI's parser does (short options
   in clusters, option values, nothing after `--` as an option). With
-  `FAKE_CLAUDE_RUNS_LOG` set, each launch logs what it applied (`applied`) and
-  whether it ran in a terminal (`tty`). Like 2.1.302, it refuses `--session-id`
-  beside `--continue` or `--resume` without `--fork-session`. With
-  `FAKE_CLAUDE_LOG_FOLDER` too, it logs what its config folder holds of the
-  user's Claude (`folder`: where `projects` and `skills` land, its settings,
-  and the address its state is signed in as).
+  `FAKE_CLAUDE_RUNS_LOG` set, each launch logs what it applied (`applied`),
+  whether it ran in a terminal (`tty`) and when it started (`at`). Like 2.1.302,
+  it refuses `--session-id` beside `--continue` or `--resume` without
+  `--fork-session`. With `FAKE_CLAUDE_LOG_FOLDER` too, it logs what its config
+  folder holds of the user's Claude (`folder`: where `projects` and `skills`
+  land, its settings, and the address its state is signed in as).
 - a test that must order something after an event, not after a length of time,
   names a file: `FAKE_CLAUDE_REFUSE_WHEN` refuses the main thread's turn once it
   appears (with `FAKE_CLAUDE_SESSION_RECORD` and `FAKE_CLAUDE_TRANSCRIPT` set),

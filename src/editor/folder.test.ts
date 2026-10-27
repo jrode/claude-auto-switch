@@ -31,7 +31,8 @@ import { renewIdleLogin } from '../usage/usage-store.js';
 import { listAccounts } from '../accounts/registry.js';
 import { readKeychainCredential } from '../accounts/keychain.js';
 import type { CliContext } from '../context.js';
-import { retireEditor, setUpEditor, takeUpEditorRenewal } from './folder.js';
+import { refreshEditor, retireEditor, setUpEditor, takeUpEditorRenewal } from './folder.js';
+import { acquireOwnedLock } from '../claude/locks.js';
 import { folderSpellings } from './folder-login.js';
 import { noteEditorChat } from './editor-chats.js';
 
@@ -1376,6 +1377,54 @@ describe('a launch from ccx-claude, with the retirement of the editor folder pen
 
     expect(up.state).toBe('not-ready');
     expect(existsSync(s.folder)).toBe(false);
+  });
+});
+
+describe('a launch from ccx-claude, which makes one try at each step', () => {
+  it('does not wait for another ccx to end its change to the folder, and leaves the move to the next event', async () => {
+    const s = await scene();
+    await editorOn(s);
+    setActive('B', s.context.ctx);
+    const lock = acquireOwnedLock(path.join(s.ccx, 'editor-folder.lock'), {
+      waitMs: 0,
+      staleMs: 60_000,
+      maxHoldMs: 60_000,
+    });
+    try {
+      const started = Date.now();
+      const up = await setUpEditor(s.context, { launch: true });
+
+      // It once waited 10 s for the lock.
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(up.state).toBe('not-ready');
+      expect(tokenOf(folderLogin(s))).toBe('a-A-1');
+    } finally {
+      lock.release();
+    }
+
+    // An event that moves nothing by itself makes the move, since a launch left it pending.
+    await refreshEditor(s.context);
+    expect(tokenOf(folderLogin(s))).toBe('a-B-1');
+  });
+
+  it("does not look for Claude's locks for long, and leaves the move to the next event", async () => {
+    const s = await scene();
+    await editorOn(s);
+    setActive('B', s.context.ctx);
+    s.context.editorMoveRetryMs = 8_000;
+    const lock = path.join(s.folder, '.oauth_refresh.lock');
+    mkdirSync(lock);
+
+    const started = Date.now();
+    const up = await setUpEditor(s.context, { launch: true });
+
+    // A move under a running Claude looks again every 200 ms for as long as editorMoveRetryMs.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(up.state).toBe('meanwhile');
+    expect(tokenOf(folderLogin(s))).toBe('a-A-1');
+    rmSync(lock, { recursive: true });
+    await refreshEditor(s.context);
+    expect(tokenOf(folderLogin(s))).toBe('a-B-1');
   });
 });
 

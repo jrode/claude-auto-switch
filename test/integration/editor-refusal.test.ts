@@ -18,6 +18,7 @@ import { loadConfig } from '../../src/config/config.js';
 import { getActive, setActive } from '../../src/state/active.js';
 import { markCapped, updateLedger } from '../../src/ledger/ledger.js';
 import { moveEditorToActive, retireEditor, setUpEditor } from '../../src/editor/folder.js';
+import { acquireOwnedLock } from '../../src/claude/locks.js';
 import { noteEditorChat } from '../../src/editor/editor-chats.js';
 import type { CliContext } from '../../src/context.js';
 import type { PathCtx } from '../../src/config/paths.js';
@@ -271,7 +272,7 @@ function launchScript(home: string, mode: Mode): string {
   writeFileSync(
     script,
     [
-      `import { appendFileSync, existsSync, readFileSync } from 'node:fs';`,
+      `import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';`,
       `import { EOL } from 'node:os';`,
       `import path from 'node:path';`,
       `import { editorLaunch, wrapperLaunch } from ${source('src', 'commands', 'editor-launch.ts')};`,
@@ -309,6 +310,8 @@ function launchScript(home: string, mode: Mode): string {
       `  refuteBackoffMs: Number(process.env.EDITOR_REFUTE_BACKOFF_MS) || undefined,`,
       `  editorMoveRetryMs: Number(process.env.EDITOR_MOVE_RETRY_MS) || undefined,`,
       `  out: () => {}, err: () => {}, json: false, quiet: false };`,
+      // When the launch is called, so a test can tell how long it took to start Claude apart from tsx's own start.
+      `writeFileSync(path.join(home, 'called.txt'), String(Date.now()));`,
       mode === 'wrapper'
         ? `process.exit(await wrapperLaunch(context, [process.execPath, fake, ...claudeArgs]));`
         : `process.exit(await editorLaunch(context, claudeArgs));`,
@@ -977,10 +980,16 @@ const isRealFolder = (dir: string): boolean => {
   }
 };
 interface Launch {
+  at: number;
   args: string[];
   applied: { print: boolean; sessionId: string | null };
-  folder: { configDir: string | null };
+  folder: { configDir: string | null; settings: unknown };
 }
+/** When ccx-claude's launch was called (see launchScript). */
+const calledAt = (home: string): number =>
+  Number(readFileSync(path.join(home, 'called.txt'), 'utf8'));
+/** How long a launch may take to start Claude, when it must not wait for a lock: it once waited 10 s for each. */
+const LAUNCH_MS = 3_000;
 /** Each Claude the fake claude logged starting (FAKE_CLAUDE_RUNS_LOG), with the folder it runs in (FAKE_CLAUDE_LOG_FOLDER). */
 const launchesIn = (runsLog: string): Launch[] =>
   linesOf(runsLog)
@@ -1048,6 +1057,70 @@ describe.each<Mode>(['wrapper', 'direct'])(
         );
         expect(await chat.close()).toBe(0);
         expect(isRealFolder(folder)).toBe(true);
+      },
+    );
+
+    it(
+      'starts Claude on the editor folder at once while another ccx holds the editor lock, with your setup in it',
+      { timeout: 60_000 },
+      async () => {
+        const { home, context } = await twoAccounts('cas-editor-locked-', { A: [ROOM] });
+        mkdirSync(path.join(home, '.claude'), { recursive: true });
+        writeFileSync(
+          path.join(home, '.claude', 'settings.json'),
+          JSON.stringify({ model: 'fable' }),
+          'utf8',
+        );
+        await setUpEditor(context);
+        // Another ccx is changing the folder, and goes on holding its lock for as long as this launch runs.
+        const lock = acquireOwnedLock(path.join(home, 'editor-folder.lock'), {
+          waitMs: 0,
+          staleMs: 60_000,
+          maxHoldMs: 60_000,
+        });
+        expect(lock.held).toBe(true);
+        try {
+          const chat = openChat(home, [], { FAKE_CLAUDE_REFUSE_ON: '', ...LOG_LAUNCH(home) }, mode);
+          expect(await chat.up()).toBe(true);
+
+          // It once waited 10 s for the lock and then ran on the account's own folder, which has none of your setup.
+          const [launch] = launchesIn(path.join(home, 'runs.jsonl'));
+          expect(launch!.at - calledAt(home)).toBeLessThan(LAUNCH_MS);
+          expect(launch?.folder.configDir).toBe(realpathSync(editorFolder(home)));
+          expect(launch?.folder.settings).toEqual({ model: 'fable' });
+          expect(await chat.close()).toBe(0);
+        } finally {
+          lock.release();
+        }
+      },
+    );
+
+    it(
+      'starts Claude at once when the move to the active account waits on Claude, and leaves that move pending',
+      { timeout: 60_000 },
+      async () => {
+        const { home, ctx, context } = await twoAccounts('cas-editor-launch-wait-', { A: [ROOM] });
+        // The folder is on A, B has been made active since, and Claude holds its login's lock.
+        await setUpEditor(context);
+        setActive('B', ctx);
+        claudeHoldsItsLogin(home);
+
+        // A move under a running Claude looks for its lock for 10 s; a launch looks once.
+        const chat = openChat(
+          home,
+          [],
+          { FAKE_CLAUDE_REFUSE_ON: '', EDITOR_MOVE_RETRY_MS: '8000', ...LOG_LAUNCH(home) },
+          mode,
+        );
+        expect(await chat.up()).toBe(true);
+
+        const [launch] = launchesIn(path.join(home, 'runs.jsonl'));
+        expect(launch!.at - calledAt(home)).toBeLessThan(LAUNCH_MS);
+        expect(launch?.folder.configDir).toBe(realpathSync(editorFolder(home)));
+        // The editor stays on A, and the move waits for a later event.
+        expect(editorRecord(home)?.account).toBe('A');
+        expect(existsSync(path.join(home, 'editor-move-pending.json'))).toBe(true);
+        expect(await chat.close()).toBe(0);
       },
     );
   },

@@ -18,6 +18,7 @@ import { appendEvent } from '../events/log.js';
 import { ensureEditorReady } from './editor-ready.js';
 import { configHome } from '../config/paths.js';
 import {
+  editorStanding,
   moveEditorToActive,
   setUpEditor,
   takeUpEditorRenewal,
@@ -74,19 +75,33 @@ interface ClaudeFolder {
 /**
  * Bring the editor's folder up on the active account and run Claude on it, as
  * the editor's extension is set to do: the user's own Claude but for the
- * login. When it cannot be brought up, the launch runs on the account's own
- * folder, which holds only a login, and says why.
+ * login. A launch tries each step once and never waits on a lock. What it
+ * could not do now (the move to the active account, a refresh) is left to a
+ * later event, and the launch runs on the folder as it is, since it holds the
+ * user's setup. Only a launch with no folder to run on, or a folder with no
+ * working login, runs on the account's own folder, which holds only a login,
+ * and says why.
  */
 async function claudeFolder(context: CliContext, chosen: Account): Promise<ClaudeFolder> {
+  const home = configHome(context.ctx);
   const up = await setUpEditor(context, { launch: true });
-  if (up.state !== 'not-ready') return { dir: editorFolderPath(context.ctx), onEditor: true };
-  appendEvent(
-    configHome(context.ctx),
-    `the editor's folder is not ready (${up.why}), so this chat runs on ${chosen.name}'s own folder`,
-    Date.now(),
-  );
-  ensureEditorReady(chosen.dir, context.ctx);
-  return { dir: chosen.dir, onEditor: false };
+  if (up.state === 'not-ready') {
+    if (!editorStanding(context)?.loggedIn) {
+      appendEvent(
+        home,
+        `the editor's folder is not ready (${up.why}), so this chat runs on ${chosen.name}'s own folder`,
+        Date.now(),
+      );
+      ensureEditorReady(chosen.dir, context.ctx);
+      return { dir: chosen.dir, onEditor: false };
+    }
+    appendEvent(
+      home,
+      `the editor's folder could not be brought up to date now (${up.why}); this chat runs on it as it is`,
+      Date.now(),
+    );
+  }
+  return { dir: editorFolderPath(context.ctx), onEditor: true };
 }
 
 /** How often an editor's Claude's records are read while it runs: as often as a terminal session's. */

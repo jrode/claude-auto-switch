@@ -294,6 +294,7 @@ if (runsLog) {
     runsLog,
     `${JSON.stringify({
       type: 'launch',
+      at: Date.now(),
       args,
       marker: readMarker(),
       settingsModel,

@@ -14,7 +14,9 @@ import { addCommand } from '../../src/commands/add.js';
 import { useCommand } from '../../src/commands/use.js';
 import { editorLaunch } from '../../src/commands/editor-launch.js';
 import { loadConfig } from '../../src/config/config.js';
-import { getActive } from '../../src/state/active.js';
+import { getActive, setActive } from '../../src/state/active.js';
+import { setUpEditor } from '../../src/editor/folder.js';
+import { acquireOwnedLock } from '../../src/claude/locks.js';
 import { loadLedger } from '../../src/ledger/ledger.js';
 import { eventsFilePath } from '../../src/events/log.js';
 import type { CliContext } from '../../src/context.js';
@@ -208,6 +210,37 @@ describe("editorLaunch on the editor's own folder (against fake-claude)", () => 
       JSON.parse(readFileSync(path.join(folder, 'fake-last-run.json'), 'utf8')).configDir,
     ).toBe(folder);
     expect(existsSync(path.join(dirA, 'fake-last-run.json'))).toBe(false);
+  });
+
+  it("runs on the account's own folder, and says why, when the editor's folder holds no working login and cannot be brought up now", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-editor-no-login-'));
+    const context = makeContext(home);
+    const dirA = await accountA(context, home);
+    // The folder is on B, which has no login to put in it.
+    const dirB = path.join(home, 'profiles', 'B');
+    await addCommand(context, 'B', { dir: dirB, login: false });
+    seed(dirB);
+    setActive('B', context.ctx);
+    await setUpEditor(context);
+    setActive('A', context.ctx);
+    // Another ccx is changing the folder, so the move to A cannot be made now.
+    const lock = acquireOwnedLock(path.join(home, 'editor-folder.lock'), {
+      waitMs: 0,
+      staleMs: 60_000,
+      maxHoldMs: 60_000,
+    });
+    try {
+      expect(await editorLaunch(context, ['chat'])).toBe(0);
+    } finally {
+      lock.release();
+    }
+
+    expect(JSON.parse(readFileSync(path.join(dirA, 'fake-last-run.json'), 'utf8')).configDir).toBe(
+      dirA,
+    );
+    expect(existsSync(path.join(home, 'editor-active', 'fake-last-run.json'))).toBe(false);
+    const said = eventMessages(home).find((msg) => msg.includes("runs on A's own folder"));
+    expect(said).toContain('another ccx was changing the folder');
   });
 
   it("runs on the account's own folder, and says why, when the editor's folder cannot be set up", async () => {
