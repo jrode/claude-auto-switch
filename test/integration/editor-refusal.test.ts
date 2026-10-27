@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -8,6 +8,8 @@ import { addCommand } from '../../src/commands/add.js';
 import { loadConfig } from '../../src/config/config.js';
 import { getActive, setActive } from '../../src/state/active.js';
 import { markCapped, updateLedger } from '../../src/ledger/ledger.js';
+import { retireEditor, setUpEditor } from '../../src/editor/folder.js';
+import { noteEditorChat } from '../../src/editor/editor-chats.js';
 import type { CliContext } from '../../src/context.js';
 import type { PathCtx } from '../../src/config/paths.js';
 import type { LimitProbeResult } from '../../src/usage/limit-probe.js';
@@ -18,7 +20,9 @@ import type { LimitProbeResult } from '../../src/usage/limit-probe.js';
  * a process of its own, through tsx, exactly as the extension runs it: its
  * standard input and output are the chat's, passed to Claude untouched, and
  * the fake claude stands in for the extension's Claude, taking turns as
- * stream-json on standard input and staying up across them.
+ * stream-json on standard input and staying up across them. Conductor starts
+ * ccx-claude the other way, with Claude's own arguments and no command before
+ * them; the same chats are run that way too.
  */
 
 const REPO = fileURLToPath(new URL('../..', import.meta.url));
@@ -117,7 +121,7 @@ const resetOnLedger = (ctx: PathCtx, account: string): void => {
 };
 /** Whose login the usage check was asked with, in order. */
 const asked = (home: string): string[] => linesOf(path.join(home, 'asked.txt'));
-/** Let the usage endpoint give an answer that waits for `name` (see wrapperScript). */
+/** Let the usage endpoint give an answer that waits for `name` (see launchScript). */
 const release = (home: string, name = 'release'): void => writeFileSync(path.join(home, name), '', 'utf8');
 /** Claude's own record of another process of its on `conversation`, in the shared folder: this test's own process stands in for it. */
 function otherClaudeOn(home: string, conversation: string): void {
@@ -128,14 +132,15 @@ function otherClaudeOn(home: string, conversation: string): void {
     'utf8',
   );
 }
-const recordOf = (home: string, account: string, conversation: string): string =>
-  path.join(home, 'profiles', account, 'projects', 'fake-project', `${conversation}.jsonl`);
+/** A conversation's record, in your own projects folder, which the editor's folder links. */
+const recordOf = (home: string, conversation: string): string =>
+  path.join(home, '.claude', 'projects', 'fake-project', `${conversation}.jsonl`);
 
 /** Accounts A and B, both signed in, the editor on A, and the usage endpoint answering as given. */
 async function twoAccounts(
   prefix: string,
   usage: Record<string, Answer[]>,
-): Promise<{ home: string; ctx: PathCtx }> {
+): Promise<{ home: string; ctx: PathCtx; context: CliContext }> {
   const home = mkdtempSync(path.join(tmpdir(), prefix));
   const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };
   const context: CliContext = {
@@ -160,21 +165,28 @@ async function twoAccounts(
   }
   setActive('A', ctx);
   writeFileSync(path.join(home, 'usage.json'), JSON.stringify(usage), 'utf8');
-  return { home, ctx };
+  return { home, ctx, context };
 }
 
+/** How ccx-claude is started: as the editor's extension does (`<claude> ...args`), or as Conductor does (`...claude args`). */
+type Mode = 'wrapper' | 'direct';
+
 /**
- * The wrapper as the extension starts it, in a process of its own: ccx's
- * wrapperLaunch on `<claude> ...args`, with the usage endpoint answering from
+ * ccx-claude as it is started, in a process of its own: ccx's wrapperLaunch
+ * on `<claude> ...args` (the extension), or editorLaunch on `...args`
+ * (Conductor), with the usage endpoint answering from
  * `usage.json` (each account's answers in turn, the last one standing; one
  * with `waitFor` answers once that file appears in the home folder) and the
- * fake claude, which runs as `node`, counted as a Claude. It reads Claude's
+ * fake claude, which runs as `node`, counted as a Claude. Each question put to
+ * the usage endpoint is logged in `asked.txt` (whose login it was) and
+ * `asked.jsonl` (the file and token as well). It reads Claude's
  * records every 100 ms, or every EDITOR_FOLLOW_MS, and holds refused turns
  * back for 20 s after a check that confirms nothing, as production does, or
- * for EDITOR_REFUTE_BACKOFF_MS.
+ * for EDITOR_REFUTE_BACKOFF_MS. A move of the editor's login waits for Claude's
+ * locks for EDITOR_MOVE_RETRY_MS, as production does for 10 s.
  */
-function wrapperScript(home: string): string {
-  const script = path.join(home, 'editor-wrapper.mts');
+function launchScript(home: string, mode: Mode): string {
+  const script = path.join(home, `editor-${mode}.mts`);
   const source = (...parts: string[]): string => JSON.stringify(pathToFileURL(path.join(REPO, ...parts)).href);
   writeFileSync(
     script,
@@ -182,15 +194,18 @@ function wrapperScript(home: string): string {
       `import { appendFileSync, existsSync, readFileSync } from 'node:fs';`,
       `import { EOL } from 'node:os';`,
       `import path from 'node:path';`,
-      `import { wrapperLaunch } from ${source('src', 'commands', 'editor-launch.ts')};`,
+      `import { editorLaunch, wrapperLaunch } from ${source('src', 'commands', 'editor-launch.ts')};`,
       `import { loadConfig } from ${source('src', 'config', 'config.ts')};`,
       `import { processIsAlive } from ${source('src', 'session', 'lease.ts')};`,
       `const [home, fake, ...claudeArgs] = process.argv.slice(2);`,
       `const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };`,
       `const answers = JSON.parse(readFileSync(path.join(home, 'usage.json'), 'utf8'));`,
       `const probe = async (credentialsFile) => {`,
-      `  const account = JSON.parse(readFileSync(credentialsFile, 'utf8')).account ?? '?';`,
+      `  const login = JSON.parse(readFileSync(credentialsFile, 'utf8'));`,
+      `  const account = login.account ?? '?';`,
       `  appendFileSync(path.join(home, 'asked.txt'), account + EOL);`,
+      `  const token = login.claudeAiOauth?.accessToken ?? null;`,
+      `  appendFileSync(path.join(home, 'asked.jsonl'), JSON.stringify({ account, file: credentialsFile, token }) + EOL);`,
       `  const queue = answers[account] ?? [];`,
       `  const answer = (queue.length > 1 ? queue.shift() : queue[0]) ?? { verdict: 'allowed', fiveHour: 0.1, sevenDay: 0.1 };`,
       `  const until = Date.now() + 30000;`,
@@ -199,11 +214,24 @@ function wrapperScript(home: string): string {
       `  }`,
       `  return answer;`,
       `};`,
+      // Whose a login is, as the API would say: by the account its token was made for.
+      `const lookupOwner = async (dir) => {`,
+      `  try {`,
+      `    const token = JSON.parse(readFileSync(path.join(dir, '.credentials.json'), 'utf8')).claudeAiOauth?.accessToken ?? '';`,
+      `    const named = /^a-([A-Za-z]+)-/.exec(token);`,
+      `    return named ? named[1].toLowerCase() + '@example.com' : null;`,
+      `  } catch {`,
+      `    return null;`,
+      `  }`,
+      `};`,
       `const context = { ctx, config: loadConfig(ctx), claude: { bin: process.execPath, prefixArgs: [fake] },`,
-      `  capProbe: probe, isClaudeProcess: processIsAlive, editorFollowMs: Number(process.env.EDITOR_FOLLOW_MS) || 100,`,
+      `  capProbe: probe, lookupOwner, isClaudeProcess: processIsAlive, editorFollowMs: Number(process.env.EDITOR_FOLLOW_MS) || 100,`,
       `  refuteBackoffMs: Number(process.env.EDITOR_REFUTE_BACKOFF_MS) || undefined,`,
+      `  editorMoveRetryMs: Number(process.env.EDITOR_MOVE_RETRY_MS) || undefined,`,
       `  out: () => {}, err: () => {}, json: false, quiet: false };`,
-      `process.exit(await wrapperLaunch(context, [process.execPath, fake, ...claudeArgs]));`,
+      mode === 'wrapper'
+        ? `process.exit(await wrapperLaunch(context, [process.execPath, fake, ...claudeArgs]));`
+        : `process.exit(await editorLaunch(context, claudeArgs));`,
     ].join('\n'),
     'utf8',
   );
@@ -233,12 +261,23 @@ interface Chat {
   signal(signal: NodeJS.Signals): void;
   /** The wrapper's exit code, once it has exited. */
   exited: Promise<number | null>;
+  /** Whether Claude has come up, within a while: it says so as it starts. */
+  up(): Promise<boolean>;
+  /** Every line Claude wrote to standard output, as it came through the wrapper. */
+  stdout: string[];
+  /** The result of each turn Claude has answered, in order. */
+  results(): Array<{ is_error?: boolean }>;
 }
 
 const opened: ChildProcess[] = [];
 
-function openChat(home: string, chatArgs: string[], env: Record<string, string> = {}): Chat {
-  const child = spawn(TSX, [wrapperScript(home), home, fakeClaude, ...EXTENSION_ARGS, ...chatArgs], {
+function openChat(
+  home: string,
+  chatArgs: string[],
+  env: Record<string, string> = {},
+  mode: Mode = 'wrapper',
+): Chat {
+  const child = spawn(TSX, [launchScript(home, mode), home, fakeClaude, ...EXTENSION_ARGS, ...chatArgs], {
     stdio: ['pipe', 'pipe', 'pipe'],
     shell: process.platform === 'win32',
     env: { ...process.env, ...EDITOR_CLAUDE, ...env },
@@ -251,7 +290,9 @@ function openChat(home: string, chatArgs: string[], env: Record<string, string> 
       resolve(code);
     }),
   );
-  const results: unknown[] = [];
+  const results: Array<{ is_error?: boolean }> = [];
+  const stdout: string[] = [];
+  let started = false;
   let unread = '';
   child.stdout?.setEncoding('utf8');
   child.stdout?.on('data', (chunk: string) => {
@@ -259,9 +300,11 @@ function openChat(home: string, chatArgs: string[], env: Record<string, string> 
     for (let end = unread.indexOf('\n'); end !== -1; end = unread.indexOf('\n')) {
       const line = unread.slice(0, end).trim();
       unread = unread.slice(end + 1);
+      if (line !== '') stdout.push(line);
       try {
-        const event = JSON.parse(line) as { type?: unknown };
+        const event = JSON.parse(line) as { type?: unknown; subtype?: unknown; is_error?: boolean };
         if (event.type === 'result') results.push(event);
+        if (event.type === 'system' && event.subtype === 'init') started = true;
       } catch {
         /* not an event */
       }
@@ -293,6 +336,9 @@ function openChat(home: string, chatArgs: string[], env: Record<string, string> 
       child.kill(signal);
     },
     exited,
+    up: () => until(() => started),
+    stdout,
+    results: () => results,
   };
 }
 
@@ -345,7 +391,7 @@ describe('an editor chat that meets a limit while the usage check is turned away
       const { home, ctx } = await twoAccounts('cas-editor-resumed-', { A: [TURNED_AWAY] });
       // Earlier turns of the chat: a refusal an hour ago, and one half a minute
       // ago, before this Claude started, on another process now gone.
-      const record = recordOf(home, 'A', RESUMED);
+      const record = recordOf(home, RESUMED);
       mkdirSync(path.dirname(record), { recursive: true });
       const old = (agoMs: number): string =>
         `${JSON.stringify({
@@ -406,8 +452,8 @@ describe('an editor chat that meets a limit while the usage check is turned away
 
       expect(chat.running()).toBe(true);
       // The turn refused for a limit ccx can name is in the new conversation's record only.
-      expect(readFileSync(recordOf(home, 'A', CLEARED), 'utf8')).toContain('"rateLimitType":"five_hour"');
-      expect(readFileSync(recordOf(home, 'A', NEW_CHAT), 'utf8')).not.toContain('"rateLimitType":"five_hour"');
+      expect(readFileSync(recordOf(home, CLEARED), 'utf8')).toContain('"rateLimitType":"five_hour"');
+      expect(readFileSync(recordOf(home, NEW_CHAT), 'utf8')).not.toContain('"rateLimitType":"five_hour"');
       expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A' })]);
       expect(getActive(ctx)).toBe('B');
       expect(verdicts(home)[1]).toMatch(confirmedByRefusal('five_hour'));
@@ -808,6 +854,115 @@ describe('an editor chat that meets a limit while the usage check is turned away
       );
       // Sonnet asked about; the Opus refusal let go, since the ledger holds it.
       expect(asked(home)).toEqual(['A', 'A']);
+    },
+  );
+});
+
+/** The editor's folder, where ccx-claude runs every chat's Claude. */
+const editorFolder = (home: string): string => path.join(home, 'editor-active');
+const isRealFolder = (dir: string): boolean => {
+  try {
+    const stat = lstatSync(dir);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+};
+interface Launch {
+  args: string[];
+  applied: { print: boolean; sessionId: string | null };
+  folder: { configDir: string | null };
+}
+/** Each Claude the fake claude logged starting (FAKE_CLAUDE_RUNS_LOG), with the folder it runs in (FAKE_CLAUDE_LOG_FOLDER). */
+const launchesIn = (runsLog: string): Launch[] =>
+  linesOf(runsLog)
+    .map((l) => JSON.parse(l) as Launch & { type: string })
+    .filter((e) => e.type === 'launch');
+const LOG_LAUNCH = (home: string): Record<string, string> => ({
+  FAKE_CLAUDE_RUNS_LOG: path.join(home, 'runs.jsonl'),
+  FAKE_CLAUDE_LOG_FOLDER: '1',
+});
+
+describe.each<Mode>(['wrapper', 'direct'])('a chat started through ccx-claude (%s mode)', (mode) => {
+  afterEach(() => {
+    for (const child of opened.splice(0)) {
+      child.stdin?.end();
+      if (child.exitCode === null) child.kill();
+    }
+  });
+
+  it(
+    "runs Claude on the editor's folder, and keeps the folder from being retired while it runs",
+    { timeout: 60_000 },
+    async () => {
+      const { home, context } = await twoAccounts('cas-editor-on-folder-', { A: [ROOM] });
+      const folder = editorFolder(home);
+      const chat = openChat(home, [], { FAKE_CLAUDE_REFUSE_ON: '', ...LOG_LAUNCH(home) }, mode);
+      chat.send('hello');
+      expect(await chat.answered(1)).toBe(true);
+
+      expect(launchesIn(path.join(home, 'runs.jsonl'))[0]?.folder.configDir).toBe(realpathSync(folder));
+      // It is an editor chat open in the folder: a retirement waits for it, as it does for the extension's.
+      expect(retireEditor(context)).toBe('held');
+      expect(isRealFolder(folder)).toBe(true);
+
+      expect(await chat.close()).toBe(0);
+      expect(retireEditor(context)).toBe('retired');
+      expect(existsSync(folder)).toBe(false);
+    },
+  );
+
+  it('clears a retirement of the folder that is pending, and runs on the folder', { timeout: 60_000 }, async () => {
+    const { home, context } = await twoAccounts('cas-editor-pending-', { A: [ROOM] });
+    const folder = editorFolder(home);
+    // The folder, with its retirement held off for as long as something counts as an editor chat open in it.
+    await setUpEditor(context);
+    const chatEnded = noteEditorChat(context.ctx, process.pid);
+    expect(retireEditor(context)).toBe('held');
+    chatEnded();
+    const pending = path.join(home, 'editor-retire.json');
+    expect(existsSync(pending)).toBe(true);
+
+    const chat = openChat(home, [], { FAKE_CLAUDE_REFUSE_ON: '', ...LOG_LAUNCH(home) }, mode);
+    chat.send('hello');
+    expect(await chat.answered(1)).toBe(true);
+
+    expect(existsSync(pending)).toBe(false);
+    expect(launchesIn(path.join(home, 'runs.jsonl'))[0]?.folder.configDir).toBe(realpathSync(folder));
+    expect(await chat.close()).toBe(0);
+    expect(isRealFolder(folder)).toBe(true);
+  });
+});
+
+describe('a chat started the way Conductor starts Claude (against fake-claude)', () => {
+  afterEach(() => {
+    for (const child of opened.splice(0)) {
+      child.stdin?.end();
+      if (child.exitCode === null) child.kill();
+    }
+  });
+
+  it(
+    "passes its command line to Claude untouched, and writes nothing to Claude's standard output",
+    { timeout: 60_000 },
+    async () => {
+      const { home } = await twoAccounts('cas-conductor-args-', { A: [ROOM] });
+      const conductorArgs = [`--session-id=${NEW_CHAT}`, '--setting-sources=user,project,local'];
+      const chat = openChat(home, conductorArgs, { FAKE_CLAUDE_REFUSE_ON: '', ...LOG_LAUNCH(home) }, 'direct');
+      chat.send('hello');
+      expect(await chat.answered(1)).toBe(true);
+      expect(await chat.close()).toBe(0);
+
+      const [launch] = launchesIn(path.join(home, 'runs.jsonl'));
+      expect(launch?.args).toEqual([...EXTENSION_ARGS, ...conductorArgs]);
+      expect(launch?.applied.print).toBe(false);
+      expect(launch?.applied.sessionId).toBe(NEW_CHAT);
+      expect(launch?.folder.configDir).toBe(realpathSync(editorFolder(home)));
+      // Every line on standard output is one of Claude's own events.
+      expect(chat.stdout.length).toBeGreaterThan(0);
+      for (const line of chat.stdout) {
+        expect(['system', 'assistant', 'result']).toContain((JSON.parse(line) as { type: string }).type);
+      }
     },
   );
 });

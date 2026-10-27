@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
+import { describe, it, expect, afterEach } from 'vitest';
+import { existsSync, mkdtempSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +9,7 @@ import { editorLaunch } from '../../src/commands/editor-launch.js';
 import { loadConfig } from '../../src/config/config.js';
 import { getActive } from '../../src/state/active.js';
 import { loadLedger } from '../../src/ledger/ledger.js';
+import { eventsFilePath } from '../../src/events/log.js';
 import type { CliContext } from '../../src/context.js';
 import type { LimitVerdict } from '../../src/usage/limit-probe.js';
 
@@ -125,5 +126,91 @@ describe('limit-looking text in an editor session', () => {
 
     expect(loadLedger(context.ctx).caps).toHaveLength(0);
     expect(getActive(context.ctx)).toBe('A'); // and the operator is not moved
+  });
+});
+
+/**
+ * A context with a home folder of its own, so the editor's folder and the
+ * user's Claude folder (`~/.claude`) are the test's too. Without a home ccx
+ * cannot build the editor's folder, and the launch runs on the account's own.
+ */
+function makeHomeContext(home: string): CliContext {
+  const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };
+  return {
+    ctx,
+    config: loadConfig(ctx),
+    claude: { bin: process.execPath, prefixArgs: [fakeClaude] },
+    out: () => {},
+    err: () => {},
+    json: false,
+    quiet: false,
+  };
+}
+
+/** Account A, signed in as the fake claude reads it, and active. */
+async function accountA(context: CliContext, home: string): Promise<string> {
+  const dirA = path.join(home, 'profiles', 'A');
+  await addCommand(context, 'A', { dir: dirA, login: false });
+  seed(dirA);
+  writeFileSync(path.join(dirA, '.credentials.json'), JSON.stringify({ account: 'A' }), 'utf8');
+  useCommand(context, 'A');
+  return dirA;
+}
+
+const eventMessages = (home: string): string[] =>
+  existsSync(eventsFilePath(home))
+    ? readFileSync(eventsFilePath(home), 'utf8')
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => (JSON.parse(line) as { msg: string }).msg)
+    : [];
+
+describe("editorLaunch on the editor's own folder (against fake-claude)", () => {
+  afterEach(() => {
+    delete process.env.FAKE_CLAUDE_RUNS_LOG;
+    delete process.env.FAKE_CLAUDE_LOG_FOLDER;
+  });
+
+  it("runs Claude on the editor's folder, made when missing, with your settings and CLAUDE.md in it", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-editor-folder-'));
+    const context = makeHomeContext(home);
+    const dirA = await accountA(context, home);
+    const folder = path.join(home, 'editor-active');
+    mkdirSync(path.join(home, '.claude'), { recursive: true });
+    writeFileSync(path.join(home, '.claude', 'settings.json'), JSON.stringify({ model: 'fable' }), 'utf8');
+    writeFileSync(path.join(home, '.claude', 'CLAUDE.md'), 'my memory', 'utf8');
+    const runsLog = path.join(home, 'runs.jsonl');
+    process.env.FAKE_CLAUDE_RUNS_LOG = runsLog;
+    process.env.FAKE_CLAUDE_LOG_FOLDER = '1';
+    expect(existsSync(folder)).toBe(false);
+
+    expect(await editorLaunch(context, ['chat'])).toBe(0);
+
+    const launch = JSON.parse(readFileSync(runsLog, 'utf8').trim().split('\n')[0]!) as {
+      marker: string | null;
+      folder: { configDir: string; settings: unknown };
+    };
+    expect(launch.folder.configDir).toBe(realpathSync(folder));
+    expect(launch.folder.settings).toEqual({ model: 'fable' });
+    // The login in it is the active account's, copied from its own folder.
+    expect(launch.marker).toBe('A');
+    expect(readFileSync(path.join(folder, 'CLAUDE.md'), 'utf8')).toBe('my memory');
+    expect(JSON.parse(readFileSync(path.join(folder, 'fake-last-run.json'), 'utf8')).configDir).toBe(folder);
+    expect(existsSync(path.join(dirA, 'fake-last-run.json'))).toBe(false);
+  });
+
+  it("runs on the account's own folder, and says why, when the editor's folder cannot be set up", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-editor-fallback-'));
+    const context = makeHomeContext(home);
+    const dirA = await accountA(context, home);
+    // A file where the folder would be.
+    writeFileSync(path.join(home, 'editor-active'), 'in the way', 'utf8');
+
+    expect(await editorLaunch(context, ['chat'])).toBe(0);
+
+    expect(JSON.parse(readFileSync(path.join(dirA, 'fake-last-run.json'), 'utf8')).configDir).toBe(dirA);
+    expect(readFileSync(path.join(home, 'editor-active'), 'utf8')).toBe('in the way');
+    const said = eventMessages(home).find((msg) => msg.includes("runs on A's own folder"));
+    expect(said).toContain('is not a folder');
   });
 });

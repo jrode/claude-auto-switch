@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -98,5 +98,28 @@ describe('wrapperLaunch (runs the editor-supplied command on the active account)
     expect(await wrapperLaunch(context, [process.execPath, fakeClaude, 'chat'])).toBe(1);
     expect(loadLedger(context.ctx).caps.map((c) => c.account)).toEqual(['A']);
     expect(getActive(context.ctx)).toBe('B');
+  });
+});
+
+describe("wrapperLaunch on the editor's own folder", () => {
+  it("runs the editor's command on the editor's folder, made when missing, with your setup in it", async () => {
+    // A home of its own, so ccx can build the editor's folder and find your ~/.claude.
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-wrap-folder-'));
+    const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };
+    const context: CliContext = { ...makeContext(home), ctx, config: loadConfig(ctx) };
+    const dirA = path.join(home, 'profiles', 'A');
+    await addCommand(context, 'A', { dir: dirA, login: false });
+    seed(dirA, false);
+    useCommand(context, 'A');
+    mkdirSync(path.join(home, '.claude'), { recursive: true });
+    writeFileSync(path.join(home, '.claude', 'CLAUDE.md'), 'my memory', 'utf8');
+    const folder = path.join(home, 'editor-active');
+    expect(existsSync(folder)).toBe(false);
+
+    expect(await wrapperLaunch(context, [process.execPath, fakeClaude, 'chat'])).toBe(0);
+
+    expect(JSON.parse(readFileSync(path.join(folder, 'fake-last-run.json'), 'utf8')).configDir).toBe(folder);
+    expect(readFileSync(path.join(folder, 'CLAUDE.md'), 'utf8')).toBe('my memory');
+    expect(existsSync(path.join(dirA, 'fake-last-run.json'))).toBe(false);
   });
 });
