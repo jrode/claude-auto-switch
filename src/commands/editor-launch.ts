@@ -20,6 +20,7 @@ import { configHome } from '../config/paths.js';
 import {
   editorStanding,
   moveEditorToActive,
+  rememberEditorSpellings,
   setUpEditor,
   takeUpEditorRenewal,
   type EditorUp,
@@ -86,7 +87,9 @@ interface ClaudeFolder {
  * folder, which holds only a login, and says why. Claude is given the folder
  * as an editor's setting spells it, when one lands on it, so every Claude
  * there keeps its login in one Keychain item and a renewal is never in a
- * second one that the next move overwrites.
+ * second one that the next move overwrites. That spelling is noted in the
+ * folder's record, so the item stays among those ccx reads and writes if the
+ * setting is later edited away.
  */
 async function claudeFolder(context: CliContext, chosen: Account): Promise<ClaudeFolder> {
   const home = configHome(context.ctx);
@@ -112,7 +115,10 @@ async function claudeFolder(context: CliContext, chosen: Account): Promise<Claud
     }
   }
   const dir = editorFolderPath(context.ctx);
-  return { dir, given: folderSpellings(dir, context.ctx)[0] ?? dir, onEditor: true };
+  const given = folderSpellings(dir, context.ctx)[0] ?? dir;
+  // Kept in one try, since a launch does not wait on a lock; the next launch tries again.
+  if (given !== dir) rememberEditorSpellings(context, [given], 0);
+  return { dir, given, onEditor: true };
 }
 
 /** How often an editor's Claude's records are read while it runs: as often as a terminal session's. */

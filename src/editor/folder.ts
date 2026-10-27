@@ -1054,13 +1054,21 @@ const clearRetirePending = (c: PathCtx): void => rmSync(retireFile(c), { force: 
  * Keep in the folder's record how editor settings spell the folder, before
  * `ccx editor off` takes one away: on macOS the Keychain item named after that
  * text may hold a login nothing else names, which the retirement must take home
- * and remove, whether it runs now or after the last editor goes. False when it
- * could not be kept.
+ * and remove, whether it runs now or after the last editor goes. A spelling kept
+ * stays among those ccx reads and writes the folder's login by (editorFolderLogin)
+ * after the setting is gone. False when it could not be kept. `waitMs` is how
+ * long the editor's lock is waited for; a launch looks once.
  */
-export function rememberEditorSpellings(context: CliContext, spellings: string[]): boolean {
+export function rememberEditorSpellings(
+  context: CliContext,
+  spellings: string[],
+  waitMs = EDITOR_LOCK_WAIT_MS,
+): boolean {
   const c = context.ctx;
   const dir = editorFolderPath(c);
   if (kindOf(dir) !== 'folder') return true;
+  const noted = readEditorRecord(dir)?.spellings ?? [];
+  if (spellings.every((spelling) => noted.includes(spelling))) return true;
   const kept = withEditorLock(
     c,
     () => {
@@ -1075,7 +1083,7 @@ export function rememberEditorSpellings(context: CliContext, spellings: string[]
         return false;
       }
     },
-    EDITOR_LOCK_WAIT_MS,
+    waitMs,
   );
   return kept.ran && kept.value;
 }

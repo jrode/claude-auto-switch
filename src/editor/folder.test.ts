@@ -26,7 +26,8 @@ import { editorCommand } from '../commands/editor.js';
 import { editorLaunch } from '../commands/editor-launch.js';
 import { setActive } from '../state/active.js';
 import { loadConfig } from '../config/config.js';
-import { installEditorEnvVar, readEditorEnvVar } from './install.js';
+import { installEditorEnvVar, readEditorEnvVar, uninstallEditorEnvVar } from './install.js';
+import { readEditorRecord } from './folder-login.js';
 import { readTarget, setTarget } from '../daemon/junction.js';
 import { refreshCredentialIfExpired } from '../usage/oauth-refresh.js';
 import { renewIdleLogin } from '../usage/usage-store.js';
@@ -318,6 +319,61 @@ describe('the editor has a Claude folder of its own', () => {
     expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
     expect(tokenOf(keychain.get(spelled))).toBe('a-B-1');
     expect(keychain.has(s.folder)).toBe(false);
+  });
+
+  it("keeps the spelling it gave Claude among the folder's, so a renewal still goes home once the setting is edited away", async () => {
+    const s = await scene();
+    const spelled = `${s.folder}${path.sep}`;
+    expect(installEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', spelled, s.context.ctx).ok).toBe(
+      true,
+    );
+    const launching = { ...s.context, claude: { bin: process.execPath, prefixArgs: [fakeClaude] } };
+    expect(await editorLaunch(launching, ['chat'])).toBe(0);
+    const ran = JSON.parse(read(path.join(s.folder, 'fake-last-run.json')) ?? '{}') as {
+      configDir?: string;
+    };
+    expect(ran.configDir).toBe(spelled);
+
+    // Someone edits the setting away by hand, while that Claude goes on keeping its login in the item named after the old text.
+    expect(uninstallEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', s.context.ctx).ok).toBe(true);
+    expect(readEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', s.context.ctx)).toBeNull();
+    keychain.set(spelled, login('A', 2));
+    rmSync(path.join(s.folder, '.credentials.json'));
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-1');
+    await use(s, 'B', () => tokenOf(keychain.get(spelled)) === 'a-B-1');
+
+    // The renewal went home before the move replaced it, in the item that Claude still reads.
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+    expect(tokenOf(keychain.get(spelled))).toBe('a-B-1');
+  });
+
+  it('notes that spelling in one try, so a launch does not wait for another ccx that holds the editor lock', async () => {
+    const s = await scene();
+    const spelled = `${s.folder}${path.sep}`;
+    expect(installEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', spelled, s.context.ctx).ok).toBe(
+      true,
+    );
+    await setUpEditor(s.context);
+    const launching = { ...s.context, claude: { bin: process.execPath, prefixArgs: [fakeClaude] } };
+    const lock = acquireOwnedLock(path.join(s.ccx, 'editor-folder.lock'), {
+      waitMs: 0,
+      staleMs: 60_000,
+      maxHoldMs: 60_000,
+    });
+    try {
+      const started = Date.now();
+      expect(await editorLaunch(launching, ['chat'])).toBe(0);
+
+      // Noting it once waited 10 s for the lock, as `ccx editor off` does.
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(readEditorRecord(s.folder)?.spellings).toBeUndefined();
+    } finally {
+      lock.release();
+    }
+
+    // The next launch notes it.
+    expect(await editorLaunch(launching, ['chat'])).toBe(0);
+    expect(readEditorRecord(s.folder)?.spellings).toEqual([spelled]);
   });
 
   it.skipIf(process.platform === 'win32')(
