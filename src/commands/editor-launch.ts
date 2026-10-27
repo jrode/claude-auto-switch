@@ -81,30 +81,35 @@ interface ClaudeFolder {
  * login. A launch tries each step once and never waits on a lock. What it
  * could not do now (the move to the active account, a refresh) is left to a
  * later event, and the launch runs on the folder as it is, since it holds the
- * user's setup. Only a launch with no folder to run on, or a folder with no
- * working login, runs on the account's own folder, which holds only a login,
- * and says why. Claude is given the folder as an editor's setting spells it,
- * when one lands on it, so every Claude there keeps its login in one Keychain
- * item and a renewal is never in a second one that the next move overwrites.
+ * user's setup. Only a launch with no folder to run on, or one that is not
+ * ready and whose folder holds no working login, runs on the account's own
+ * folder, which holds only a login, and says why. Claude is given the folder
+ * as an editor's setting spells it, when one lands on it, so every Claude
+ * there keeps its login in one Keychain item and a renewal is never in a
+ * second one that the next move overwrites.
  */
 async function claudeFolder(context: CliContext, chosen: Account): Promise<ClaudeFolder> {
   const home = configHome(context.ctx);
   const up = await setUpEditor(context, { launch: true });
-  if (up.state === 'not-ready') {
-    if (!editorStanding(context)?.loggedIn) {
+  if (up.state !== 'ready') {
+    const standing = editorStanding(context);
+    if (!standing?.loggedIn) {
+      const why = standing ? `${up.why}; the folder holds no working login` : up.why;
       appendEvent(
         home,
-        `the editor's folder is not ready (${up.why}), so this chat runs on ${chosen.name}'s own folder`,
+        `the editor's folder is not ready (${why}), so this chat runs on ${chosen.name}'s own folder`,
         Date.now(),
       );
       ensureEditorReady(chosen.dir, context.ctx);
       return { dir: chosen.dir, given: chosen.dir, onEditor: false };
     }
-    appendEvent(
-      home,
-      `the editor's folder could not be brought up to date now (${up.why}); this chat runs on it as it is`,
-      Date.now(),
-    );
+    if (up.state === 'not-ready') {
+      appendEvent(
+        home,
+        `the editor's folder could not be brought up to date now (${up.why}); this chat runs on it as it is`,
+        Date.now(),
+      );
+    }
   }
   const dir = editorFolderPath(context.ctx);
   return { dir, given: folderSpellings(dir, context.ctx)[0] ?? dir, onEditor: true };
