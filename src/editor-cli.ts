@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-// The launcher an editor extension points at (claudeProcessWrapper). The editor
-// invokes it as `ccx-claude <nodePath> <cli.js> <...args>` and expects us to run
-// that command, so we run it on the active/healthiest account with inherited
-// stdio (protocol intact) and flip accounts on a cap for the next chat. When
-// invoked directly with plain claude args, we resolve the real claude instead.
+// The launcher an editor points at. The extension's claudeProcessWrapper invokes it
+// as `ccx-claude <nodePath> <cli.js> <...args>` and expects us to run that command.
+// Conductor's claude_code_executable_path invokes it with Claude's own arguments,
+// and we resolve the real claude instead. Either way Claude runs on the editor's
+// own folder, kept on the active account, with inherited stdio (protocol intact),
+// and a limit its chat meets moves that folder, and every chat on it, to the next
+// account in place.
 import { existsSync } from 'node:fs';
 import { buildContext } from './context.js';
 import { wrapperLaunch, editorLaunch } from './commands/editor-launch.js';
