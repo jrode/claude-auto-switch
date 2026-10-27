@@ -22,7 +22,9 @@ semantic versioning.
   standard input. Claude is given the folder as the editor's setting spells it,
   or ccx's own path when none does, so every Claude on the folder keeps its
   login in one Keychain item, and a renewal is never in a second one that the
-  next move would overwrite.
+  next move would overwrite. ccx notes that spelling in the folder's record, so
+  editing the setting away by hand does not leave the item unread while that
+  Claude goes on using it.
 - **A launch through `ccx-claude` never waits long and never drops your setup.**
   A chat that is starting makes one try at each step. It does not wait for ccx's
   editor lock or for Claude's locks, and what it could not do then, a refresh or
