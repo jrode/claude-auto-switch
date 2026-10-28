@@ -589,6 +589,8 @@ function saveEditorLoginHome(
   });
   if (!decision.save) {
     appendEvent(configHome(c), `the editor: ${decision.reason}`, Date.now(), { kind: 'credential-sync' });
+    // Its sign-ins are the person's own whoever the folder is signed in as, and go with the folder.
+    if (ending && holdsMcpLogins(text)) parkEditorMcpLogins(leaving, text, c);
     return;
   }
   if (!newer) {

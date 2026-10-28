@@ -1958,8 +1958,10 @@ describe('the MCP logins in the editor folder', () => {
       expect(profileLogin(s, 'A')).toBe(withMcp(held, mcpLogins(7)));
     });
 
-    it('are not parked in the saved login of an account the folder is not signed in as', async () => {
-      const { s } = await sameLoginOnA();
+    it('are parked all the same when the folder is signed in as someone else, and the account keeps its Claude login', async () => {
+      const { s, held } = await sameLoginOnA();
+      // B was signed in to in the editor's Claude: a newer login than A's, and not A's to be given.
+      writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('B', 2), MCP));
       const state = path.join(s.folder, '.claude.json');
       writeFileSync(
         state,
@@ -1971,7 +1973,42 @@ describe('the MCP logins in the editor folder', () => {
 
       expect(await editorCommand(s.context, 'off')).toBe(0);
 
-      expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+      expect(existsSync(s.folder)).toBe(false);
+      expect(tokenOf(profileLogin(s, 'A'))).toBe(tokenOf(held));
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual(MCP);
+    });
+
+    it('are parked all the same when the folder does not say who it is signed in as', async () => {
+      const { s, held } = await sameLoginOnA();
+      // A newer login that cannot be confirmed to be A's, so it is not saved home.
+      writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 2), MCP));
+      const state = path.join(s.folder, '.claude.json');
+      const unsigned = json(state);
+      delete unsigned.oauthAccount;
+      writeFileSync(state, JSON.stringify(unsigned));
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(existsSync(s.folder)).toBe(false);
+      expect(tokenOf(profileLogin(s, 'A'))).toBe(tokenOf(held));
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual(MCP);
+    });
+
+    it('are not parked from a refused folder that holds none, which leaves the saved login as it is', async () => {
+      const { s, held } = await sameLoginOnA();
+      writeFileSync(path.join(s.folder, '.credentials.json'), login('B', 2));
+      const state = path.join(s.folder, '.claude.json');
+      writeFileSync(
+        state,
+        JSON.stringify({
+          ...json(state),
+          oauthAccount: { emailAddress: emailOf('B'), accountUuid: 'uuid-B' },
+        }),
+      );
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(profileLogin(s, 'A')).toBe(withMcp(held, mcpLogins(7)));
     });
 
     it('are left to the saved login that holds them when the folder, whose login is newer, holds none', async () => {

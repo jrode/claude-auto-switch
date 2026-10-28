@@ -25,16 +25,15 @@ semantic versioning.
   Signing out of a server in one folder does not remove a sign-in another folder
   parked for it. A terminal session parks at its end, even when its Claude is
   signed out or signed in as someone else, and the editor's folder when it is
-  retired, even when its Claude login is no newer than the saved one. The
-  editor's folder is read in every Keychain item and file its editors' Claudes
-  keep a login in, where it used to be read in the first only, and the one read
-  first wins for a server more than one holds. A folder with no login yet starts
-  with what its account's saved login holds.
-  Each Keychain item of the editor's folder, whichever way an editor spells its
-  path, keeps its own. A login with no MCP sign-ins on either side is written
-  exactly as before. A login long enough to carry several goes in `security`'s
-  arguments, as since 2.6.26; docs/how-it-works.md says what that shows other
-  programs.
+  retired, even when its Claude login is no newer than the saved one or is not
+  the account's. The editor's folder is read in every Keychain item and file its
+  editors' Claudes keep a login in, where it used to be read in the first only,
+  and the one read first wins for a server more than one holds. A folder with no
+  login yet starts with what its account's saved login holds. Each Keychain item
+  of the editor's folder, whichever way an editor spells its path, keeps its
+  own. A login with no MCP sign-ins on either side is written exactly as before.
+  A login long enough to carry several goes in `security`'s arguments, as since
+  2.6.26; docs/how-it-works.md says what that shows other programs.
 - **A move that fails partway puts back what the folder held.** A terminal
   session's move was undone from the copy of the login kept at the last install,
   and none is kept when the folder holds no working login, so the undo could put
