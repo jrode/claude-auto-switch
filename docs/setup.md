@@ -50,6 +50,30 @@ runs it:
 (`pwsh` for PowerShell 7). Then run `ccx on` again. When Group Policy sets it,
 that command changes nothing, so doctor says to ask an administrator instead.
 
+## Conductor
+
+Conductor runs its own Claude. To run it through ccx, add one top-level line to
+`~/.conductor/settings.toml`, above any `[table]`:
+
+```toml
+claude_code_executable_path = "/absolute/path/to/ccx-claude"
+```
+
+Find the path with `command -v ccx-claude`. From then on:
+
+- Every Conductor chat runs on the editor's own folder, with your settings,
+  `CLAUDE.md`, skills, agents and history (see
+  [the editor's own folder](how-it-works.md#moving-a-session)). It is the folder
+  `ccx editor on` sets Cursor and VS Code up on, so the chats on it share one
+  account at a time.
+- When a chat meets a limit, ccx records it and moves the folder, and every chat
+  on it, to the next account. The turn that was refused stays refused, and the
+  next message you send goes out on the next account.
+- While a Conductor chat is open, `ccx off` and `ccx editor off` leave the folder
+  where it is. ccx removes it at a later event, once the chats have closed.
+
+To stop, remove the line.
+
 ## Finding Claude on Windows
 
 ccx starts Claude's own program, `claude.exe`, never npm's `claude.cmd`, which

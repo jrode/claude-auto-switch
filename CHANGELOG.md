@@ -4,6 +4,66 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.28]
+
+### Added
+
+- **Conductor's chats run through `ccx-claude`, on the editor's own folder.**
+  One top-level line in `~/.conductor/settings.toml`,
+  `claude_code_executable_path = "<path of ccx-claude>"`, runs every Conductor
+  chat through ccx (docs/setup.md). Both ways `ccx-claude` is started, as the
+  extension's `claudeProcessWrapper` and as Conductor's executable, now bring
+  the editor's folder up on the active account and run Claude on it, with your
+  settings, `CLAUDE.md`, skills, agents, MCP servers and history. Before, Claude
+  ran on the account's own folder, which holds only a login, so a chat lost all
+  of that and its history was split by account (#157, which #168 fixed for the
+  editor's setting but not for `ccx-claude`). Conductor's arguments reach Claude
+  untouched, and ccx writes nothing to Claude's standard output and holds no
+  standard input. Claude is given the folder as the editor's setting spells it,
+  or ccx's own path when none does, so every Claude on the folder keeps its
+  login in one Keychain item, and a renewal is never in a second one that the
+  next move would overwrite. ccx notes that spelling in the folder's record, so
+  editing the setting away by hand does not leave the item unread while that
+  Claude goes on using it.
+- **A launch through `ccx-claude` never waits long and never drops your setup.**
+  A chat that is starting makes one try at each step. It does not wait for ccx's
+  editor lock or for Claude's locks, and what it could not do then, a refresh or
+  the move to the active account, is left to the retry a refusal makes or to
+  ccx's next event. It runs on the editor's folder whenever that folder exists
+  and holds a working login. It runs on the account's own folder, as before,
+  only when there is no folder and none could be made, or the folder has no
+  working login to run on, and the event log says why.
+- **A limit a `ccx-claude` chat meets moves the editor to the next account at
+  once.** A confirmed limit used to set the active account for the next chat
+  only, and the chat that met it failed every turn until it was closed. ccx now
+  moves the editor's folder in place, so the open chat's next message goes out
+  on the next account; the turn that was refused stays refused. When Claude's
+  locks hold the move off, the next refusal for the limit already recorded tries
+  it again, no more than once every 20 s, and asks the usage endpoint nothing.
+
+### Fixed
+
+- **A refusal is judged against the account the editor's folder holds when it is
+  judged.** It used to be the account picked at launch, though other ccx
+  processes move the folder too. The usage check runs on that account's own
+  folder, never the editor's, whose login is renewed and replaced. A refusal that
+  comes within 40 s of a move may be the login the folder left, and is passed
+  over, so it costs no check and holds up no other. A renewal the editor's Claude
+  made of the account is taken home before the check. A limit the check confirms
+  is recorded even when the folder has moved off the account meanwhile, since
+  the check ran on that account's own login; only the pick of a next account and
+  the move are skipped then, and the event log says the editor had already moved.
+- **The editor's folder is not retired under a Conductor chat.** The extension's
+  chats are told by the record Claude keeps, which names the extension; a Claude
+  `ccx-claude` runs is now noted while it runs, with the folder it runs on, and
+  `ccx off`, `ccx editor off`, a retirement already pending and the take-over of
+  a folder ccx did not make wait for it. A note holds off only what is done to
+  its own folder, so a Conductor user who always has a chat open does not defer
+  the merge of an account's folder, or the removal of a folder ccx took over,
+  for ever. The note goes when `ccx-claude` ends however it ends, including when
+  it gives up on a Claude that will not end. A launch through `ccx-claude` clears
+  a retirement that is pending, as an editor setting naming the folder does.
+
 ## [2.6.27]
 
 ### Fixed

@@ -1,5 +1,14 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -8,6 +17,10 @@ import { addCommand } from '../../src/commands/add.js';
 import { loadConfig } from '../../src/config/config.js';
 import { getActive, setActive } from '../../src/state/active.js';
 import { markCapped, updateLedger } from '../../src/ledger/ledger.js';
+import { moveEditorToActive, retireEditor, setUpEditor } from '../../src/editor/folder.js';
+import { acquireOwnedLock } from '../../src/claude/locks.js';
+import { processIsAlive } from '../../src/session/lease.js';
+import { noteEditorChat } from '../../src/editor/editor-chats.js';
 import type { CliContext } from '../../src/context.js';
 import type { PathCtx } from '../../src/config/paths.js';
 import type { LimitProbeResult } from '../../src/usage/limit-probe.js';
@@ -18,7 +31,9 @@ import type { LimitProbeResult } from '../../src/usage/limit-probe.js';
  * a process of its own, through tsx, exactly as the extension runs it: its
  * standard input and output are the chat's, passed to Claude untouched, and
  * the fake claude stands in for the extension's Claude, taking turns as
- * stream-json on standard input and staying up across them.
+ * stream-json on standard input and staying up across them. Conductor starts
+ * ccx-claude the other way, with Claude's own arguments and no command before
+ * them; the same chats are run that way too.
  */
 
 const REPO = fileURLToPath(new URL('../..', import.meta.url));
@@ -75,6 +90,8 @@ async function until(ok: () => boolean, ms = 15_000): Promise<boolean> {
 interface LoggedEvent {
   msg: string;
   kind?: string;
+  /** How many times in a row the log folded this message into the one line. */
+  count?: number;
 }
 interface Cap {
   account: string;
@@ -94,6 +111,14 @@ const verdicts = (home: string): string[] =>
     .filter((e) => e.kind === 'cap-verify')
     .map((e) => e.msg);
 const said = (home: string, msg: string): number => eventsIn(home).filter((e) => e.msg === msg).length;
+/** How many times ccx said what `matches`, counting a message the log folded into one line for each time. */
+const timesSaid = (home: string, matches: RegExp): number =>
+  eventsIn(home)
+    .filter((e) => matches.test(e.msg))
+    .reduce((times, e) => times + (e.count ?? 1), 0);
+/** What ccx says when the editor has not been moved off the account yet: it moves at ccx's next event. */
+const NOT_MOVED_TO_B =
+  /^the editor has not moved to B yet: on A for now: .* ccx moves it at its next event$/;
 /** The `n`th verdict ccx gives on a refused turn, once it has given that many. */
 async function verdictNumber(home: string, n: number): Promise<string> {
   await until(() => verdicts(home).length >= n);
@@ -117,7 +142,32 @@ const resetOnLedger = (ctx: PathCtx, account: string): void => {
 };
 /** Whose login the usage check was asked with, in order. */
 const asked = (home: string): string[] => linesOf(path.join(home, 'asked.txt'));
-/** Let the usage endpoint give an answer that waits for `name` (see wrapperScript). */
+/** Each question put to the usage endpoint: whose login, the file it was asked with, and that file's access token. */
+const askedDetail = (
+  home: string,
+): Array<{ account: string; file: string; token: string | null }> =>
+  linesOf(path.join(home, 'asked.jsonl')).map(
+    (l) => JSON.parse(l) as { account: string; file: string; token: string | null },
+  );
+/** Which account the editor's folder holds, and since when, by ccx's record in it. */
+const editorRecord = (home: string): { account: string | null; loginChangedAt: number } | null => {
+  try {
+    return JSON.parse(
+      readFileSync(path.join(home, 'editor-active', '.ccx-editor.json'), 'utf8'),
+    ) as {
+      account: string | null;
+      loginChangedAt: number;
+    };
+  } catch {
+    return null;
+  }
+};
+/** Claude's own lock on its login in the editor's folder, taken as it is while Claude renews a login: a move of the editor waits for it. */
+const claudeHoldsItsLogin = (home: string): void =>
+  mkdirSync(path.join(home, 'editor-active', '.oauth_refresh.lock'));
+const claudeLetsGo = (home: string): void =>
+  rmSync(path.join(home, 'editor-active', '.oauth_refresh.lock'), { recursive: true, force: true });
+/** Let the usage endpoint give an answer that waits for `name` (see launchScript). */
 const release = (home: string, name = 'release'): void => writeFileSync(path.join(home, name), '', 'utf8');
 /** Claude's own record of another process of its on `conversation`, in the shared folder: this test's own process stands in for it. */
 function otherClaudeOn(home: string, conversation: string): void {
@@ -128,14 +178,32 @@ function otherClaudeOn(home: string, conversation: string): void {
     'utf8',
   );
 }
-const recordOf = (home: string, account: string, conversation: string): string =>
-  path.join(home, 'profiles', account, 'projects', 'fake-project', `${conversation}.jsonl`);
+/** A conversation's record, in your own projects folder, which the editor's folder links. */
+const recordOf = (home: string, conversation: string): string =>
+  path.join(home, '.claude', 'projects', 'fake-project', `${conversation}.jsonl`);
 
-/** Accounts A and B, both signed in, the editor on A, and the usage endpoint answering as given. */
+const HOURS = 3_600_000;
+/** A login of `name`'s, generation `gen`: a renewal is the next generation, with a later expiry. The fake claude reads whose it is from `account`. */
+const loginOf = (name: string, gen: number): string =>
+  JSON.stringify({
+    account: name,
+    claudeAiOauth: {
+      accessToken: `a-${name}-${gen}`,
+      refreshToken: `r-${name}-${gen}`,
+      expiresAt: Date.now() + (8 + gen) * HOURS,
+    },
+  });
+
+/**
+ * Accounts A and B, both signed in, the editor on A, and the usage endpoint
+ * answering as given. With `realLogins`, each has a login with tokens, an
+ * email and an identity, as ccx needs to take a renewal home.
+ */
 async function twoAccounts(
   prefix: string,
   usage: Record<string, Answer[]>,
-): Promise<{ home: string; ctx: PathCtx }> {
+  options: { realLogins?: boolean } = {},
+): Promise<{ home: string; ctx: PathCtx; context: CliContext }> {
   const home = mkdtempSync(path.join(tmpdir(), prefix));
   const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };
   const context: CliContext = {
@@ -149,9 +217,28 @@ async function twoAccounts(
   };
   for (const name of ['A', 'B']) {
     const dir = path.join(home, 'profiles', name);
-    await addCommand(context, name, { dir, login: false });
+    const email = `${name.toLowerCase()}@example.com`;
+    await addCommand(context, name, {
+      dir,
+      login: false,
+      ...(options.realLogins ? { email } : {}),
+    });
     mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, '.credentials.json'), JSON.stringify({ account: name }), 'utf8');
+    writeFileSync(
+      path.join(dir, '.credentials.json'),
+      options.realLogins ? loginOf(name, 1) : JSON.stringify({ account: name }),
+      'utf8',
+    );
+    if (options.realLogins) {
+      writeFileSync(
+        path.join(dir, '.claude.json'),
+        JSON.stringify({
+          oauthAccount: { emailAddress: email, accountUuid: `uuid-${name}` },
+          userID: `user-${name}`,
+        }),
+        'utf8',
+      );
+    }
     writeFileSync(
       path.join(dir, 'fake-scenario.json'),
       JSON.stringify({ authStatus: { loggedIn: true, subscriptionType: 'max', email: `${name}@example.com` } }),
@@ -160,37 +247,47 @@ async function twoAccounts(
   }
   setActive('A', ctx);
   writeFileSync(path.join(home, 'usage.json'), JSON.stringify(usage), 'utf8');
-  return { home, ctx };
+  return { home, ctx, context };
 }
 
+/** How ccx-claude is started: as the editor's extension does (`<claude> ...args`), or as Conductor does (`...claude args`). */
+type Mode = 'wrapper' | 'direct';
+
 /**
- * The wrapper as the extension starts it, in a process of its own: ccx's
- * wrapperLaunch on `<claude> ...args`, with the usage endpoint answering from
+ * ccx-claude as it is started, in a process of its own: ccx's wrapperLaunch
+ * on `<claude> ...args` (the extension), or editorLaunch on `...args`
+ * (Conductor), with the usage endpoint answering from
  * `usage.json` (each account's answers in turn, the last one standing; one
  * with `waitFor` answers once that file appears in the home folder) and the
- * fake claude, which runs as `node`, counted as a Claude. It reads Claude's
+ * fake claude, which runs as `node`, counted as a Claude. Each question put to
+ * the usage endpoint is logged in `asked.txt` (whose login it was) and
+ * `asked.jsonl` (the file and token as well). It reads Claude's
  * records every 100 ms, or every EDITOR_FOLLOW_MS, and holds refused turns
  * back for 20 s after a check that confirms nothing, as production does, or
- * for EDITOR_REFUTE_BACKOFF_MS.
+ * for EDITOR_REFUTE_BACKOFF_MS. A move of the editor's login waits for Claude's
+ * locks for EDITOR_MOVE_RETRY_MS, as production does for 10 s.
  */
-function wrapperScript(home: string): string {
-  const script = path.join(home, 'editor-wrapper.mts');
+function launchScript(home: string, mode: Mode): string {
+  const script = path.join(home, `editor-${mode}.mts`);
   const source = (...parts: string[]): string => JSON.stringify(pathToFileURL(path.join(REPO, ...parts)).href);
   writeFileSync(
     script,
     [
-      `import { appendFileSync, existsSync, readFileSync } from 'node:fs';`,
+      `import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';`,
       `import { EOL } from 'node:os';`,
       `import path from 'node:path';`,
-      `import { wrapperLaunch } from ${source('src', 'commands', 'editor-launch.ts')};`,
+      `import { editorLaunch, wrapperLaunch } from ${source('src', 'commands', 'editor-launch.ts')};`,
       `import { loadConfig } from ${source('src', 'config', 'config.ts')};`,
       `import { processIsAlive } from ${source('src', 'session', 'lease.ts')};`,
       `const [home, fake, ...claudeArgs] = process.argv.slice(2);`,
       `const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };`,
       `const answers = JSON.parse(readFileSync(path.join(home, 'usage.json'), 'utf8'));`,
       `const probe = async (credentialsFile) => {`,
-      `  const account = JSON.parse(readFileSync(credentialsFile, 'utf8')).account ?? '?';`,
+      `  const login = JSON.parse(readFileSync(credentialsFile, 'utf8'));`,
+      `  const account = login.account ?? '?';`,
       `  appendFileSync(path.join(home, 'asked.txt'), account + EOL);`,
+      `  const token = login.claudeAiOauth?.accessToken ?? null;`,
+      `  appendFileSync(path.join(home, 'asked.jsonl'), JSON.stringify({ account, file: credentialsFile, token }) + EOL);`,
       `  const queue = answers[account] ?? [];`,
       `  const answer = (queue.length > 1 ? queue.shift() : queue[0]) ?? { verdict: 'allowed', fiveHour: 0.1, sevenDay: 0.1 };`,
       `  const until = Date.now() + 30000;`,
@@ -199,11 +296,26 @@ function wrapperScript(home: string): string {
       `  }`,
       `  return answer;`,
       `};`,
+      // Whose a login is, as the API would say: by the account its token was made for.
+      `const lookupOwner = async (dir) => {`,
+      `  try {`,
+      `    const token = JSON.parse(readFileSync(path.join(dir, '.credentials.json'), 'utf8')).claudeAiOauth?.accessToken ?? '';`,
+      `    const named = /^a-([A-Za-z]+)-/.exec(token);`,
+      `    return named ? named[1].toLowerCase() + '@example.com' : null;`,
+      `  } catch {`,
+      `    return null;`,
+      `  }`,
+      `};`,
       `const context = { ctx, config: loadConfig(ctx), claude: { bin: process.execPath, prefixArgs: [fake] },`,
-      `  capProbe: probe, isClaudeProcess: processIsAlive, editorFollowMs: Number(process.env.EDITOR_FOLLOW_MS) || 100,`,
+      `  capProbe: probe, lookupOwner, isClaudeProcess: processIsAlive, editorFollowMs: Number(process.env.EDITOR_FOLLOW_MS) || 100,`,
       `  refuteBackoffMs: Number(process.env.EDITOR_REFUTE_BACKOFF_MS) || undefined,`,
+      `  editorMoveRetryMs: Number(process.env.EDITOR_MOVE_RETRY_MS) || undefined,`,
       `  out: () => {}, err: () => {}, json: false, quiet: false };`,
-      `process.exit(await wrapperLaunch(context, [process.execPath, fake, ...claudeArgs]));`,
+      // When the launch is called, so a test can tell how long it took to start Claude apart from tsx's own start.
+      `writeFileSync(path.join(home, 'called.txt'), String(Date.now()));`,
+      mode === 'wrapper'
+        ? `process.exit(await wrapperLaunch(context, [process.execPath, fake, ...claudeArgs]));`
+        : `process.exit(await editorLaunch(context, claudeArgs));`,
     ].join('\n'),
     'utf8',
   );
@@ -233,16 +345,31 @@ interface Chat {
   signal(signal: NodeJS.Signals): void;
   /** The wrapper's exit code, once it has exited. */
   exited: Promise<number | null>;
+  /** Whether Claude has come up, within a while: it says so as it starts. */
+  up(): Promise<boolean>;
+  /** Every line Claude wrote to standard output, as it came through the wrapper. */
+  stdout: string[];
+  /** The result of each turn Claude has answered, in order. */
+  results(): Array<{ is_error?: boolean }>;
 }
 
 const opened: ChildProcess[] = [];
 
-function openChat(home: string, chatArgs: string[], env: Record<string, string> = {}): Chat {
-  const child = spawn(TSX, [wrapperScript(home), home, fakeClaude, ...EXTENSION_ARGS, ...chatArgs], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    shell: process.platform === 'win32',
-    env: { ...process.env, ...EDITOR_CLAUDE, ...env },
-  });
+function openChat(
+  home: string,
+  chatArgs: string[],
+  env: Record<string, string> = {},
+  mode: Mode = 'wrapper',
+): Chat {
+  const child = spawn(
+    TSX,
+    [launchScript(home, mode), home, fakeClaude, ...EXTENSION_ARGS, ...chatArgs],
+    {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: process.platform === 'win32',
+      env: { ...process.env, ...EDITOR_CLAUDE, ...env },
+    },
+  );
   opened.push(child);
   let exitCode: number | null | undefined;
   const exited = new Promise<number | null>((resolve) =>
@@ -251,7 +378,9 @@ function openChat(home: string, chatArgs: string[], env: Record<string, string> 
       resolve(code);
     }),
   );
-  const results: unknown[] = [];
+  const results: Array<{ is_error?: boolean }> = [];
+  const stdout: string[] = [];
+  let started = false;
   let unread = '';
   child.stdout?.setEncoding('utf8');
   child.stdout?.on('data', (chunk: string) => {
@@ -259,9 +388,11 @@ function openChat(home: string, chatArgs: string[], env: Record<string, string> 
     for (let end = unread.indexOf('\n'); end !== -1; end = unread.indexOf('\n')) {
       const line = unread.slice(0, end).trim();
       unread = unread.slice(end + 1);
+      if (line !== '') stdout.push(line);
       try {
-        const event = JSON.parse(line) as { type?: unknown };
+        const event = JSON.parse(line) as { type?: unknown; subtype?: unknown; is_error?: boolean };
         if (event.type === 'result') results.push(event);
+        if (event.type === 'system' && event.subtype === 'init') started = true;
       } catch {
         /* not an event */
       }
@@ -293,6 +424,9 @@ function openChat(home: string, chatArgs: string[], env: Record<string, string> 
       child.kill(signal);
     },
     exited,
+    up: () => until(() => started),
+    stdout,
+    results: () => results,
   };
 }
 
@@ -322,7 +456,7 @@ describe('an editor chat that meets a limit while the usage check is turned away
       const chat = openChat(home, [], { FAKE_CLAUDE_RESETS_AT: String(resetsAt) });
       chat.send('hello');
       expect(await chat.answered(1)).toBe(true);
-      await until(() => getActive(ctx) === 'B');
+      await until(() => said(home, 'the editor moved to B') === 1);
 
       // Before the chat ends: its one Claude is still answering turns.
       expect(chat.running()).toBe(true);
@@ -331,7 +465,7 @@ describe('an editor chat that meets a limit while the usage check is turned away
       expect(getActive(ctx)).toBe('B');
       expect(asked(home)).toEqual(['A']);
       expect(verdicts(home)).toEqual([expect.stringMatching(confirmedByRefusal('five_hour'))]);
-      expect(said(home, 'next editor chat will use B')).toBe(1);
+      expect(said(home, 'the editor moved to B')).toBe(1);
 
       expect(await chat.close()).toBe(0);
       expect(capsIn(home)).toHaveLength(1);
@@ -345,7 +479,7 @@ describe('an editor chat that meets a limit while the usage check is turned away
       const { home, ctx } = await twoAccounts('cas-editor-resumed-', { A: [TURNED_AWAY] });
       // Earlier turns of the chat: a refusal an hour ago, and one half a minute
       // ago, before this Claude started, on another process now gone.
-      const record = recordOf(home, 'A', RESUMED);
+      const record = recordOf(home, RESUMED);
       mkdirSync(path.dirname(record), { recursive: true });
       const old = (agoMs: number): string =>
         `${JSON.stringify({
@@ -406,8 +540,12 @@ describe('an editor chat that meets a limit while the usage check is turned away
 
       expect(chat.running()).toBe(true);
       // The turn refused for a limit ccx can name is in the new conversation's record only.
-      expect(readFileSync(recordOf(home, 'A', CLEARED), 'utf8')).toContain('"rateLimitType":"five_hour"');
-      expect(readFileSync(recordOf(home, 'A', NEW_CHAT), 'utf8')).not.toContain('"rateLimitType":"five_hour"');
+      expect(readFileSync(recordOf(home, CLEARED), 'utf8')).toContain(
+        '"rateLimitType":"five_hour"',
+      );
+      expect(readFileSync(recordOf(home, NEW_CHAT), 'utf8')).not.toContain(
+        '"rateLimitType":"five_hour"',
+      );
       expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A' })]);
       expect(getActive(ctx)).toBe('B');
       expect(verdicts(home)[1]).toMatch(confirmedByRefusal('five_hour'));
@@ -493,25 +631,32 @@ describe('an editor chat that meets a limit while the usage check is turned away
     );
   });
 
-  it('records a limit once, however many turns Claude refuses on it', { timeout: 60_000 }, async () => {
-    const { home, ctx } = await twoAccounts('cas-editor-twice-', { A: [TURNED_AWAY] });
-    const chat = openChat(home, []);
-    chat.send('hello');
-    expect(await chat.answered(1)).toBe(true);
-    await until(() => getActive(ctx) === 'B');
-    // The person tries again on the same Claude, and it is refused again.
-    chat.send('please');
-    expect(await chat.answered(2)).toBe(true);
-    // Long enough for ccx to have read that refusal several times over.
-    await sleep(1_000);
+  it(
+    'records a limit once, however many turns Claude refuses on it',
+    { timeout: 60_000 },
+    async () => {
+      const { home, ctx } = await twoAccounts('cas-editor-twice-', { A: [TURNED_AWAY] });
+      // Claude keeps the login it had for a request more after the editor moves, as it does for up to 30 s.
+      const chat = openChat(home, [], { FAKE_CLAUDE_OLD_LOGIN_REQUESTS: '1' });
+      chat.send('hello');
+      expect(await chat.answered(1)).toBe(true);
+      await until(() => said(home, 'the editor moved to B') === 1);
+      expect(getActive(ctx)).toBe('B');
+      // The person tries again on the same Claude, and it is refused again.
+      chat.send('please');
+      expect(await chat.answered(2)).toBe(true);
+      // Long enough for ccx to have read that refusal several times over.
+      await sleep(1_000);
 
-    expect(asked(home)).toEqual(['A']);
-    expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A' })]);
-    expect(said(home, 'A hit its limit (editor)')).toBe(1);
-    expect(said(home, 'next editor chat will use B')).toBe(1);
-    expect(await chat.close()).toBe(0);
-    expect(said(home, 'A hit its limit (editor)')).toBe(1);
-  });
+      expect(asked(home)).toEqual(['A']);
+      expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A' })]);
+      expect(chat.results()[1]?.is_error).toBe(true);
+      expect(said(home, 'A hit its limit (editor)')).toBe(1);
+      expect(said(home, 'the editor moved to B')).toBe(1);
+      expect(await chat.close()).toBe(0);
+      expect(said(home, 'A hit its limit (editor)')).toBe(1);
+    },
+  );
 
   it(
     "records a limit once when the record proved it and Claude's last words show it",
@@ -525,7 +670,11 @@ describe('an editor chat that meets a limit while the usage check is turned away
         FAKE_CLAUDE_RESETS_AT: String(resetsAt),
         FAKE_CLAUDE_LAST_WORDS: "You've hit your session limit. Run /usage-credits to continue.",
         FAKE_CLAUDE_EXIT_CODE: '1',
+        EDITOR_MOVE_RETRY_MS: '300',
       });
+      expect(await chat.up()).toBe(true);
+      // The editor stays on A, where the words at the end are about, while Claude holds its login's lock.
+      claudeHoldsItsLogin(home);
       chat.send('hello');
       expect(await chat.answered(1)).toBe(true);
       await until(() => getActive(ctx) === 'B');
@@ -536,7 +685,7 @@ describe('an editor chat that meets a limit while the usage check is turned away
       expect(asked(home)).toEqual(['A']);
       expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A', capUntil: resetsAt * 1000 })]);
       expect(said(home, 'A hit its limit (editor)')).toBe(1);
-      expect(said(home, 'next editor chat will use B')).toBe(1);
+      expect(timesSaid(home, NOT_MOVED_TO_B)).toBe(1);
     },
   );
 
@@ -567,6 +716,8 @@ describe('an editor chat that meets a limit while the usage check is turned away
         expect.objectContaining({ account: 'A', model: 'Opus', capUntil: resetsAt * 1000 }),
       ]);
       expect(said(home, 'A hit its limit (editor)')).toBe(1);
+      // A's other models still work, so it is the account the editor stays on.
+      expect(said(home, 'the editor stays on A')).toBe(1);
     },
   );
 
@@ -603,13 +754,16 @@ describe('an editor chat that meets a limit while the usage check is turned away
       // An editor's Claude outlives a limit: refused at 10:00 for one that
       // resets at 15:00, and at 18:00 for the next, on the same Claude.
       const { home, ctx } = await twoAccounts('cas-editor-again-', { A: [TURNED_AWAY] });
-      const chat = openChat(home, []);
+      const chat = openChat(home, [], { EDITOR_MOVE_RETRY_MS: '300' });
+      expect(await chat.up()).toBe(true);
+      // The editor stays on A while Claude holds its login's lock, so this Claude meets the limit again.
+      claudeHoldsItsLogin(home);
       // Far enough out to hold however slowly the first turn is judged.
       const first = Math.floor(Date.now() / 1000) + 2 * 60 * 60;
       chat.send('hello', { resetsAt: first });
       expect(await chat.answered(1)).toBe(true);
       expect(await verdictNumber(home, 1)).toMatch(confirmedByRefusal('five_hour'));
-      expect(await until(() => said(home, 'next editor chat will use B') === 1)).toBe(true);
+      expect(await until(() => timesSaid(home, NOT_MOVED_TO_B) === 1)).toBe(true);
       expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A', capUntil: first * 1000 })]);
 
       resetOnLedger(ctx, 'A');
@@ -636,13 +790,17 @@ describe('an editor chat that meets a limit while the usage check is turned away
       const chat = openChat(home, [], {
         FAKE_CLAUDE_LAST_WORDS: "You've hit your session limit. Run /usage-credits to continue.",
         FAKE_CLAUDE_EXIT_CODE: '1',
+        EDITOR_MOVE_RETRY_MS: '300',
       });
+      expect(await chat.up()).toBe(true);
+      // The editor stays on A, where the words at the end are about, while Claude holds its login's lock.
+      claudeHoldsItsLogin(home);
       // Far enough out to hold however slowly the first turn is judged.
       const first = Math.floor(Date.now() / 1000) + 2 * 60 * 60;
       chat.send('hello', { resetsAt: first });
       expect(await chat.answered(1)).toBe(true);
       expect(await verdictNumber(home, 1)).toMatch(confirmedByRefusal('five_hour'));
-      expect(await until(() => said(home, 'next editor chat will use B') === 1)).toBe(true);
+      expect(await until(() => timesSaid(home, NOT_MOVED_TO_B) === 1)).toBe(true);
       resetOnLedger(ctx, 'A');
 
       expect(await chat.close()).toBe(1);
@@ -812,6 +970,545 @@ describe('an editor chat that meets a limit while the usage check is turned away
   );
 });
 
+/** The editor's folder, where ccx-claude runs every chat's Claude. */
+const editorFolder = (home: string): string => path.join(home, 'editor-active');
+const isRealFolder = (dir: string): boolean => {
+  try {
+    const stat = lstatSync(dir);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+};
+interface Launch {
+  at: number;
+  pid: number;
+  args: string[];
+  applied: { print: boolean; sessionId: string | null };
+  folder: { configDir: string | null; settings: unknown };
+}
+/** When ccx-claude's launch was called (see launchScript). */
+const calledAt = (home: string): number =>
+  Number(readFileSync(path.join(home, 'called.txt'), 'utf8'));
+/** How long a launch may take to start Claude, when it must not wait for a lock: it once waited 10 s for each. */
+const LAUNCH_MS = 3_000;
+/** Each Claude the fake claude logged starting (FAKE_CLAUDE_RUNS_LOG), with the folder it runs in (FAKE_CLAUDE_LOG_FOLDER). */
+const launchesIn = (runsLog: string): Launch[] =>
+  linesOf(runsLog)
+    .map((l) => JSON.parse(l) as Launch & { type: string })
+    .filter((e) => e.type === 'launch');
+const LOG_LAUNCH = (home: string): Record<string, string> => ({
+  FAKE_CLAUDE_RUNS_LOG: path.join(home, 'runs.jsonl'),
+  FAKE_CLAUDE_LOG_FOLDER: '1',
+});
+
+describe.each<Mode>(['wrapper', 'direct'])(
+  'a chat started through ccx-claude (%s mode)',
+  (mode) => {
+    afterEach(() => {
+      for (const child of opened.splice(0)) {
+        child.stdin?.end();
+        if (child.exitCode === null) child.kill();
+      }
+    });
+
+    it(
+      "runs Claude on the editor's folder, and keeps the folder from being retired while it runs",
+      { timeout: 60_000 },
+      async () => {
+        const { home, context } = await twoAccounts('cas-editor-on-folder-', { A: [ROOM] });
+        const folder = editorFolder(home);
+        const chat = openChat(home, [], { FAKE_CLAUDE_REFUSE_ON: '', ...LOG_LAUNCH(home) }, mode);
+        chat.send('hello');
+        expect(await chat.answered(1)).toBe(true);
+
+        expect(launchesIn(path.join(home, 'runs.jsonl'))[0]?.folder.configDir).toBe(
+          realpathSync(folder),
+        );
+        // It is an editor chat open in the folder: a retirement waits for it, as it does for the extension's.
+        expect(retireEditor(context)).toBe('held');
+        expect(isRealFolder(folder)).toBe(true);
+
+        expect(await chat.close()).toBe(0);
+        expect(retireEditor(context)).toBe('retired');
+        expect(existsSync(folder)).toBe(false);
+      },
+    );
+
+    it(
+      'clears a retirement of the folder that is pending, and runs on the folder',
+      { timeout: 60_000 },
+      async () => {
+        const { home, context } = await twoAccounts('cas-editor-pending-', { A: [ROOM] });
+        const folder = editorFolder(home);
+        // The folder, with its retirement held off for as long as something counts as an editor chat open in it.
+        await setUpEditor(context);
+        // A running chat started before the check; retireEditor skips one started at or after it.
+        const chatEnded = noteEditorChat(context.ctx, process.pid, folder, Date.now() - 1_000);
+        expect(retireEditor(context)).toBe('held');
+        chatEnded();
+        const pending = path.join(home, 'editor-retire.json');
+        expect(existsSync(pending)).toBe(true);
+
+        const chat = openChat(home, [], { FAKE_CLAUDE_REFUSE_ON: '', ...LOG_LAUNCH(home) }, mode);
+        chat.send('hello');
+        expect(await chat.answered(1)).toBe(true);
+
+        expect(existsSync(pending)).toBe(false);
+        expect(launchesIn(path.join(home, 'runs.jsonl'))[0]?.folder.configDir).toBe(
+          realpathSync(folder),
+        );
+        expect(await chat.close()).toBe(0);
+        expect(isRealFolder(folder)).toBe(true);
+      },
+    );
+
+    it(
+      'starts Claude on the editor folder at once while another ccx holds the editor lock, with your setup in it',
+      { timeout: 60_000 },
+      async () => {
+        const { home, context } = await twoAccounts('cas-editor-locked-', { A: [ROOM] });
+        mkdirSync(path.join(home, '.claude'), { recursive: true });
+        writeFileSync(
+          path.join(home, '.claude', 'settings.json'),
+          JSON.stringify({ model: 'fable' }),
+          'utf8',
+        );
+        await setUpEditor(context);
+        // Another ccx is changing the folder, and goes on holding its lock for as long as this launch runs.
+        const lock = acquireOwnedLock(path.join(home, 'editor-folder.lock'), {
+          waitMs: 0,
+          staleMs: 60_000,
+          maxHoldMs: 60_000,
+        });
+        expect(lock.held).toBe(true);
+        try {
+          const chat = openChat(home, [], { FAKE_CLAUDE_REFUSE_ON: '', ...LOG_LAUNCH(home) }, mode);
+          expect(await chat.up()).toBe(true);
+
+          // It once waited 10 s for the lock and then ran on the account's own folder, which has none of your setup.
+          const [launch] = launchesIn(path.join(home, 'runs.jsonl'));
+          expect(launch!.at - calledAt(home)).toBeLessThan(LAUNCH_MS);
+          expect(launch?.folder.configDir).toBe(realpathSync(editorFolder(home)));
+          expect(launch?.folder.settings).toEqual({ model: 'fable' });
+          expect(await chat.close()).toBe(0);
+        } finally {
+          lock.release();
+        }
+      },
+    );
+
+    it(
+      'starts Claude at once when the move to the active account waits on Claude, and leaves that move pending',
+      { timeout: 60_000 },
+      async () => {
+        const { home, ctx, context } = await twoAccounts('cas-editor-launch-wait-', { A: [ROOM] });
+        // The folder is on A, B has been made active since, and Claude holds its login's lock.
+        await setUpEditor(context);
+        setActive('B', ctx);
+        claudeHoldsItsLogin(home);
+
+        // A move under a running Claude looks for its lock for 10 s; a launch looks once.
+        const chat = openChat(
+          home,
+          [],
+          { FAKE_CLAUDE_REFUSE_ON: '', EDITOR_MOVE_RETRY_MS: '8000', ...LOG_LAUNCH(home) },
+          mode,
+        );
+        expect(await chat.up()).toBe(true);
+
+        const [launch] = launchesIn(path.join(home, 'runs.jsonl'));
+        expect(launch!.at - calledAt(home)).toBeLessThan(LAUNCH_MS);
+        expect(launch?.folder.configDir).toBe(realpathSync(editorFolder(home)));
+        // The editor stays on A, and the move waits for a later event.
+        expect(editorRecord(home)?.account).toBe('A');
+        expect(existsSync(path.join(home, 'editor-move-pending.json'))).toBe(true);
+        expect(await chat.close()).toBe(0);
+      },
+    );
+  },
+);
+
+describe('a chat started the way Conductor starts Claude (against fake-claude)', () => {
+  afterEach(() => {
+    for (const child of opened.splice(0)) {
+      child.stdin?.end();
+      if (child.exitCode === null) child.kill();
+    }
+  });
+
+  it(
+    "passes its command line to Claude untouched, and writes nothing to Claude's standard output",
+    { timeout: 60_000 },
+    async () => {
+      const { home } = await twoAccounts('cas-conductor-args-', { A: [ROOM] });
+      const conductorArgs = [`--session-id=${NEW_CHAT}`, '--setting-sources=user,project,local'];
+      const chat = openChat(
+        home,
+        conductorArgs,
+        { FAKE_CLAUDE_REFUSE_ON: '', ...LOG_LAUNCH(home) },
+        'direct',
+      );
+      chat.send('hello');
+      expect(await chat.answered(1)).toBe(true);
+      expect(await chat.close()).toBe(0);
+
+      const [launch] = launchesIn(path.join(home, 'runs.jsonl'));
+      expect(launch?.args).toEqual([...EXTENSION_ARGS, ...conductorArgs]);
+      expect(launch?.applied.print).toBe(false);
+      expect(launch?.applied.sessionId).toBe(NEW_CHAT);
+      expect(launch?.folder.configDir).toBe(realpathSync(editorFolder(home)));
+      // Every line on standard output is one of Claude's own events.
+      expect(chat.stdout.length).toBeGreaterThan(0);
+      for (const line of chat.stdout) {
+        expect(['system', 'assistant', 'result']).toContain(
+          (JSON.parse(line) as { type: string }).type,
+        );
+      }
+    },
+  );
+});
+
+/** The limit on `account`, as another session's confirmed check puts it on the ledger. */
+const limitOn = (ctx: PathCtx, account: string): void => {
+  updateLedger(ctx, (ledger) =>
+    markCapped(ledger, {
+      account,
+      now: Date.now(),
+      resetAt: Date.now() + 2 * HOURS,
+      reason: 'another session',
+    }),
+  );
+};
+
+describe.each<Mode>(['wrapper', 'direct'])(
+  'a limit met in a chat started through ccx-claude (%s mode)',
+  (mode) => {
+    afterEach(() => {
+      for (const child of opened.splice(0)) {
+        child.stdin?.end();
+        if (child.exitCode === null) child.kill();
+      }
+    });
+
+    it(
+      'moves the editor to the next account while the chat stays open, so its next message goes out there',
+      { timeout: 60_000 },
+      async () => {
+        const resetsAt = Math.floor(Date.now() / 1000) + 2 * 60 * 60;
+        const { home, ctx } = await twoAccounts('cas-editor-moves-', { A: [TURNED_AWAY] });
+        const chat = openChat(home, [], { FAKE_CLAUDE_RESETS_AT: String(resetsAt) }, mode);
+        chat.send('hello');
+        expect(await chat.answered(1)).toBe(true);
+        await until(() => said(home, 'the editor moved to B') === 1);
+
+        // The chat that met the limit is still open, and the editor's folder is on B.
+        expect(chat.running()).toBe(true);
+        expect(capsIn(home)).toEqual([
+          expect.objectContaining({ account: 'A', capUntil: resetsAt * 1000 }),
+        ]);
+        expect(getActive(ctx)).toBe('B');
+        expect(editorRecord(home)?.account).toBe('B');
+        const login = JSON.parse(
+          readFileSync(path.join(home, 'editor-active', '.credentials.json'), 'utf8'),
+        ) as {
+          account: string;
+        };
+        expect(login.account).toBe('B');
+        expect(said(home, 'A hit its limit (editor)')).toBe(1);
+        expect(said(home, 'the editor moved to B')).toBe(1);
+        expect(said(home, 'next editor chat will use B')).toBe(0);
+
+        // The refused turn stays refused, and the next message goes out on B.
+        chat.send('please');
+        expect(await chat.answered(2)).toBe(true);
+        expect(chat.results().map((result) => result.is_error)).toEqual([true, false]);
+        expect(asked(home)).toEqual(['A']);
+        expect(await chat.close()).toBe(0);
+      },
+    );
+
+    it(
+      'passes over a refusal that comes just after the editor moved, which may be the login it left',
+      { timeout: 60_000 },
+      async () => {
+        const { home } = await twoAccounts('cas-editor-left-', { A: [TURNED_AWAY] });
+        // Claude keeps the login it had for a request more after the editor moves, as it does for up to 30 s.
+        const chat = openChat(home, [], { FAKE_CLAUDE_OLD_LOGIN_REQUESTS: '1' }, mode);
+        chat.send('hello');
+        expect(await chat.answered(1)).toBe(true);
+        await until(() => editorRecord(home)?.account === 'B');
+        chat.send('again');
+        expect(await chat.answered(2)).toBe(true);
+        chat.send('once more');
+        expect(await chat.answered(3)).toBe(true);
+        // Long enough for ccx to have read that refusal several times over.
+        await sleep(1_000);
+
+        // Refused on the login Claude still held, then answered on B's.
+        expect(chat.results().map((result) => result.is_error)).toEqual([true, true, false]);
+        expect(
+          timesSaid(
+            home,
+            /^Claude recorded a refused turn in the editor, but not asking about it: the refusal came within 40 s of the login changing under Claude, so it may be the old login$/,
+          ),
+        ).toBe(1);
+        // No check was made for B, which has room, and none was left to be made as Claude ends.
+        expect(asked(home)).toEqual(['A']);
+        expect(verdicts(home)).toHaveLength(1);
+        expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A' })]);
+        expect(await chat.close()).toBe(0);
+        expect(asked(home)).toEqual(['A']);
+      },
+    );
+
+    it(
+      'asks, for a refusal after the editor moved, the account the editor holds now, with its own login',
+      { timeout: 60_000 },
+      async () => {
+        const { home, ctx, context } = await twoAccounts('cas-editor-holder-', {
+          B: [TURNED_AWAY],
+        });
+        // The editor's folder is on B while A is the account this launch picks: the move to A waits on Claude's lock.
+        setActive('B', ctx);
+        await setUpEditor(context);
+        setActive('A', ctx);
+        claudeHoldsItsLogin(home);
+        const chat = openChat(
+          home,
+          [],
+          { FAKE_CLAUDE_REFUSE_ON: 'B', EDITOR_MOVE_RETRY_MS: '300' },
+          mode,
+        );
+        chat.send('hello');
+        expect(await chat.answered(1)).toBe(true);
+        await until(() => capsIn(home).length > 0);
+
+        // B's login was refused, so B is asked about, by its own profile folder's login, and B is what is recorded.
+        expect(asked(home)).toEqual(['B']);
+        expect(realpathSync(askedDetail(home)[0]!.file)).toBe(
+          realpathSync(path.join(home, 'profiles', 'B', '.credentials.json')),
+        );
+        expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'B' })]);
+        expect(await chat.close()).toBe(0);
+      },
+    );
+
+    it(
+      'takes home a renewal the editor made of the account before it asks that account about a limit',
+      { timeout: 60_000 },
+      async () => {
+        const { home } = await twoAccounts(
+          'cas-editor-renewal-',
+          { A: [TURNED_AWAY] },
+          { realLogins: true },
+        );
+        const chat = openChat(home, [], {}, mode);
+        expect(await chat.up()).toBe(true);
+        // The editor's Claude renews A's login in its folder, a generation on.
+        writeFileSync(
+          path.join(home, 'editor-active', '.credentials.json'),
+          loginOf('A', 2),
+          'utf8',
+        );
+        chat.send('hello');
+        expect(await chat.answered(1)).toBe(true);
+        await until(() => askedDetail(home).length === 1);
+
+        // The check ran on the renewed login, not the one it retired.
+        expect(askedDetail(home).map((question) => question.token)).toEqual(['a-A-2']);
+        expect(await chat.close()).toBe(0);
+      },
+    );
+
+    it(
+      'asks, about the words Claude ends on, the account the editor holds by then',
+      { timeout: 60_000 },
+      async () => {
+        const { home } = await twoAccounts('cas-editor-words-held-', { A: [TURNED_AWAY] });
+        const chat = openChat(
+          home,
+          [],
+          {
+            FAKE_CLAUDE_LAST_WORDS:
+              "You've hit your session limit. Run /usage-credits to continue.",
+            FAKE_CLAUDE_EXIT_CODE: '1',
+          },
+          mode,
+        );
+        chat.send('hello');
+        expect(await chat.answered(1)).toBe(true);
+        await until(() => said(home, 'the editor moved to B') === 1);
+
+        expect(await chat.close()).toBe(1);
+        // The editor is on B by then, which has room: the limit on A is recorded once.
+        expect(asked(home)).toEqual(['A', 'B']);
+        expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A' })]);
+        expect(
+          said(home, 'limit text in the editor, but "B" shows no spent window; nothing recorded'),
+        ).toBe(1);
+      },
+    );
+
+    it(
+      'records the limit of an account the editor has moved off while the check on it was under way, and moves nothing',
+      { timeout: 60_000 },
+      async () => {
+        const { home, ctx, context } = await twoAccounts('cas-editor-moved-away-', {
+          A: [{ ...OUT(Date.now() + 5 * HOURS), waitFor: 'release' }],
+        });
+        const chat = openChat(home, [], {}, mode);
+        chat.send('hello');
+        expect(await chat.answered(1)).toBe(true);
+        await until(() => asked(home).length === 1);
+
+        // While A is being asked about, something else puts the editor on B.
+        setActive('B', ctx);
+        await moveEditorToActive(context);
+        expect(editorRecord(home)?.account).toBe('B');
+        release(home);
+        await until(() => timesSaid(home, /^the editor had already moved to B$/) === 1);
+
+        // A is spent whichever account the editor holds now, so its limit is recorded. The editor is
+        // already where it should be, so no next account is picked and nothing is moved.
+        expect(capsIn(home)).toEqual([expect.objectContaining({ account: 'A' })]);
+        expect(said(home, 'A hit its limit (editor)')).toBe(1);
+        expect(getActive(ctx)).toBe('B');
+        expect(editorRecord(home)?.account).toBe('B');
+        expect(timesSaid(home, /^the editor (moved|has not moved|stays)/)).toBe(0);
+        expect(await chat.close()).toBe(0);
+      },
+    );
+
+    describe('a limit the ledger holds already, met again on the account the editor still holds', () => {
+      it(
+        'moves the editor when a move had waited on Claude, without asking the usage endpoint',
+        { timeout: 60_000 },
+        async () => {
+          const { home, ctx } = await twoAccounts('cas-editor-retry-', { A: [TURNED_AWAY] });
+          const chat = openChat(home, [], {}, mode);
+          expect(await chat.up()).toBe(true);
+          // Another session recorded A's limit and made B active, and the editor's folder is still on A.
+          limitOn(ctx, 'A');
+          setActive('B', ctx);
+          expect(editorRecord(home)?.account).toBe('A');
+
+          chat.send('hello');
+          expect(await chat.answered(1)).toBe(true);
+          await until(() => said(home, 'the editor moved to B') === 1);
+
+          expect(editorRecord(home)?.account).toBe('B');
+          expect(said(home, 'the editor moved to B')).toBe(1);
+          expect(asked(home)).toEqual([]);
+          // The turn that moved it stays refused, and the next goes out on B.
+          chat.send('please');
+          expect(await chat.answered(2)).toBe(true);
+          expect(chat.results().map((result) => result.is_error)).toEqual([true, false]);
+          expect(await chat.close()).toBe(0);
+        },
+      );
+
+      it.each(['A', 'B'])(
+        'does nothing while every account is spent, with %s active',
+        { timeout: 60_000 },
+        async (active) => {
+          const { home, ctx } = await twoAccounts('cas-editor-all-spent-', { A: [TURNED_AWAY] });
+          const chat = openChat(home, [], {}, mode);
+          expect(await chat.up()).toBe(true);
+          limitOn(ctx, 'A');
+          limitOn(ctx, 'B');
+          setActive(active, ctx);
+          const moves = eventsIn(home).filter((event) => event.kind === 'editor-move').length;
+
+          chat.send('hello');
+          expect(await chat.answered(1)).toBe(true);
+          // Long enough for ccx to have read that refusal several times over.
+          await sleep(1_000);
+
+          expect(editorRecord(home)?.account).toBe('A');
+          expect(eventsIn(home).filter((event) => event.kind === 'editor-move')).toHaveLength(
+            moves,
+          );
+          expect(timesSaid(home, /^the editor (moved|has not moved)/)).toBe(0);
+          expect(asked(home)).toEqual([]);
+          expect(await chat.close()).toBe(0);
+        },
+      );
+
+      it(
+        "does not move the editor to the account it is on for one model's limit the ledger holds",
+        { timeout: 60_000 },
+        async () => {
+          const { home, ctx } = await twoAccounts('cas-editor-model-held-', { A: [TURNED_AWAY] });
+          const chat = openChat(home, [], {}, mode);
+          expect(await chat.up()).toBe(true);
+          // Only Opus is out on A, which is the active account and the editor's.
+          updateLedger(ctx, (ledger) =>
+            markCapped(ledger, {
+              account: 'A',
+              now: Date.now(),
+              resetAt: Date.now() + 2 * HOURS,
+              model: 'Opus',
+              reason: 'another session',
+            }),
+          );
+
+          chat.send('hello', { limitType: 'seven_day_opus' });
+          expect(await chat.answered(1)).toBe(true);
+          // Long enough for ccx to have read that refusal several times over.
+          await sleep(1_000);
+
+          expect(timesSaid(home, /^the editor (moved|has not moved)/)).toBe(0);
+          expect(asked(home)).toEqual([]);
+          expect(await chat.close()).toBe(0);
+        },
+      );
+
+      it(
+        'tries the move once for two refusals within the back-off, and again after it',
+        { timeout: 60_000 },
+        async () => {
+          const { home, ctx } = await twoAccounts('cas-editor-retry-once-', { A: [TURNED_AWAY] });
+          const chat = openChat(
+            home,
+            [],
+            { EDITOR_MOVE_RETRY_MS: '300', EDITOR_REFUTE_BACKOFF_MS: '3000' },
+            mode,
+          );
+          expect(await chat.up()).toBe(true);
+          limitOn(ctx, 'A');
+          setActive('B', ctx);
+          claudeHoldsItsLogin(home);
+
+          chat.send('hello');
+          expect(await chat.answered(1)).toBe(true);
+          // The first try waits on Claude's lock and gives up.
+          await until(() => timesSaid(home, NOT_MOVED_TO_B) === 1);
+          chat.send('please');
+          expect(await chat.answered(2)).toBe(true);
+          // Long enough for ccx to have read that refusal several times over.
+          await sleep(1_000);
+
+          expect(timesSaid(home, NOT_MOVED_TO_B)).toBe(1);
+          expect(editorRecord(home)?.account).toBe('A');
+
+          // Once the back-off has passed and Claude lets go, the next refusal moves the editor.
+          claudeLetsGo(home);
+          await sleep(3_000);
+          chat.send('again');
+          expect(await chat.answered(3)).toBe(true);
+          await until(() => said(home, 'the editor moved to B') === 1);
+
+          expect(said(home, 'the editor moved to B')).toBe(1);
+          expect(timesSaid(home, NOT_MOVED_TO_B)).toBe(1);
+          expect(asked(home)).toEqual([]);
+          expect(await chat.close()).toBe(0);
+        },
+      );
+    });
+  },
+);
+
 /**
  * How the extension (2.1.302) ends a chat's process: it closes its input,
  * then sends SIGTERM 2 s later if the wrapper still runs, and SIGKILL 5 s
@@ -892,3 +1589,67 @@ describe.skipIf(process.platform === 'win32')('an editor chat ended by the exten
     },
   );
 });
+
+describe.skipIf(process.platform === 'win32')(
+  'a chat through ccx-claude whose Claude will not end when asked (against fake-claude)',
+  () => {
+    afterEach(() => {
+      for (const child of opened.splice(0)) {
+        child.stdin?.end();
+        if (child.exitCode === null) child.kill();
+      }
+    });
+
+    describe.each<Mode>(['wrapper', 'direct'])('%s mode', (mode) => {
+      /** A chat whose Claude ignores SIGTERM, and the note ccx-claude made of it. */
+      async function stubbornChat(
+        prefix: string,
+      ): Promise<{ chat: Chat; claude: number; note: string }> {
+        const { home } = await twoAccounts(prefix, { A: [ROOM] });
+        const chat = openChat(
+          home,
+          [],
+          { FAKE_CLAUDE_REFUSE_ON: '', FAKE_CLAUDE_IGNORE_TERM: '1', ...LOG_LAUNCH(home) },
+          mode,
+        );
+        chat.send('hello');
+        expect(await chat.answered(1)).toBe(true);
+        const claude = launchesIn(path.join(home, 'runs.jsonl'))[0]!.pid;
+        const note = path.join(home, 'editor-chats', `${claude}.json`);
+        expect(existsSync(note)).toBe(true);
+        return { chat, claude, note };
+      }
+
+      it(
+        'leaves no note of its Claude when it gives up on it after the time it was given',
+        { timeout: 60_000 },
+        async () => {
+          const { chat, claude, note } = await stubbornChat('cas-editor-note-giveup-');
+
+          chat.signal('SIGTERM');
+          expect(await chat.exited).toBe(143);
+
+          // Claude is still running, which is not what clears the note.
+          expect(processIsAlive(claude)).toBe(true);
+          expect(existsSync(note)).toBe(false);
+        },
+      );
+
+      it(
+        'leaves no note of its Claude when it is asked to end a second time',
+        { timeout: 60_000 },
+        async () => {
+          const { chat, claude, note } = await stubbornChat('cas-editor-note-second-');
+
+          chat.signal('SIGTERM');
+          await sleep(300);
+          chat.signal('SIGTERM');
+          expect(await chat.exited).toBe(143);
+
+          expect(processIsAlive(claude)).toBe(true);
+          expect(existsSync(note)).toBe(false);
+        },
+      );
+    });
+  },
+);

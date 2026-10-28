@@ -18,13 +18,29 @@ import { appendEvent } from '../events/log.js';
 import { ensureEditorReady } from './editor-ready.js';
 import { configHome } from '../config/paths.js';
 import {
+  editorStanding,
+  moveEditorToActive,
+  rememberEditorSpellings,
+  setUpEditor,
+  takeUpEditorRenewal,
+  type EditorUp,
+} from '../editor/folder.js';
+import { editorFolderPath, folderSpellings, readEditorRecord } from '../editor/folder-login.js';
+import { noteEditorChat } from '../editor/editor-chats.js';
+import {
   confirmCap,
   refusalConfirmed,
   refusalLimitEnd,
   usageAnswer,
   type CapDecision,
 } from '../usage/confirm-cap.js';
-import { judgeRefusal, limitNamed, type RecordedRefusal, type WriterLookup } from '../session/refused-turn.js';
+import {
+  judgeRefusal,
+  limitNamed,
+  oldLoginWhy,
+  type RecordedRefusal,
+  type WriterLookup,
+} from '../session/refused-turn.js';
 import { createRecordWatch, type ReadRefusal, type RecordWatch } from '../session/record-watch.js';
 import { createCheckBackoff } from '../session/check-backoff.js';
 import type { Refusal } from '../session/transcript.js';
@@ -48,6 +64,61 @@ async function pickAccount(context: CliContext): Promise<Account | undefined> {
   const picked = await selectHealthy(context, accounts, capped, active);
   if (picked) setActive(picked.name, context.ctx);
   return picked;
+}
+
+/** The folder a launch runs Claude on. */
+interface ClaudeFolder {
+  /** Where ccx reads and writes it. */
+  dir: string;
+  /** The text Claude is given as its CLAUDE_CONFIG_DIR, which names the Keychain item it keeps its login in. */
+  given: string;
+  /** The editor's own folder, which ccx keeps on the active account, rather than the account's. */
+  onEditor: boolean;
+}
+
+/**
+ * Bring the editor's folder up on the active account and run Claude on it, as
+ * the editor's extension is set to do: the user's own Claude but for the
+ * login. A launch tries each step once and never waits on a lock. What it
+ * could not do now (the move to the active account, a refresh) is left to a
+ * later event, and the launch runs on the folder as it is, since it holds the
+ * user's setup. Only a launch with no folder to run on, or one that is not
+ * ready and whose folder holds no working login, runs on the account's own
+ * folder, which holds only a login, and says why. Claude is given the folder
+ * as an editor's setting spells it, when one lands on it, so every Claude
+ * there keeps its login in one Keychain item and a renewal is never in a
+ * second one that the next move overwrites. That spelling is noted in the
+ * folder's record, so the item stays among those ccx reads and writes if the
+ * setting is later edited away.
+ */
+async function claudeFolder(context: CliContext, chosen: Account): Promise<ClaudeFolder> {
+  const home = configHome(context.ctx);
+  const up = await setUpEditor(context, { launch: true });
+  if (up.state !== 'ready') {
+    const standing = editorStanding(context);
+    if (!standing?.loggedIn) {
+      const why = standing ? `${up.why}; the folder holds no working login` : up.why;
+      appendEvent(
+        home,
+        `the editor's folder is not ready (${why}), so this chat runs on ${chosen.name}'s own folder`,
+        Date.now(),
+      );
+      ensureEditorReady(chosen.dir, context.ctx);
+      return { dir: chosen.dir, given: chosen.dir, onEditor: false };
+    }
+    if (up.state === 'not-ready') {
+      appendEvent(
+        home,
+        `the editor's folder could not be brought up to date now (${up.why}); this chat runs on it as it is`,
+        Date.now(),
+      );
+    }
+  }
+  const dir = editorFolderPath(context.ctx);
+  const given = folderSpellings(dir, context.ctx)[0] ?? dir;
+  // Kept in one try, since a launch does not wait on a lock; the next launch tries again.
+  if (given !== dir) rememberEditorSpellings(context, [given], 0);
+  return { dir, given, onEditor: true };
 }
 
 /** How often an editor's Claude's records are read while it runs: as often as a terminal session's. */
@@ -96,8 +167,8 @@ interface EditorWatch {
  * (session/refused-turn), and what it prints goes to the editor, not through
  * ccx. So its refused turns are read from Claude's own records while it runs,
  * by the watch a terminal session uses (session/record-watch): the
- * conversation from the per-process record Claude keeps in the account's
- * folder, followed when the process moves to another (a /clear), and that
+ * conversation from the per-process record Claude keeps in the folder it runs
+ * on, followed when the process moves to another (a /clear), and that
  * conversation's record as it grows. Its standard error is still read once it
  * has ended, for what only that shows.
  *
@@ -107,15 +178,27 @@ interface EditorWatch {
  * already holds for this account is neither asked about nor recorded again,
  * and a check that confirms nothing holds the next ones back as a terminal
  * session's does (session/check-backoff).
+ *
+ * On the editor's folder, every Claude there is on the account the folder
+ * holds, and a confirmed limit moves the folder to the next account in place,
+ * so the open chat's next message goes out on it. A refusal belongs to the
+ * account the folder holds when it is judged, not the one picked at launch:
+ * other ccx processes move the folder too, and one that comes just after a
+ * move may be the login the folder left.
  */
-function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: string[]): EditorWatch {
+function watchEditorLaunch(
+  context: CliContext,
+  chosen: Account,
+  folder: ClaudeFolder,
+  claudeArgs: string[],
+): EditorWatch {
   const home = configHome(context.ctx);
   const startsNew = !wantsExistingConversation(claudeArgs);
   // An existing chat comes with `--resume=<id>`, and the extension starts its
   // Claude to send the turn the person just wrote, which can be refused before
   // the per-process record is first read.
   const resumes = startsNew || forksConversation(claudeArgs) ? null : conversationIdIn(claudeArgs);
-  // An editor's Claude keeps its per-process record in the account's folder.
+  // The editor's folder links `sessions` to ~/.claude/sessions, which the lookup reads, so configDirs needs no change.
   const writers: WriterLookup = {
     sessionDir: null,
     configDirs: () => listAccounts(context.ctx).map((a) => a.dir),
@@ -123,17 +206,34 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
     ...(context.isClaudeProcess ? { isClaude: context.isClaudeProcess } : {}),
   };
   /**
+   * The account a refusal belongs to: the one the editor's folder holds as it
+   * is judged, and else, when the folder is not the editor's or names none ccx
+   * knows, the one picked at launch.
+   */
+  const holder = (): Account => {
+    if (!folder.onEditor) return chosen;
+    const name = readEditorRecord(folder.dir)?.account;
+    return listAccounts(context.ctx).find((a) => a.name === name) ?? chosen;
+  };
+  /** When the login in the editor's folder was last replaced; 0 on any other folder. */
+  const loginChangedAt = (): number =>
+    folder.onEditor ? (readEditorRecord(folder.dir)?.loginChangedAt ?? 0) : 0;
+  /**
    * Whether the ledger, which every session writes, holds a limit of this
    * scope for the account that still holds. An editor's Claude outlives a
    * limit's reset, and meeting it again after that is news.
    */
-  const covered = (model: string | undefined): boolean =>
-    limitOnLedger(loadLedger(context.ctx), chosen.name, model, Date.now());
+  const covered = (account: Account, model: string | undefined): boolean =>
+    limitOnLedger(loadLedger(context.ctx), account.name, model, Date.now());
   const backoff = createCheckBackoff(context.refuteBackoffMs);
+  /** Kept apart from the pause after a check that confirmed nothing: a move tried again says nothing of the next limit. */
+  const moveBackoff = createCheckBackoff(context.refuteBackoffMs);
   let watch: RecordWatch | null = null;
   let child: ChildProcess | null = null;
   let timer: NodeJS.Timeout | null = null;
-  /** The check under way for a refused turn. */
+  /** Ends the note that this Claude runs on the editor's folder (editor-chats). */
+  let forgetChat: (() => void) | null = null;
+  /** The check under way for a refused turn, or the move of the editor tried again. */
   let checking: Promise<void> | null = null;
   /**
    * Refused turns waiting to be asked about, the newest of each limit. One
@@ -163,16 +263,35 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
     return all;
   };
 
-  // The injected verdict when a test supplies one, exactly as the session path
-  // does; otherwise the account's own credential, which is the one this Claude
-  // runs on. Nothing changes the login under an editor's Claude: a move changes
-  // which account the next chat starts on.
-  const decide = async (text: string, recorded?: RecordedRefusal): Promise<CapDecision> => {
+  // The injected verdict when a test supplies one, as the session path does; else the account's own login, never the editor folder's.
+  const decide = async (
+    account: Account,
+    text: string,
+    recorded?: RecordedRefusal,
+  ): Promise<CapDecision> => {
     if (context.verifyCap) return { limited: (await context.verifyCap(text)) === 'limited' };
-    return confirmCap(chosen.dir, text, {
+    // A renewal the editor's Claude made of this login comes home first, so the check does not run on a retired token.
+    if (folder.onEditor) {
+      await takeUpEditorRenewal(context.ctx, {
+        account: account.name,
+        ...(context.lookupOwner ? { lookupOwner: context.lookupOwner } : {}),
+      });
+    }
+    return confirmCap(account.dir, text, {
       ...(context.capProbe ? { probe: context.capProbe } : {}),
-      ...(recorded ? { refusal: judgeRefusal(recorded, writers, () => 0) } : {}),
+      ...(recorded ? { refusal: judgeRefusal(recorded, writers, loginChangedAt) } : {}),
     });
+  };
+
+  /** Say how a move of the editor's folder to `to` went. */
+  const reportMove = (to: string, up: EditorUp): void => {
+    appendEvent(
+      home,
+      up.state === 'ready'
+        ? `the editor moved to ${to}`
+        : `the editor has not moved to ${to} yet: ${up.why}`,
+      Date.now(),
+    );
   };
 
   /**
@@ -184,7 +303,8 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
    * operator's active account off it.
    */
   const act = async (text: string, reason: string, recorded?: RecordedRefusal): Promise<void> => {
-    const decision = await decide(text, recorded);
+    const account = holder();
+    const decision = await decide(account, text, recorded);
     const seenIn = recorded ? 'record' : 'stderr';
     const seen = recorded ? 'Claude recorded a refused turn in the editor' : 'limit text in the editor';
     if (!decision.limited) {
@@ -194,25 +314,25 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
         decision.unanswered
           ? `${seen}, but not moving the editor yet: the usage check could not answer (${usageAnswer(decision)}), ` +
               `and ${decision.refusalWhy ?? 'Claude has not recorded the turn as refused'}`
-          : `${seen}, but "${chosen.name}" shows no spent window; nothing recorded`,
+          : `${seen}, but "${account.name}" shows no spent window; nothing recorded`,
         Date.now(),
-        { kind: 'cap-verify', data: { account: chosen.name, seenIn } },
+        { kind: 'cap-verify', data: { account: account.name, seenIn } },
       );
       return;
     }
     // Asked again after the check: it may have been recorded meanwhile, here or elsewhere.
-    if (covered(decision.model)) return;
+    if (covered(account, decision.model)) return;
     if (decision.byRefusal) {
       appendEvent(home, `in the editor, ${refusalConfirmed(decision)}`, Date.now(), {
         kind: 'cap-verify',
-        data: { account: chosen.name, seenIn, confirmedBy: 'refusal' },
+        data: { account: account.name, seenIn, confirmedBy: 'refusal' },
       });
     }
-    const now = Date.now();
+    const markedAt = Date.now();
     updateLedger(context.ctx, (ledger) =>
       markCapped(ledger, {
-        account: chosen.name,
-        now,
+        account: account.name,
+        now: markedAt,
         // The VERIFIED window only. The classification's reset time is parsed out
         // of the rendered text, and text that has just been refuted as a verdict
         // is no better as a duration: a replayed message announcing a reset days
@@ -226,7 +346,7 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
         // beats an unbounded one.
         resetAt:
           (decision.byRefusal
-            ? refusalLimitEnd(decision, () => accountCapEnd(ledger, chosen.name, now))
+            ? refusalLimitEnd(decision, () => accountCapEnd(ledger, account.name, markedAt))
             : decision.resetAt) ?? null,
         backoffMinutes: context.config.rotation.defaultBackoffMinutes,
         reason,
@@ -234,29 +354,94 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
         ...(decision.model ? { model: decision.model } : {}),
       }),
     );
-    appendEvent(home, `${chosen.name} hit its limit (editor)`, Date.now());
+    appendEvent(home, `${account.name} hit its limit (editor)`, Date.now());
+    // The account is spent whichever one the folder holds. If it moved on while the check ran, it is already elsewhere.
+    const holdsNow = holder();
+    if (holdsNow.name !== account.name) {
+      appendEvent(home, `the editor had already moved to ${holdsNow.name}`, Date.now());
+      return;
+    }
     const next = await selectHealthy(
       context,
       listAccounts(context.ctx),
       cappedNames(loadLedger(context.ctx), Date.now()),
       undefined,
     );
-    if (next) {
-      setActive(next.name, context.ctx);
+    if (!next) return;
+    setActive(next.name, context.ctx);
+    if (!folder.onEditor) {
       appendEvent(home, `next editor chat will use ${next.name}`, Date.now());
+    } else if (next.name === account.name) {
+      // A model's limit leaves the account working on everything else, so it can be the next account.
+      appendEvent(home, `the editor stays on ${next.name}`, Date.now());
+    } else {
+      reportMove(next.name, await moveEditorToActive(context));
     }
   };
 
+  /**
+   * A limit the ledger holds, met again by a Claude on the account the editor's
+   * folder still holds, while another account is active: the move to it waited
+   * on Claude's locks and did not come again at an event of ccx's, so it is
+   * tried again, no more than once for each back-off. It holds refusals back
+   * while it runs, as a check does. Nothing is asked of the usage endpoint.
+   */
+  const retryMove = (spent: Account): void => {
+    if (!folder.onEditor || checking || moveBackoff.paused(Date.now())) return;
+    if (readEditorRecord(folder.dir)?.account !== spent.name) return;
+    const active = getActive(context.ctx);
+    if (active === null || active === spent.name) return;
+    // With every account spent there is nothing to move to.
+    if (cappedNames(loadLedger(context.ctx), Date.now()).has(active)) return;
+    moveBackoff.pause(Date.now());
+    checking = moveEditorToActive(context)
+      .then((up) => reportMove(active, up))
+      .catch(() => {
+        /* the next refusal tries again */
+      })
+      .finally(() => {
+        checking = null;
+        askHeld();
+      });
+  };
+
+  /**
+   * Whether a refused turn may be the login the editor's folder left: it came
+   * before the folder's last move, or soon enough after it that the Claude that
+   * met it may still have been on the old login. It was the account the folder
+   * left that refused it, so asking about the account it holds now would only
+   * cost a check, and one that finds room.
+   */
+  const leftBehind = (recorded: RecordedRefusal): string | null => {
+    const at = recorded.refusal.at;
+    if (!folder.onEditor || at === null) return null;
+    return oldLoginWhy(at, recorded.promptAt, loginChangedAt(), recorded.launchedAt);
+  };
+
   const refused = (refusal: ReadRefusal): void => {
+    if (!watch) return;
     // Claude refuses every turn the person tries until a limit resets, and each
     // check spends the usage endpoint's budget, which every session on the
     // machine shares: a limit the ledger holds is not asked about again.
-    if (!watch || covered(limitNamed(refusal.limitType)?.model)) return;
+    const account = holder();
+    if (covered(account, limitNamed(refusal.limitType)?.model)) {
+      retryMove(account);
+      return;
+    }
+    const recorded = watch.recorded(refusal, child?.pid ?? null);
+    const left = leftBehind(recorded);
+    if (left !== null) {
+      appendEvent(
+        home,
+        `Claude recorded a refused turn in the editor, but not asking about it: ${left}`,
+        Date.now(),
+      );
+      return;
+    }
     if (checking || (!ending && backoff.paused(Date.now()))) {
       hold(refusal);
       return;
     }
-    const recorded = watch.recorded(refusal, child?.pid ?? null);
     checking = act(refusal.text, refusal.apiError ?? refusal.error, recorded)
       .catch(() => {
         /* a check that fails records nothing */
@@ -287,7 +472,21 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
   return {
     started(claude) {
       child = claude;
-      watch = createRecordWatch({ configDir: chosen.dir, startsNew, launchedAt: Date.now(), resumes });
+      if (folder.onEditor && claude.pid !== undefined) {
+        const forget = noteEditorChat(context.ctx, claude.pid, folder.dir);
+        // ccx-claude can end without `finished`: it gives up on a Claude that will not end, or is told to end twice.
+        process.once('exit', forget);
+        forgetChat = () => {
+          process.removeListener('exit', forget);
+          forget();
+        };
+      }
+      watch = createRecordWatch({
+        configDir: folder.dir,
+        startsNew,
+        launchedAt: Date.now(),
+        resumes,
+      });
       timer = setInterval(() => {
         try {
           look(true);
@@ -305,6 +504,8 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
     async finished(result) {
       if (timer) clearInterval(timer);
       timer = null;
+      forgetChat?.();
+      forgetChat = null;
       ending = true;
       // A refusal written just before Claude exited. Its per-process record went
       // with it, so the conversation is the one last seen.
@@ -316,7 +517,7 @@ function watchEditorLaunch(context: CliContext, chosen: Account, claudeArgs: str
       askHeld();
       const deadline = Date.now() + CHECK_WAIT_MS;
       while (checking !== null && Date.now() < deadline) await within(checking, deadline - Date.now());
-      if (result.classification.kind !== 'capped' || covered(undefined)) return;
+      if (result.classification.kind !== 'capped' || covered(holder(), undefined)) return;
       await act(result.stderr, result.classification.reason ?? 'usage cap');
     },
   };
@@ -363,8 +564,8 @@ async function runFollowed(
 
 /**
  * WRAPPER mode: run the EXACT command an editor hands us (e.g. `<claude> ...args`)
- * on the chosen account, with inherited stdio so the extension's protocol is
- * untouched. While it runs, and once it has ended, a confirmed limit is
+ * on the editor's own folder, with inherited stdio so the extension's protocol
+ * is untouched. While it runs, and once it has ended, a confirmed limit is
  * recorded and the active account moved, so the next chat starts elsewhere.
  * This is what the editor's claudeProcessWrapper setting points at.
  */
@@ -375,19 +576,21 @@ export async function wrapperLaunch(context: CliContext, argv: string[], deps: W
     if (argv.length === 0) return 0;
     return (await spawnWatched(argv[0]!, argv.slice(1))).exitCode;
   }
-  ensureEditorReady(chosen.dir, context.ctx);
-  const watch = watchEditorLaunch(context, chosen, argv.slice(1));
+  const folder = await claudeFolder(context, chosen);
+  const watch = watchEditorLaunch(context, chosen, folder, argv.slice(1));
   return runFollowed(
     watch,
-    (started) => spawnWatched(argv[0]!, argv.slice(1), { CLAUDE_CONFIG_DIR: chosen.dir }, started),
+    (started) =>
+      spawnWatched(argv[0]!, argv.slice(1), { CLAUDE_CONFIG_DIR: folder.given }, started),
     deps,
   );
 }
 
 /**
  * DIRECT mode: resolve the real claude and run it with the given claude args on
- * the chosen account. Used when ccx-claude is invoked directly (not via an
- * editor that passes the full command).
+ * the editor's own folder. Used when ccx-claude is invoked directly (not via an
+ * editor that passes the full command), as Conductor does with
+ * `claude_code_executable_path`.
  */
 export async function editorLaunch(context: CliContext, args: string[], deps: WrapperDeps = {}): Promise<number> {
   const claude = getClaude(context);
@@ -395,11 +598,11 @@ export async function editorLaunch(context: CliContext, args: string[], deps: Wr
   if (!chosen) {
     return (await launchWatched(args, { name: '', dir: '' }, { claude })).exitCode;
   }
-  ensureEditorReady(chosen.dir, context.ctx);
-  const watch = watchEditorLaunch(context, chosen, args);
+  const folder = await claudeFolder(context, chosen);
+  const watch = watchEditorLaunch(context, chosen, folder, args);
   return runFollowed(
     watch,
-    (started) => launchWatched(args, { name: chosen.name, dir: chosen.dir }, { claude }, started),
+    (started) => launchWatched(args, { name: chosen.name, dir: folder.given }, { claude }, started),
     deps,
   );
 }

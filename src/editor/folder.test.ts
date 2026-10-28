@@ -19,19 +19,30 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { addCommand } from '../commands/add.js';
 import { useCommand } from '../commands/use.js';
 import { editorCommand } from '../commands/editor.js';
+import { editorLaunch } from '../commands/editor-launch.js';
 import { setActive } from '../state/active.js';
 import { loadConfig } from '../config/config.js';
-import { installEditorEnvVar, readEditorEnvVar } from './install.js';
+import { installEditorEnvVar, readEditorEnvVar, uninstallEditorEnvVar } from './install.js';
+import { readEditorRecord } from './folder-login.js';
 import { readTarget, setTarget } from '../daemon/junction.js';
 import { refreshCredentialIfExpired } from '../usage/oauth-refresh.js';
 import { renewIdleLogin } from '../usage/usage-store.js';
 import { listAccounts } from '../accounts/registry.js';
 import { readKeychainCredential } from '../accounts/keychain.js';
 import type { CliContext } from '../context.js';
-import { takeUpEditorRenewal } from './folder.js';
+import {
+  editorChatsOpen,
+  refreshEditor,
+  retireEditor,
+  setUpEditor,
+  takeUpEditorRenewal,
+} from './folder.js';
+import { acquireOwnedLock } from '../claude/locks.js';
+import { noteEditorChat } from './editor-chats.js';
 
 /**
  * The editor's Claude folder, end to end through the commands that set it up
@@ -62,6 +73,9 @@ vi.mock('../accounts/keychain.js', () => {
   };
 });
 
+const fakeClaude = fileURLToPath(
+  new URL('../../test/fake-claude/fake-claude.mjs', import.meta.url),
+);
 const HOURS = 3_600_000;
 const emailOf = (name: string): string => `${name.toLowerCase()}@example.com`;
 /** A login of `name`'s, generation `gen`: a renewal is the next generation, with a later expiry. */
@@ -277,6 +291,89 @@ describe('the editor has a Claude folder of its own', () => {
 
     expect(tokenOf(keychain.get(spelled))).toBe('a-B-1');
     expect(keychain.has(s.folder)).toBe(false);
+  });
+
+  it("gives ccx-claude's Claude the folder as the editor's setting spells it, so one Keychain item holds the login and a renewal goes home", async () => {
+    const s = await scene();
+    // The only editor setting that names the folder is VS Code's, with a trailing separator.
+    const spelled = `${s.folder}${path.sep}`;
+    expect(installEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', spelled, s.context.ctx).ok).toBe(
+      true,
+    );
+
+    // A launch through ccx-claude, which makes the folder, gives Claude exactly the text the setting has.
+    const launching = { ...s.context, claude: { bin: process.execPath, prefixArgs: [fakeClaude] } };
+    expect(await editorLaunch(launching, ['chat'])).toBe(0);
+    const ran = JSON.parse(read(path.join(s.folder, 'fake-last-run.json')) ?? '{}') as {
+      configDir?: string;
+    };
+    expect(ran.configDir).toBe(spelled);
+
+    // That Claude renewed A's login in the item named after that text, and A's profile holds the older one.
+    keychain.set(spelled, login('A', 2));
+    rmSync(path.join(s.folder, '.credentials.json'));
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-1');
+    await use(s, 'B', () => tokenOf(keychain.get(spelled)) === 'a-B-1');
+
+    // The renewal went home before the move replaced it, and no second item was written.
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+    expect(tokenOf(keychain.get(spelled))).toBe('a-B-1');
+    expect(keychain.has(s.folder)).toBe(false);
+  });
+
+  it("keeps the spelling it gave Claude among the folder's, so a renewal still goes home once the setting is edited away", async () => {
+    const s = await scene();
+    const spelled = `${s.folder}${path.sep}`;
+    expect(installEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', spelled, s.context.ctx).ok).toBe(
+      true,
+    );
+    const launching = { ...s.context, claude: { bin: process.execPath, prefixArgs: [fakeClaude] } };
+    expect(await editorLaunch(launching, ['chat'])).toBe(0);
+    const ran = JSON.parse(read(path.join(s.folder, 'fake-last-run.json')) ?? '{}') as {
+      configDir?: string;
+    };
+    expect(ran.configDir).toBe(spelled);
+
+    // Someone edits the setting away by hand, while that Claude goes on keeping its login in the item named after the old text.
+    expect(uninstallEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', s.context.ctx).ok).toBe(true);
+    expect(readEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', s.context.ctx)).toBeNull();
+    keychain.set(spelled, login('A', 2));
+    rmSync(path.join(s.folder, '.credentials.json'));
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-1');
+    await use(s, 'B', () => tokenOf(keychain.get(spelled)) === 'a-B-1');
+
+    // The renewal went home before the move replaced it, in the item that Claude still reads.
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+    expect(tokenOf(keychain.get(spelled))).toBe('a-B-1');
+  });
+
+  it('notes that spelling in one try, so a launch does not wait for another ccx that holds the editor lock', async () => {
+    const s = await scene();
+    const spelled = `${s.folder}${path.sep}`;
+    expect(installEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', spelled, s.context.ctx).ok).toBe(
+      true,
+    );
+    await setUpEditor(s.context);
+    const launching = { ...s.context, claude: { bin: process.execPath, prefixArgs: [fakeClaude] } };
+    const lock = acquireOwnedLock(path.join(s.ccx, 'editor-folder.lock'), {
+      waitMs: 0,
+      staleMs: 60_000,
+      maxHoldMs: 60_000,
+    });
+    try {
+      const started = Date.now();
+      expect(await editorLaunch(launching, ['chat'])).toBe(0);
+
+      // Noting it once waited 10 s for the lock, as `ccx editor off` does.
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(readEditorRecord(s.folder)?.spellings).toBeUndefined();
+    } finally {
+      lock.release();
+    }
+
+    // The next launch notes it.
+    expect(await editorLaunch(launching, ['chat'])).toBe(0);
+    expect(readEditorRecord(s.folder)?.spellings).toEqual([spelled]);
   });
 
   it.skipIf(process.platform === 'win32')(
@@ -1247,6 +1344,163 @@ describe('ccx editor off', () => {
     expect(await editorCommand(s.context, 'off')).toBe(1);
 
     expect(isRealFolder(s.folder)).toBe(true);
+  });
+});
+
+/** A process that runs until it is killed, standing in for a Claude. */
+function stayingProcess(): { pid: number; end: () => Promise<void> } {
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  return {
+    pid: child.pid!,
+    end: () => {
+      child.kill();
+      return exited;
+    },
+  };
+}
+
+describe('a Claude ccx-claude runs on the editor folder', () => {
+  it('keeps the folder from being retired while it runs, and lets it go once it has ended', async () => {
+    const s = await scene();
+    await editorOn(s);
+    const claude = stayingProcess();
+    try {
+      // A running chat started before the check; retireEditor skips one started at or after it.
+      const ended = noteEditorChat(s.context.ctx, claude.pid, s.folder, Date.now() - 1_000);
+
+      expect(retireEditor(s.context)).toBe('held');
+      expect(isRealFolder(s.folder)).toBe(true);
+
+      ended();
+      expect(retireEditor(s.context)).toBe('retired');
+      expect(existsSync(s.folder)).toBe(false);
+    } finally {
+      await claude.end();
+    }
+  });
+
+  it("holds the retirement of the editor folder, but not the merge into an account's folder or a taken-over copy", async () => {
+    const s = await scene();
+    await editorOn(s);
+    const claude = stayingProcess();
+    try {
+      // A running chat started before the check; retireEditor skips one started at or after it.
+      noteEditorChat(s.context.ctx, claude.pid, s.folder, Date.now() - 1_000);
+
+      expect(editorChatsOpen(s.context.ctx, s.folder)).toBe(true);
+      expect(retireEditor(s.context)).toBe('held');
+      // A Conductor user always has a chat open, and that must not hold off what is done to other folders.
+      expect(editorChatsOpen(s.context.ctx, s.dirOf('A'))).toBe(false);
+      expect(editorChatsOpen(s.context.ctx, `${s.folder}.taken-over`)).toBe(false);
+    } finally {
+      await claude.end();
+    }
+  });
+
+  it('counts for nothing once its process is gone, and its note is cleared', async () => {
+    const s = await scene();
+    await editorOn(s);
+    const claude = stayingProcess();
+    noteEditorChat(s.context.ctx, claude.pid, s.folder);
+    await claude.end();
+    const note = path.join(s.ccx, 'editor-chats', `${claude.pid}.json`);
+    expect(existsSync(note)).toBe(true);
+
+    expect(retireEditor(s.context)).toBe('retired');
+
+    expect(existsSync(s.folder)).toBe(false);
+    expect(existsSync(note)).toBe(false);
+  });
+});
+
+describe('a launch from ccx-claude, with the retirement of the editor folder pending', () => {
+  /** The setting gone while an editor chat was open, which held the folder's retirement off; that chat has closed since. */
+  async function retirementPending(): Promise<Scene> {
+    const s = await scene();
+    await editorOn(s);
+    const chat = stayingProcess();
+    mkdirSync(path.join(s.folder, 'sessions'), { recursive: true });
+    writeFileSync(
+      path.join(s.folder, 'sessions', `${chat.pid}.json`),
+      JSON.stringify({
+        pid: chat.pid,
+        entrypoint: 'claude-vscode',
+        startedAt: Date.now() - 60_000,
+      }),
+    );
+    expect(await editorCommand(s.context, 'off')).toBe(0);
+    expect(existsSync(path.join(s.ccx, 'editor-retire.json'))).toBe(true);
+    await chat.end();
+    return s;
+  }
+
+  it('clears the retirement and keeps the folder, as an editor setting naming the folder does', async () => {
+    const s = await retirementPending();
+
+    const up = await setUpEditor(s.context, { launch: true });
+
+    expect(up.state).toBe('ready');
+    expect(existsSync(path.join(s.ccx, 'editor-retire.json'))).toBe(false);
+    expect(isRealFolder(s.folder)).toBe(true);
+    expect(tokenOf(folderLogin(s))).toBe('a-A-1');
+  });
+
+  it('is the only launch to: setting the editor up without one retires the folder, as before', async () => {
+    const s = await retirementPending();
+
+    const up = await setUpEditor(s.context);
+
+    expect(up.state).toBe('not-ready');
+    expect(existsSync(s.folder)).toBe(false);
+  });
+});
+
+describe('a launch from ccx-claude, which makes one try at each step', () => {
+  it('does not wait for another ccx to end its change to the folder, and leaves the move to the next event', async () => {
+    const s = await scene();
+    await editorOn(s);
+    setActive('B', s.context.ctx);
+    const lock = acquireOwnedLock(path.join(s.ccx, 'editor-folder.lock'), {
+      waitMs: 0,
+      staleMs: 60_000,
+      maxHoldMs: 60_000,
+    });
+    try {
+      const started = Date.now();
+      const up = await setUpEditor(s.context, { launch: true });
+
+      // It once waited 10 s for the lock.
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(up.state).toBe('not-ready');
+      expect(tokenOf(folderLogin(s))).toBe('a-A-1');
+    } finally {
+      lock.release();
+    }
+
+    // An event that moves nothing by itself makes the move, since a launch left it pending.
+    await refreshEditor(s.context);
+    expect(tokenOf(folderLogin(s))).toBe('a-B-1');
+  });
+
+  it("does not look for Claude's locks for long, and leaves the move to the next event", async () => {
+    const s = await scene();
+    await editorOn(s);
+    setActive('B', s.context.ctx);
+    s.context.editorMoveRetryMs = 8_000;
+    const lock = path.join(s.folder, '.oauth_refresh.lock');
+    mkdirSync(lock);
+
+    const started = Date.now();
+    const up = await setUpEditor(s.context, { launch: true });
+
+    // A move under a running Claude looks again every 200 ms for as long as editorMoveRetryMs.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(up.state).toBe('meanwhile');
+    expect(tokenOf(folderLogin(s))).toBe('a-A-1');
+    rmSync(lock, { recursive: true });
+    await refreshEditor(s.context);
+    expect(tokenOf(folderLogin(s))).toBe('a-B-1');
   });
 });
 

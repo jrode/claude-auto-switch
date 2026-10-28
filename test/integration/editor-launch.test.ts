@@ -1,5 +1,12 @@
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
+import { describe, it, expect, afterEach } from 'vitest';
+import {
+  existsSync,
+  mkdtempSync,
+  writeFileSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,15 +14,21 @@ import { addCommand } from '../../src/commands/add.js';
 import { useCommand } from '../../src/commands/use.js';
 import { editorLaunch } from '../../src/commands/editor-launch.js';
 import { loadConfig } from '../../src/config/config.js';
-import { getActive } from '../../src/state/active.js';
+import { getActive, setActive } from '../../src/state/active.js';
+import { setUpEditor } from '../../src/editor/folder.js';
+import { acquireOwnedLock } from '../../src/claude/locks.js';
+import { rememberDeadLogin } from '../../src/usage/dead-login-store.js';
+import { sha256Fingerprint } from '../../src/util/fingerprint.js';
 import { loadLedger } from '../../src/ledger/ledger.js';
+import { eventsFilePath } from '../../src/events/log.js';
 import type { CliContext } from '../../src/context.js';
 import type { LimitVerdict } from '../../src/usage/limit-probe.js';
 
 const fakeClaude = fileURLToPath(new URL('../fake-claude/fake-claude.mjs', import.meta.url));
 
 function makeContext(home: string, verdict: LimitVerdict = 'limited'): CliContext {
-  const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home } };
+  // A home of its own, so the editor's folder and your ~/.claude are the test's too.
+  const ctx = { env: { CLAUDE_AUTO_SWITCH_HOME: home, HOME: home, USERPROFILE: home } };
   return {
     ctx,
     config: loadConfig(ctx),
@@ -45,6 +58,18 @@ function seed(dir: string, opts: { capped?: boolean } = {}): void {
   );
 }
 
+/**
+ * Claude runs on the editor's folder, which has no scenario of its own: it
+ * follows the account's, as if the login in the folder were that account's.
+ */
+function runLike(dir: string): void {
+  process.env.FAKE_CLAUDE_SCENARIO = path.join(dir, 'fake-scenario.json');
+}
+
+afterEach(() => {
+  delete process.env.FAKE_CLAUDE_SCENARIO;
+});
+
 describe('editorLaunch (against fake-claude)', () => {
   it('runs on the active account and, on a cap, flips active to the next healthy one', async () => {
     const home = mkdtempSync(path.join(tmpdir(), 'cas-editor-'));
@@ -56,6 +81,7 @@ describe('editorLaunch (against fake-claude)', () => {
     seed(dirA, { capped: true }); // active account will hit its limit
     seed(dirB, { capped: false });
     useCommand(context, 'A');
+    runLike(dirA);
 
     const exit = await editorLaunch(context, ['chat']);
     expect(exit).toBe(1); // the capped run's exit code passes through
@@ -94,6 +120,7 @@ describe('limit-looking text in an editor session', () => {
     seed(dirA, { capped: true });
     seed(dirB, { capped: false });
     useCommand(context, 'A');
+    runLike(dirA);
 
     await editorLaunch(context, ['chat']);
 
@@ -120,10 +147,168 @@ describe('limit-looking text in an editor session', () => {
     seed(dirA, { capped: true }); // prints the limit message
     seed(dirB, { capped: false });
     useCommand(context, 'A');
+    runLike(dirA);
 
     await editorLaunch(context, ['chat']);
 
     expect(loadLedger(context.ctx).caps).toHaveLength(0);
     expect(getActive(context.ctx)).toBe('A'); // and the operator is not moved
+  });
+});
+
+/** Account A, signed in as the fake claude reads it, and active. */
+async function accountA(context: CliContext, home: string): Promise<string> {
+  const dirA = path.join(home, 'profiles', 'A');
+  await addCommand(context, 'A', { dir: dirA, login: false });
+  seed(dirA);
+  writeFileSync(path.join(dirA, '.credentials.json'), JSON.stringify({ account: 'A' }), 'utf8');
+  useCommand(context, 'A');
+  return dirA;
+}
+
+const eventMessages = (home: string): string[] =>
+  existsSync(eventsFilePath(home))
+    ? readFileSync(eventsFilePath(home), 'utf8')
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => (JSON.parse(line) as { msg: string }).msg)
+    : [];
+
+describe("editorLaunch on the editor's own folder (against fake-claude)", () => {
+  afterEach(() => {
+    delete process.env.FAKE_CLAUDE_RUNS_LOG;
+    delete process.env.FAKE_CLAUDE_LOG_FOLDER;
+  });
+
+  it("runs Claude on the editor's folder, made when missing, with your settings and CLAUDE.md in it", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-editor-folder-'));
+    const context = makeContext(home);
+    const dirA = await accountA(context, home);
+    const folder = path.join(home, 'editor-active');
+    mkdirSync(path.join(home, '.claude'), { recursive: true });
+    writeFileSync(
+      path.join(home, '.claude', 'settings.json'),
+      JSON.stringify({ model: 'fable' }),
+      'utf8',
+    );
+    writeFileSync(path.join(home, '.claude', 'CLAUDE.md'), 'my memory', 'utf8');
+    const runsLog = path.join(home, 'runs.jsonl');
+    process.env.FAKE_CLAUDE_RUNS_LOG = runsLog;
+    process.env.FAKE_CLAUDE_LOG_FOLDER = '1';
+    expect(existsSync(folder)).toBe(false);
+
+    expect(await editorLaunch(context, ['chat'])).toBe(0);
+
+    const launch = JSON.parse(readFileSync(runsLog, 'utf8').trim().split('\n')[0]!) as {
+      marker: string | null;
+      folder: { configDir: string; settings: unknown };
+    };
+    expect(launch.folder.configDir).toBe(realpathSync(folder));
+    expect(launch.folder.settings).toEqual({ model: 'fable' });
+    // The login in it is the active account's, copied from its own folder.
+    expect(launch.marker).toBe('A');
+    expect(readFileSync(path.join(folder, 'CLAUDE.md'), 'utf8')).toBe('my memory');
+    expect(
+      JSON.parse(readFileSync(path.join(folder, 'fake-last-run.json'), 'utf8')).configDir,
+    ).toBe(folder);
+    expect(existsSync(path.join(dirA, 'fake-last-run.json'))).toBe(false);
+  });
+
+  it("runs on the account's own folder, and says why, when the editor's folder holds no working login and cannot be brought up now", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-editor-no-login-'));
+    const context = makeContext(home);
+    const dirA = await accountA(context, home);
+    // The folder is on B, which has no login to put in it.
+    const dirB = path.join(home, 'profiles', 'B');
+    await addCommand(context, 'B', { dir: dirB, login: false });
+    seed(dirB);
+    setActive('B', context.ctx);
+    await setUpEditor(context);
+    setActive('A', context.ctx);
+    // Another ccx is changing the folder, so the move to A cannot be made now.
+    const lock = acquireOwnedLock(path.join(home, 'editor-folder.lock'), {
+      waitMs: 0,
+      staleMs: 60_000,
+      maxHoldMs: 60_000,
+    });
+    try {
+      expect(await editorLaunch(context, ['chat'])).toBe(0);
+    } finally {
+      lock.release();
+    }
+
+    expect(JSON.parse(readFileSync(path.join(dirA, 'fake-last-run.json'), 'utf8')).configDir).toBe(
+      dirA,
+    );
+    expect(existsSync(path.join(home, 'editor-active', 'fake-last-run.json'))).toBe(false);
+    const said = eventMessages(home).find((msg) => msg.includes("runs on A's own folder"));
+    expect(said).toContain('another ccx was changing the folder');
+  });
+
+  it("runs on the account's own folder, and says why, when the editor's folder was scrubbed and its move waits on Claude", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-editor-scrubbed-'));
+    const context = makeContext(home);
+    const dirA = await accountA(context, home);
+    // An earlier move to B, which has no login, left the folder with none, and its record names B all the same.
+    const dirB = path.join(home, 'profiles', 'B');
+    await addCommand(context, 'B', { dir: dirB, login: false });
+    seed(dirB);
+    setActive('B', context.ctx);
+    await setUpEditor(context);
+    setActive('A', context.ctx);
+    // Claude holds its login's lock, so the move to A cannot be made now: the bring-up is only meanwhile.
+    mkdirSync(path.join(home, 'editor-active', '.oauth_refresh.lock'));
+
+    expect(await editorLaunch(context, ['chat'])).toBe(0);
+
+    expect(JSON.parse(readFileSync(path.join(dirA, 'fake-last-run.json'), 'utf8')).configDir).toBe(
+      dirA,
+    );
+    expect(existsSync(path.join(home, 'editor-active', 'fake-last-run.json'))).toBe(false);
+    const said = eventMessages(home).find((msg) => msg.includes("runs on A's own folder"));
+    expect(said).toContain('the folder holds no working login');
+  });
+
+  it("runs on the account's own folder, and says why, when the editor's folder holds a dead login and its move waits on Claude", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-editor-dead-'));
+    const context = makeContext(home);
+    const dirA = await accountA(context, home);
+    const dirB = path.join(home, 'profiles', 'B');
+    await addCommand(context, 'B', { dir: dirB, login: false });
+    seed(dirB);
+    writeFileSync(path.join(dirB, '.credentials.json'), JSON.stringify({ account: 'B' }), 'utf8');
+    // The folder is on A. The token endpoint has since refused A's login, so B is the account this launch picks.
+    await setUpEditor(context);
+    rememberDeadLogin(sha256Fingerprint(JSON.stringify({ account: 'A' })), 'refused', context.ctx);
+    // Claude holds its login's lock, so the move to B cannot be made now: the bring-up is only meanwhile.
+    mkdirSync(path.join(home, 'editor-active', '.oauth_refresh.lock'));
+
+    expect(await editorLaunch(context, ['chat'])).toBe(0);
+
+    expect(getActive(context.ctx)).toBe('B');
+    expect(JSON.parse(readFileSync(path.join(dirB, 'fake-last-run.json'), 'utf8')).configDir).toBe(
+      dirB,
+    );
+    expect(existsSync(path.join(home, 'editor-active', 'fake-last-run.json'))).toBe(false);
+    expect(existsSync(path.join(dirA, 'fake-last-run.json'))).toBe(false);
+    const said = eventMessages(home).find((msg) => msg.includes("runs on B's own folder"));
+    expect(said).toContain('the folder holds no working login');
+  });
+
+  it("runs on the account's own folder, and says why, when the editor's folder cannot be set up", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-editor-fallback-'));
+    const context = makeContext(home);
+    const dirA = await accountA(context, home);
+    // A file where the folder would be.
+    writeFileSync(path.join(home, 'editor-active'), 'in the way', 'utf8');
+
+    expect(await editorLaunch(context, ['chat'])).toBe(0);
+
+    expect(JSON.parse(readFileSync(path.join(dirA, 'fake-last-run.json'), 'utf8')).configDir).toBe(
+      dirA,
+    );
+    expect(readFileSync(path.join(home, 'editor-active'), 'utf8')).toBe('in the way');
+    const said = eventMessages(home).find((msg) => msg.includes("runs on A's own folder"));
+    expect(said).toContain('is not a folder');
   });
 });
