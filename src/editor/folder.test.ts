@@ -91,6 +91,24 @@ const tokenOf = (text: string | null | undefined): string | null => {
     return null;
   }
 };
+/** Sign-ins to other services (`claude mcp login`), which Claude keeps in the same text as the account's login. */
+const MCP = {
+  'notion|1': {
+    serverName: 'notion',
+    accessToken: 'mcp-access-fake-1',
+    refreshToken: 'mcp-refresh-fake-1',
+    expiresAt: 1_900_000_000_000,
+  },
+};
+const withMcp = (text: string, mcpOAuth: unknown = MCP): string =>
+  JSON.stringify({ ...(JSON.parse(text) as object), mcpOAuth });
+const mcpOf = (text: string | null | undefined): unknown => {
+  try {
+    return (JSON.parse(text ?? '') as { mcpOAuth?: unknown }).mcpOAuth;
+  } catch {
+    return undefined;
+  }
+};
 /** Who a login belongs to, as the API would say: by the account its token was made for. */
 const ownerOf = (text: string): string | null => {
   const match = /^a-([A-Za-z]+)-/.exec(tokenOf(text) ?? '');
@@ -1526,5 +1544,19 @@ describe("a renewal the editor's Claude made, saved home from a running session"
     expect(took).toBe('taken');
     expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
     expect(tokenOf(profileLogin(s, 'C'))).toBe('a-A-1');
+  });
+});
+
+describe('the MCP logins in the editor folder', () => {
+  it('stay in the folder when it moves to the next account', async () => {
+    const s = await scene();
+    await editorOn(s);
+    // Signed in to an MCP server in the editor's Claude, which keeps it beside the account's login.
+    writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 1)));
+
+    await use(s, 'B', () => tokenOf(folderLogin(s)) === 'a-B-1');
+
+    expect(tokenOf(folderLogin(s))).toBe('a-B-1');
+    expect(mcpOf(folderLogin(s))).toEqual(MCP);
   });
 });
