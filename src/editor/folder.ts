@@ -18,7 +18,12 @@ import {
   usableLoginText,
 } from '../accounts/credential-vault.js';
 import { keychainBlocking, readKeychainItem } from '../accounts/keychain-view.js';
-import { holdsMcpLogins, type McpMode } from '../accounts/mcp-logins.js';
+import {
+  gatherMcpLogins,
+  holdsMcpLogins,
+  withMcpLogins,
+  type McpMode,
+} from '../accounts/mcp-logins.js';
 import { parkMcpLoginsSteps } from '../accounts/mcp-park.js';
 import { loginExpiresAt, readExpiresAt } from '../usage/token-expiry.js';
 import { loginIsKnownDead } from '../usage/dead-login-store.js';
@@ -62,6 +67,7 @@ import {
   nudgeFolderLogin,
   readEditorRecord,
   readFolderLogin,
+  readFolderStores,
   removeFolderLogin,
   writeEditorRecord,
   writeFolderLogin,
@@ -564,9 +570,14 @@ function saveEditorLoginHome(
   ending = false,
 ): void {
   // Throws when it cannot be read, or not saved home: what it holds may be a
-  // renewal only it has, which a move would then write over.
-  const text = readFolderLogin(login);
-  if (text === null) return;
+  // renewal only it has, which a move would then write over. A folder that is
+  // ending is read in every place its Claudes keep a login, since a sign-in held
+  // in one of them goes with the folder.
+  const stores = ending ? readFolderStores(login) : null;
+  const held = stores ? (stores[0] ?? null) : readFolderLogin(login);
+  if (held === null) return;
+  const gathered = stores ? gatherMcpLogins(stores) : null;
+  const text = gathered ? withMcpLogins(held, gathered) : held;
   const newer = newerThanStored(text, leaving);
   if (!newer && !(ending && holdsMcpLogins(text))) return;
   const decision = decideSaveBack({

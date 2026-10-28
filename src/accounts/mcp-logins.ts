@@ -81,6 +81,36 @@ export function holdsMcpLoginsOf(copy: string, ending: string): boolean {
 }
 
 /**
+ * The sign-ins the `texts` of several stores of one folder hold between them,
+ * server by server, the first store that holds a server winning for it. Null
+ * when none holds any.
+ */
+export function gatherMcpLogins(texts: string[]): Record<string, unknown> | null {
+  const gathered: Record<string, unknown> = {};
+  for (const text of texts) {
+    const held = signIns(asObject(text)?.[MCP_OAUTH_KEY]);
+    if (held === null) continue;
+    for (const [server, signIn] of Object.entries(held)) {
+      if (!Object.hasOwn(gathered, server)) gathered[server] = signIn;
+    }
+  }
+  return Object.keys(gathered).length > 0 ? gathered : null;
+}
+
+/**
+ * `text` carrying `logins` as its sign-ins, its Claude login as it is. `text`
+ * itself when it holds them already, and only the sign-ins when it is not a
+ * JSON object.
+ */
+export function withMcpLogins(text: string, logins: Record<string, unknown>): string {
+  const carrying = JSON.stringify({ [MCP_OAUTH_KEY]: logins });
+  const held = asObject(text);
+  if (held === null) return carrying;
+  if (holdsMcpLoginsOf(text, carrying)) return text;
+  return JSON.stringify({ ...held, [MCP_OAUTH_KEY]: logins });
+}
+
+/**
  * The text to write when `source` is installed over `target`, what the store
  * holds now (null when it holds nothing). Everything of the source but
  * `mcpOAuth` is kept as it is. When neither text holds `mcpOAuth`, or one is

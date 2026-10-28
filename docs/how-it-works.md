@@ -28,9 +28,11 @@ hold stays, so two folders that end on one account each leave theirs. Signing
 out of a server in one folder does not remove a sign-in another folder parked
 for it. That is a terminal session at its end, even when its Claude is signed
 out or signed in as someone else, and the editor's folder when it is retired,
-even when its Claude login is no newer than the saved one. A folder with no
-login yet, such as a new session's or a newly made editor folder, starts with
-whatever its account's saved login holds.
+even when its Claude login is no newer than the saved one. The editor's folder
+is read in every Keychain item and file its editors' Claudes keep a login in,
+and where two hold a server the one read first wins. A folder with no login yet,
+such as a new session's or a newly made editor folder, starts with whatever its
+account's saved login holds.
 A login that carries several sign-ins is usually longer than one line of
 `security -i` takes, so ccx saves it in `security`'s arguments, as Claude Code
 does. For the moment `security` runs, other programs running as you can see

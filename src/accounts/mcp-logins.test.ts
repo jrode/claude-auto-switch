@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  gatherMcpLogins,
   holdsMcpLogins,
   holdsMcpLoginsOf,
   holdsNoLogin,
   mergeMcpLogins,
   parkMcpLogins,
+  withMcpLogins,
 } from './mcp-logins.js';
 
 const claude = (n: number) => ({
@@ -260,5 +262,56 @@ describe('whether a saved login holds the MCP logins of another text', () => {
   it('does not when either text is not a JSON object', () => {
     expect(holdsMcpLoginsOf('{"mcpOAuth":', text({ mcpOAuth: mcp(1) }))).toBe(false);
     expect(holdsMcpLoginsOf(text({ mcpOAuth: mcp(1) }), '{"mcpOAuth":')).toBe(false);
+  });
+});
+
+describe('the MCP logins of several stores of one folder', () => {
+  it('are those they hold between them, server by server', () => {
+    const gathered = gatherMcpLogins([
+      text({ claudeAiOauth: claude(1), mcpOAuth: mcp(1) }),
+      text({ mcpOAuth: datadog(2) }),
+    ]);
+    expect(gathered).toEqual({ ...mcp(1), ...datadog(2) });
+  });
+
+  it('are those of the first store for a server more than one holds', () => {
+    const gathered = gatherMcpLogins([
+      text({ mcpOAuth: mcp(1) }),
+      text({ mcpOAuth: { ...mcp(2), ...datadog(2) } }),
+      text({ mcpOAuth: datadog(3) }),
+    ]);
+    expect(gathered).toEqual({ ...mcp(1), ...datadog(2) });
+  });
+
+  it('are none when no store holds a sign-in, or its text is not a login at all', () => {
+    expect(gatherMcpLogins([])).toBeNull();
+    expect(
+      gatherMcpLogins([
+        text({ claudeAiOauth: claude(1) }),
+        text({ mcpOAuth: {} }),
+        '{}',
+        '{"mcpOAuth":',
+      ]),
+    ).toBeNull();
+  });
+
+  it('are carried by a text with its Claude login as it is', () => {
+    const carried = parse(
+      withMcpLogins(text({ claudeAiOauth: claude(1), mcpOAuth: mcp(1) }), {
+        ...mcp(1),
+        ...datadog(2),
+      }),
+    );
+    expect(carried.claudeAiOauth).toEqual(claude(1));
+    expect(carried.mcpOAuth).toEqual({ ...mcp(1), ...datadog(2) });
+  });
+
+  it('leave a text that holds them already as the same string', () => {
+    const pretty = `${JSON.stringify({ claudeAiOauth: claude(1), mcpOAuth: mcp(1) }, null, 2)}\n`;
+    expect(withMcpLogins(pretty, mcp(1))).toBe(pretty);
+  });
+
+  it('are all that a text which is not a login carries', () => {
+    expect(parse(withMcpLogins('{"claudeAiOauth":', mcp(1)))).toEqual({ mcpOAuth: mcp(1) });
   });
 });

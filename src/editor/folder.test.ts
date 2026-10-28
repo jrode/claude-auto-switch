@@ -218,9 +218,13 @@ const folderLogin = (s: Scene): string | null => read(path.join(s.folder, '.cred
 const profileLogin = (s: Scene, name: string): string | null => read(path.join(s.dirOf(name), '.credentials.json'));
 
 /** Run `step` while the Keychain item named after the editor's folder cannot be read, as a locked Keychain refuses. */
-async function whileUnreadable<T>(s: Scene, step: () => Promise<T>): Promise<T> {
+async function whileUnreadable<T>(
+  s: Scene,
+  step: () => Promise<T>,
+  unreadable: string = s.folder,
+): Promise<T> {
   vi.mocked(readKeychainCredential).mockImplementation((dir: string) => {
-    if (dir === s.folder) throw new Error('Could not read the profile login from macOS Keychain');
+    if (dir === unreadable) throw new Error('Could not read the profile login from macOS Keychain');
     return keychain.get(dir) ?? null;
   });
   try {
@@ -1844,6 +1848,86 @@ describe('the MCP logins in the editor folder', () => {
 
       expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
       expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+    });
+
+    describe('held in more than one place', () => {
+      /** Two editors set to the folder, spelled two ways, each Claude with a Keychain item of its own. */
+      async function twoSpellings() {
+        const { s, held } = await sameLoginOnA();
+        const first = `${s.folder}${path.sep}`;
+        const second = s.folder;
+        expect(installEditorEnvVar('cursor', 'CLAUDE_CONFIG_DIR', first, s.context.ctx).ok).toBe(
+          true,
+        );
+        expect(installEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', second, s.context.ctx).ok).toBe(
+          true,
+        );
+        rmSync(path.join(s.folder, '.credentials.json'));
+        return { s, held, first, second };
+      }
+      /** `ccx editor off` for both editors, the last of which retires the folder. */
+      async function offForBoth(s: Scene): Promise<number> {
+        expect(await editorCommand(s.context, 'off', { editor: 'cursor' })).toBe(0);
+        return editorCommand(s.context, 'off', { editor: 'vscode' });
+      }
+
+      it('are parked from every Keychain item of the folder, whichever way an editor spells it', async () => {
+        const { s, held, first, second } = await twoSpellings();
+        keychain.set(first, withMcp(held, mcpLogins(1)));
+        keychain.set(second, withMcp(held, datadogLogins(2)));
+
+        expect(await offForBoth(s)).toBe(0);
+
+        expect(existsSync(s.folder)).toBe(false);
+        expect(keychain.has(first)).toBe(false);
+        expect(keychain.has(second)).toBe(false);
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...mcpLogins(1), ...datadogLogins(2) });
+      });
+
+      it('are those of the first item for a server that more than one item holds', async () => {
+        const { s, held, first, second } = await twoSpellings();
+        keychain.set(first, withMcp(held, mcpLogins(1)));
+        keychain.set(second, withMcp(held, { ...mcpLogins(2), ...datadogLogins(2) }));
+
+        expect(retireEditor(s.context, [first, second])).toBe('retired');
+
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...mcpLogins(1), ...datadogLogins(2) });
+      });
+
+      it("are parked from the folder's file as well as from its item", async () => {
+        const { s, held } = await sameLoginOnA();
+        // The file holds Notion, as the folder was made with it, and a Claude on the Keychain item holds Datadog.
+        keychain.set(s.folder, withMcp(held, datadogLogins(2)));
+
+        expect(await editorCommand(s.context, 'off')).toBe(0);
+
+        expect(existsSync(s.folder)).toBe(false);
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...datadogLogins(2), ...mcpLogins(1) });
+      });
+
+      it('are parked from every item too when the folder takes a newer Claude login home', async () => {
+        const { s, first, second } = await twoSpellings();
+        keychain.set(first, withMcp(login('A', 2), mcpLogins(1)));
+        keychain.set(second, withMcp(login('A', 2), datadogLogins(2)));
+
+        expect(await offForBoth(s)).toBe(0);
+
+        expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...mcpLogins(1), ...datadogLogins(2) });
+      });
+
+      it('keep the folder while one of its items cannot be read, since it may hold sign-ins nothing else does', async () => {
+        const { s, held, first, second } = await twoSpellings();
+        keychain.set(first, withMcp(held, mcpLogins(1)));
+        keychain.set(second, withMcp(held, datadogLogins(2)));
+
+        // The item ccx reads second: what it holds is read all the same, or the folder is kept.
+        expect(await whileUnreadable(s, () => offForBoth(s), first)).toBe(1);
+
+        expect(isRealFolder(s.folder)).toBe(true);
+        expect(keychain.has(first)).toBe(true);
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+      });
     });
 
     it('start the folder made for the editor next, from the saved login', async () => {

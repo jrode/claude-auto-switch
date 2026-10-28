@@ -181,6 +181,30 @@ export function* readFolderLoginSteps(login: FolderLogin, io: KeychainIo): Steps
   }
 }
 
+/**
+ * The text of every place a Claude on the folder reads its login from, in the
+ * order readFolderLogin takes them: the item of each spelling that has one,
+ * then the file. Throws when an item cannot be read, since what it holds is
+ * unknown.
+ */
+export function readFolderStores(login: FolderLogin): string[] {
+  return runBlocking(readFolderStoresSteps(login, keychainBlocking));
+}
+
+export function* readFolderStoresSteps(login: FolderLogin, io: KeychainIo): Steps<string[]> {
+  const texts: string[] = [];
+  for (const spelling of login.spellings) {
+    const item = yield* call(() => io.read(spelling));
+    if (item !== null) texts.push(item);
+  }
+  try {
+    texts.push(readFileSync(fileOf(login), 'utf8'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') throw error;
+  }
+  return texts;
+}
+
 /** Whether a Keychain item holds the folder's login for any spelling. */
 export function folderKeychainHolds(login: FolderLogin): boolean {
   return login.spellings.some((spelling) => readKeychainItem(spelling) !== null);

@@ -4,8 +4,14 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { loginTextFingerprint } from '../accounts/credential-vault.js';
 import type { KeychainIo } from '../accounts/keychain-view.js';
+import { readKeychainCredential } from '../accounts/keychain.js';
 import { runBlocking } from '../util/steps.js';
-import { replaceFolderLoginSteps, writeFolderLogin, type FolderLogin } from './folder-login.js';
+import {
+  readFolderStores,
+  replaceFolderLoginSteps,
+  writeFolderLogin,
+  type FolderLogin,
+} from './folder-login.js';
 
 /** The Keychain is a map here, never the real one. */
 const keychain = vi.hoisted(() => new Map<string, string>());
@@ -172,5 +178,36 @@ describe('putting a renewal in the folder that holds the login it retired', () =
     expect(replaced).toBe(true);
     expect(tokenOf(keychain.get(login.dir))).toBe('a-2');
     expect(mcpOf(keychain.get(login.dir))).toEqual(mcp(2));
+  });
+});
+
+describe("reading every place a Claude on the editor's folder keeps its login", () => {
+  it('gives the item of each spelling in order, then the file', () => {
+    const login = folder();
+    const other: FolderLogin = { dir: login.dir, spellings: [login.dir, `${login.dir}-other`] };
+    keychain.set(other.spellings[1]!, claudeLogin(2));
+    keychain.set(other.spellings[0]!, claudeLogin(1));
+    writeFileSync(fileOf(other), claudeLogin(3));
+
+    expect(readFolderStores(other)).toEqual([claudeLogin(1), claudeLogin(2), claudeLogin(3)]);
+  });
+
+  it('gives only the places that hold something', () => {
+    const login = folder();
+    expect(readFolderStores(login)).toEqual([]);
+    writeFileSync(fileOf(login), claudeLogin(3));
+    expect(readFolderStores(login)).toEqual([claudeLogin(3)]);
+  });
+
+  it('throws when an item cannot be read, since what it holds is unknown', () => {
+    const login = folder();
+    const other: FolderLogin = { dir: login.dir, spellings: [login.dir, `${login.dir}-other`] };
+    keychain.set(other.spellings[0]!, claudeLogin(1));
+    vi.mocked(readKeychainCredential).mockImplementationOnce(() => claudeLogin(1));
+    vi.mocked(readKeychainCredential).mockImplementationOnce(() => {
+      throw new Error('Could not read the profile login from macOS Keychain');
+    });
+
+    expect(() => readFolderStores(other)).toThrow('Could not read the profile login');
   });
 });
