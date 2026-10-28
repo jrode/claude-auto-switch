@@ -17,7 +17,9 @@ export const MCP_OAUTH_KEY = 'mcpOAuth';
  *   account's saved login written from a store that lives on.
  * - folder: keep-target for a folder a Claude runs on, except that a folder
  *   holding no login at all is new, and gets the source whole.
- * - park: the source is written whole, because its store is ending.
+ * - park: the source's MCP logins replace the target's, because its store is
+ *   ending. A source that holds none leaves the target's, since another store
+ *   may have parked some there meanwhile.
  */
 export type McpMode = 'keep-target' | 'folder' | 'park';
 
@@ -40,6 +42,20 @@ export function holdsNoLogin(text: string | null): boolean {
   return held !== null && Object.keys(held).length === 0;
 }
 
+/** Whether a text holds MCP logins: an `mcpOAuth` entry, even an empty one. */
+export function holdsMcpLogins(text: string): boolean {
+  const held = asObject(text);
+  return held !== null && Object.hasOwn(held, MCP_OAUTH_KEY);
+}
+
+/** Whether two texts hold the same MCP logins, or none. False when either is not a JSON object. */
+export function sameMcpLogins(a: string, b: string): boolean {
+  const first = asObject(a);
+  const second = asObject(b);
+  if (first === null || second === null) return false;
+  return JSON.stringify(first[MCP_OAUTH_KEY]) === JSON.stringify(second[MCP_OAUTH_KEY]);
+}
+
 /**
  * The text to write when `source` is installed over `target`, what the store
  * holds now (null when it holds nothing). Everything of the source but
@@ -51,9 +67,10 @@ export function mergeMcpLogins(
   target: string | null,
   mode: McpMode = 'keep-target',
 ): string {
-  if (mode === 'park' || (mode === 'folder' && holdsNoLogin(target))) return source;
+  if (mode === 'folder' && holdsNoLogin(target)) return source;
   const incoming = asObject(source);
   if (incoming === null) return source;
+  if (mode === 'park' && Object.hasOwn(incoming, MCP_OAUTH_KEY)) return source;
   let own: unknown;
   if (target !== null) {
     const held = asObject(target);

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { holdsNoLogin, mergeMcpLogins, parkMcpLogins } from './mcp-logins.js';
+import {
+  holdsMcpLogins,
+  holdsNoLogin,
+  mergeMcpLogins,
+  parkMcpLogins,
+  sameMcpLogins,
+} from './mcp-logins.js';
 
 const claude = (n: number) => ({
   accessToken: `a-${n}`,
@@ -78,9 +84,29 @@ describe('the text written when one login is installed over another', () => {
     expect(mergeMcpLogins(from, over, 'folder')).toBe(from);
   });
 
-  it('is the source whole when the store being written is ending its logins into an account (park)', () => {
-    expect(mergeMcpLogins(source, target, 'park')).toBe(source);
-    expect(mergeMcpLogins(source, null, 'park')).toBe(source);
+  describe('from a store that is ending (park)', () => {
+    it('is the source whole when it holds MCP logins, though the target holds some', () => {
+      expect(mergeMcpLogins(source, target, 'park')).toBe(source);
+      expect(mergeMcpLogins(source, null, 'park')).toBe(source);
+    });
+
+    it('is the source whole when it holds an empty set, which is the person having signed out of every one', () => {
+      const emptied = text({ claudeAiOauth: claude(2), mcpOAuth: {} });
+      expect(mergeMcpLogins(emptied, target, 'park')).toBe(emptied);
+    });
+
+    it('leaves the target its MCP logins when the source holds none, since another store may have parked them', () => {
+      const none = text({ claudeAiOauth: claude(2) });
+      expect(parse(mergeMcpLogins(none, target, 'park'))).toEqual({
+        claudeAiOauth: claude(2),
+        mcpOAuth: mcp(1),
+      });
+    });
+
+    it('is the source as it is when neither holds any', () => {
+      const none = `${JSON.stringify({ claudeAiOauth: claude(2) }, null, 2)}\n`;
+      expect(mergeMcpLogins(none, text({ claudeAiOauth: claude(1) }), 'park')).toBe(none);
+    });
   });
 
   describe('into a folder a Claude runs on', () => {
@@ -159,5 +185,36 @@ describe("an ending store's MCP logins, parked in an account's saved login", () 
     ["an ending store's text that is not JSON", saved, '{"mcpOAuth":'],
   ])('leaves the saved login alone for %s', (_what, copy, ending) => {
     expect(parkMcpLogins(copy, ending)).toBe(copy);
+  });
+});
+
+describe('whether a text holds MCP logins', () => {
+  it('does when it has an mcpOAuth entry, even an empty one', () => {
+    expect(holdsMcpLogins(text({ claudeAiOauth: claude(1), mcpOAuth: mcp(1) }))).toBe(true);
+    expect(holdsMcpLogins(text({ mcpOAuth: {} }))).toBe(true);
+  });
+
+  it.each([text({ claudeAiOauth: claude(1) }), '{}', '{"mcpOAuth":', '[]', ''])(
+    'does not for %j',
+    (held) => {
+      expect(holdsMcpLogins(held)).toBe(false);
+    },
+  );
+
+  it('is the same in two texts that hold the same, or none', () => {
+    expect(
+      sameMcpLogins(
+        text({ claudeAiOauth: claude(1), mcpOAuth: mcp(1) }),
+        text({ mcpOAuth: mcp(1) }),
+      ),
+    ).toBe(true);
+    expect(
+      sameMcpLogins(text({ claudeAiOauth: claude(1) }), text({ claudeAiOauth: claude(2) })),
+    ).toBe(true);
+    expect(sameMcpLogins(text({ mcpOAuth: mcp(1) }), text({ mcpOAuth: mcp(2) }))).toBe(false);
+    expect(sameMcpLogins(text({ mcpOAuth: mcp(1) }), text({ claudeAiOauth: claude(1) }))).toBe(
+      false,
+    );
+    expect(sameMcpLogins('{"mcpOAuth":', text({ claudeAiOauth: claude(1) }))).toBe(false);
   });
 });

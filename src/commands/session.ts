@@ -116,6 +116,7 @@ import {
   type SharingSnapshot,
 } from '../accounts/shared-login.js';
 import { carryTargets } from '../accounts/duplicate-guard.js';
+import type { McpMode } from '../accounts/mcp-logins.js';
 import {
   pullProfileIntoSessionAsync,
   recoverLoginFromLiveSession,
@@ -874,14 +875,22 @@ export async function runInteractiveHotSwap(
    * Claude runs; a move and the session's end run it blocking. `lockWaitMs`:
    * how long a profile sharing the login is waited for; a move under the
    * running Claude passes 0, since it runs on the thread that relays it.
+   * `mcp`: the account keeps its own MCP logins, unless the session is ending
+   * and parks its own in the account.
    */
-  const saveBack = (account: Account, confirmedOwner?: string | null, lockWaitMs?: number): SaveOutcome =>
-    runBlocking(saveBackSteps(account, confirmedOwner, keychainBlocking, lockWaitMs));
+  const saveBack = (
+    account: Account,
+    confirmedOwner?: string | null,
+    lockWaitMs?: number,
+    mcp?: McpMode,
+  ): SaveOutcome =>
+    runBlocking(saveBackSteps(account, confirmedOwner, keychainBlocking, lockWaitMs, mcp));
   const saveBackSteps = function* (
     account: Account,
     confirmedOwner: string | null | undefined,
     io: KeychainIo,
     lockWaitMs?: number,
+    mcp: McpMode = 'keep-target',
   ): Steps<SaveOutcome> {
     // Nothing there to copy. A later tick may find one.
     try {
@@ -949,7 +958,7 @@ export async function runInteractiveHotSwap(
         carryTargets(account, accounts),
         // Keeps the account's previous credential as a rollback cushion.
         function* () {
-          yield* installCredentialSteps(account.dir, sessionCreds, io);
+          yield* installCredentialSteps(account.dir, sessionCreds, io, { mcp });
         },
         io,
         {
@@ -2945,7 +2954,7 @@ export async function runInteractiveHotSwap(
   // session's older token, destroying the login it just renewed.
   finishWithLease(announced, {
     saveBack: () => {
-      if (current) saveBack(current);
+      if (current) saveBack(current, undefined, undefined, 'park');
     },
     releaseLease: (name) => releaseLease(name, context.ctx),
   });

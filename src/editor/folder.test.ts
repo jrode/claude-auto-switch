@@ -1774,6 +1774,119 @@ describe('the MCP logins in the editor folder', () => {
     expect(mcpOf(folderLogin(s))).toEqual(MCP);
   });
 
+  describe('when the folder is retired', () => {
+    /** The editor on A, whose folder and saved login hold one Claude login; the saved one carries older MCP logins. */
+    async function sameLoginOnA(): Promise<{ s: Scene; held: string }> {
+      const s = await scene();
+      await editorOn(s);
+      const held = folderLogin(s)!;
+      writeFileSync(path.join(s.dirOf('A'), '.credentials.json'), withMcp(held, mcpLogins(7)));
+      writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(held, MCP));
+      return { s, held };
+    }
+
+    it("are parked in the account's saved login though the folder's Claude login is no newer, and its Claude login stays", async () => {
+      const { s, held } = await sameLoginOnA();
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(existsSync(s.folder)).toBe(false);
+      expect(profileLogin(s, 'A')).toBe(withMcp(held, MCP));
+    });
+
+    it('start the folder made for the editor next, from the saved login', async () => {
+      const { s } = await sameLoginOnA();
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      await editorOn(s);
+
+      expect(mcpOf(folderLogin(s))).toEqual(MCP);
+    });
+
+    it("go with the rest of the folder's login home when that is newer", async () => {
+      const { s } = await sameLoginOnA();
+      writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 2), MCP));
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual(MCP);
+    });
+
+    it('leave the saved login exactly as it is when the folder holds none', async () => {
+      const { s, held } = await sameLoginOnA();
+      writeFileSync(path.join(s.folder, '.credentials.json'), held);
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(profileLogin(s, 'A')).toBe(withMcp(held, mcpLogins(7)));
+    });
+
+    it('are not parked in the saved login of an account the folder is not signed in as', async () => {
+      const { s } = await sameLoginOnA();
+      const state = path.join(s.folder, '.claude.json');
+      writeFileSync(
+        state,
+        JSON.stringify({
+          ...json(state),
+          oauthAccount: { emailAddress: emailOf('B'), accountUuid: 'uuid-B' },
+        }),
+      );
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+    });
+
+    it('are left to the saved login that holds them when the folder, whose login is newer, holds none', async () => {
+      const { s } = await sameLoginOnA();
+      writeFileSync(path.join(s.folder, '.credentials.json'), login('A', 2));
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+    });
+
+    it('are kept in a saved login of their own when the account has none, and it still reads as signed out', async () => {
+      const { s, held } = await sameLoginOnA();
+      // The folder's Claude signed out and kept its MCP logins, and the account's saved login is gone.
+      writeFileSync(
+        path.join(s.folder, '.credentials.json'),
+        JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '' }, mcpOAuth: MCP }),
+      );
+      rmSync(path.join(s.dirOf('A'), '.credentials.json'));
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(existsSync(s.folder)).toBe(false);
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual(MCP);
+      expect(tokenOf(profileLogin(s, 'A'))).toBeNull();
+      expect(held).toBeTruthy();
+    });
+
+    it(
+      "keep the folder, and its login, while the account's saved login cannot be written, and park them once it can",
+      { timeout: 30_000 },
+      async () => {
+        const { s, held } = await sameLoginOnA();
+        const lock = path.join(s.dirOf('A'), '.oauth_refresh.lock');
+        mkdirSync(lock);
+
+        expect(await editorCommand(s.context, 'off')).toBe(1);
+
+        expect(mcpOf(folderLogin(s))).toEqual(MCP);
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+
+        rmSync(lock, { recursive: true });
+        expect(await editorCommand(s.context, 'off')).toBe(0);
+
+        expect(existsSync(s.folder)).toBe(false);
+        expect(profileLogin(s, 'A')).toBe(withMcp(held, MCP));
+      },
+    );
+  });
+
   it('stay in the folder when a renewal waiting in the carry queue is made', async () => {
     const s = await scene();
     await editorOn(s);

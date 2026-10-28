@@ -370,6 +370,14 @@ describe('installCredential and the MCP logins in the stores', () => {
     expect(readFileSync(credentialPath(fresh.d), 'utf8')).toBe(source);
   });
 
+  it("leaves the account's MCP logins parked when the ending store holds none", () => {
+    const { d, incoming } = pair(loginText('old', mcp(1)), loginText('new'));
+
+    expect(installCredential(d, incoming, { mcp: 'park' })).toBe(true);
+
+    expect(readFileSync(credentialPath(d), 'utf8')).toBe(loginText('new', mcp(1)));
+  });
+
   it('merges with the login the target holds when it is written, not as it was when first looked at', () => {
     const d = dir();
     const held = loginText('old', mcp(1));
