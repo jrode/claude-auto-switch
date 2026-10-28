@@ -7,6 +7,9 @@ import { addAccount } from '../../src/accounts/registry.js';
 import { setActive } from '../../src/state/active.js';
 import { loadConfig } from '../../src/config/config.js';
 import { sessionDirFor } from '../../src/session/session-dir.js';
+import { liveLeases } from '../../src/session/lease.js';
+import { configHome } from '../../src/config/paths.js';
+import { readEvents } from '../../src/events/log.js';
 import { writeSwitchRequest } from '../../src/state/switch-request.js';
 import type { CliContext } from '../../src/context.js';
 import {
@@ -264,4 +267,94 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)("a terminal session's MCP log
       expect(mcpOf(s.saved('A'))).toEqual({ ...datadog(5), ...mcp(3) });
     },
   );
+  describe('when the Claude login in the session is not one to save home', () => {
+    /**
+     * A session on A that has refreshed Notion's sign-in, which lives only in its folder
+     * now: A's saved login holds the retired one. Nothing pulls A's login into the
+     * folder meanwhile, as its Claude being busy refreshing would keep it from.
+     */
+    async function sessionHoldingARefresh(s: Scene) {
+      const running = runCommand(s.context, []);
+      await until(() => launches(readLog(s.runsLog)).length >= 1, 30_000);
+      const folder = sessionDirFor(process.pid, s.context.ctx);
+      mkdirSync(path.join(folder, '.oauth_refresh.lock'));
+      return { running, folder, creds: path.join(folder, '.credentials.json') };
+    }
+
+    it(
+      'parks its sign-ins when Claude signed out, and leaves the account its Claude login',
+      { timeout: 90_000 },
+      async () => {
+        const s = scene();
+        const { running, creds } = await sessionHoldingARefresh(s);
+        writeFileSync(
+          creds,
+          JSON.stringify({
+            account: 'A',
+            claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: 0 },
+            mcpOAuth: mcp(3),
+          }),
+        );
+
+        writeFileSync(s.exitClaude, '');
+        expect(await running).toBe(0);
+
+        expect(mcpOf(s.saved('A'))).toEqual(mcp(3));
+        expect(tokenOf(s.saved('A'))).toBe('a-A-1');
+      },
+    );
+
+    it(
+      'parks its sign-ins when the session is signed in as someone else',
+      { timeout: 90_000 },
+      async () => {
+        const s = scene();
+        const { running, folder, creds } = await sessionHoldingARefresh(s);
+        const state = path.join(folder, '.claude.json');
+        writeFileSync(
+          state,
+          JSON.stringify({
+            ...(JSON.parse(read(state) ?? '{}') as object),
+            oauthAccount: { emailAddress: 'someone@example.com', accountUuid: 'uuid-someone' },
+          }),
+        );
+        writeFileSync(creds, login('A', mcp(3)));
+
+        writeFileSync(s.exitClaude, '');
+        expect(await running).toBe(0);
+
+        expect(mcpOf(s.saved('A'))).toEqual(mcp(3));
+        expect(tokenOf(s.saved('A'))).toBe('a-A-1');
+      },
+    );
+
+    it(
+      'ends all the same when they cannot be parked, and says so',
+      { timeout: 90_000 },
+      async () => {
+        const s = scene();
+        const { running, creds } = await sessionHoldingARefresh(s);
+        writeFileSync(
+          creds,
+          JSON.stringify({
+            account: 'A',
+            claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: 0 },
+            mcpOAuth: mcp(3),
+          }),
+        );
+        // Someone else is changing A's saved login.
+        mkdirSync(path.join(s.home, 'profiles', 'A', '.oauth_refresh.lock'));
+
+        writeFileSync(s.exitClaude, '');
+        expect(await running).toBe(0);
+
+        expect(liveLeases(s.context.ctx)).toEqual([]);
+        expect(mcpOf(s.saved('A'))).toEqual(mcp(1));
+        const said = readEvents(configHome(s.context.ctx), 100).map((e) => e.msg);
+        expect(said.some((msg) => msg.includes("could not keep this session's MCP sign-ins"))).toBe(
+          true,
+        );
+      },
+    );
+  });
 });

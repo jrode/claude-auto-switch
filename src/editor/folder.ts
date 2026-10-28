@@ -6,11 +6,7 @@ import { getActive } from '../state/active.js';
 import { configHome, type PathCtx } from '../config/paths.js';
 import { readTarget, removeTarget, setTarget } from '../daemon/junction.js';
 import { acquireOwnedLock, CREDENTIALS_LOCK_DIR, lockDirHeld, lockDirSteps, withCredentialLockIfFree } from '../claude/locks.js';
-import {
-  CREDENTIALS_FILE,
-  readCredential,
-  writeCredential,
-} from '../accounts/credential-storage.js';
+import { CREDENTIALS_FILE, readCredential } from '../accounts/credential-storage.js';
 import {
   credentialFingerprint,
   credentialPath,
@@ -18,21 +14,17 @@ import {
   identityKey,
   installCredential,
   loginTextFingerprint,
-  REREAD_PLACEHOLDER,
   sessionIdentityEmail,
   usableLoginText,
 } from '../accounts/credential-vault.js';
-import { readKeychainItem } from '../accounts/keychain-view.js';
-import {
-  holdsMcpLogins,
-  holdsMcpLoginsOf,
-  parkMcpLogins,
-  type McpMode,
-} from '../accounts/mcp-logins.js';
+import { keychainBlocking, readKeychainItem } from '../accounts/keychain-view.js';
+import { holdsMcpLogins, type McpMode } from '../accounts/mcp-logins.js';
+import { parkMcpLoginsSteps } from '../accounts/mcp-park.js';
 import { loginExpiresAt, readExpiresAt } from '../usage/token-expiry.js';
 import { loginIsKnownDead } from '../usage/dead-login-store.js';
 import { loginWasRejected } from '../accounts/account-login.js';
 import { sha256Fingerprint } from '../util/fingerprint.js';
+import { thrownReason } from '../util/thrown-reason.js';
 import { runBlocking } from '../util/steps.js';
 import { decideSaveBack } from '../accounts/save-back.js';
 import { decidePull } from '../accounts/credential-sync.js';
@@ -614,40 +606,19 @@ function saveEditorLoginHome(
  * cannot be done, so the folder is kept with them.
  */
 function parkEditorMcpLogins(account: Account, text: string, c: PathCtx): void {
-  const lock = runBlocking(lockDirSteps(path.join(account.dir, CREDENTIALS_LOCK_DIR)));
-  if (!lock.held)
-    throw new Error(
-      `${account.name}'s saved login is being changed, so the editor's MCP logins could not be kept in it`,
-    );
   try {
-    const file = credentialPath(account.dir);
-    const saved = readSavedLoginOr(file, REREAD_PLACEHOLDER);
-    const parked = parkMcpLogins(saved, text);
-    if (parked === saved && !holdsMcpLoginsOf(saved, text))
-      throw new Error(`the editor's MCP logins could not be kept in ${account.name}'s saved login`);
-    if (parked === saved) return;
-    writeCredential(file, parked);
-    appendEvent(
-      configHome(c),
-      `the editor's MCP logins were kept in ${account.name}'s saved login as its folder was retired`,
-      Date.now(),
-      {
-        kind: 'credential-sync',
-      },
-    );
-  } finally {
-    lock.release();
-  }
-}
-
-/** The login saved at `file`, or `absent` when there is none; throws when it cannot be read. */
-function readSavedLoginOr(file: string, absent: string): string {
-  try {
-    return readCredential(file);
+    if (!runBlocking(parkMcpLoginsSteps(account.dir, text, keychainBlocking))) return;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return absent;
-    throw error;
+    throw new Error(
+      `the editor's MCP logins could not be kept in ${account.name}'s saved login: ${thrownReason(error)}`,
+    );
   }
+  appendEvent(
+    configHome(c),
+    `the editor's MCP logins were kept in ${account.name}'s saved login as its folder was retired`,
+    Date.now(),
+    { kind: 'credential-sync' },
+  );
 }
 
 /**

@@ -1,4 +1,4 @@
-import { hasCredentialSteps } from '../accounts/credential-storage.js';
+import { hasCredentialSteps, readCredentialSteps } from '../accounts/credential-storage.js';
 import { thrownReason } from '../util/thrown-reason.js';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -117,6 +117,7 @@ import {
 } from '../accounts/shared-login.js';
 import { carryTargets } from '../accounts/duplicate-guard.js';
 import type { McpMode } from '../accounts/mcp-logins.js';
+import { parkMcpLoginsSteps } from '../accounts/mcp-park.js';
 import {
   pullProfileIntoSessionAsync,
   recoverLoginFromLiveSession,
@@ -885,6 +886,27 @@ export async function runInteractiveHotSwap(
     mcp?: McpMode,
   ): SaveOutcome =>
     runBlocking(saveBackSteps(account, confirmedOwner, keychainBlocking, lockWaitMs, mcp));
+  /**
+   * A session that is ending parks its MCP sign-ins in `account`'s saved login
+   * even when its Claude login is not one to save home (signed out, or not the
+   * account's): they are the person's own, and a refresh of one lives only in
+   * this folder. Never throws, so the session still ends.
+   */
+  const parkSessionMcpLogins = function* (account: Account, io: KeychainIo): Steps<void> {
+    try {
+      const ending = yield* readCredentialSteps(sessionCreds, io);
+      if (yield* parkMcpLoginsSteps(account.dir, ending, io)) {
+        logEvent(`kept this session's MCP sign-ins in "${account.name}"'s saved login`, {
+          kind: 'credential-sync',
+        });
+      }
+    } catch (error) {
+      logEvent(
+        `could not keep this session's MCP sign-ins in "${account.name}"'s saved login: ${thrownReason(error)}`,
+        { kind: 'credential-sync' },
+      );
+    }
+  };
   const saveBackSteps = function* (
     account: Account,
     confirmedOwner: string | null | undefined,
@@ -913,6 +935,7 @@ export async function runInteractiveHotSwap(
         },
         context.ctx,
       );
+      if (mcp === 'park') yield* parkSessionMcpLogins(account, io);
       // The session is signed out. Nothing to write, and nothing that a later
       // poll would write either, until the file changes.
       return 'settled';
@@ -941,6 +964,7 @@ export async function runInteractiveHotSwap(
       // every credential change, and it was landing in Claude's interface. If it
       // matters, `ccx doctor` reports the same mismatch properly.
       logEvent(decision.reason);
+      if (mcp === 'park') yield* parkSessionMcpLogins(account, io);
       // A refusal is a settled answer about this credential: asking again can
       // only produce the same refusal, and re-asking is what froze the machine.
       return 'settled';
