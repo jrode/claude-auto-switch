@@ -105,6 +105,14 @@ const mcpLogins = (n: number) => ({
   },
 });
 const MCP = mcpLogins(1);
+/** Sign-ins to a second server, so a merge per server can be told from one that replaces the lot. */
+const datadogLogins = (n: number) => ({
+  'datadog|2': {
+    serverName: 'datadog',
+    accessToken: `dd-access-fake-${n}`,
+    refreshToken: `dd-refresh-fake-${n}`,
+  },
+});
 const withMcp = (text: string, mcpOAuth: unknown = MCP): string =>
   JSON.stringify({ ...(JSON.parse(text) as object), mcpOAuth });
 const mcpOf = (text: string | null | undefined): unknown => {
@@ -1792,6 +1800,50 @@ describe('the MCP logins in the editor folder', () => {
 
       expect(existsSync(s.folder)).toBe(false);
       expect(profileLogin(s, 'A')).toBe(withMcp(held, MCP));
+    });
+
+    it('are parked server by server, so the saved login keeps a server the folder does not hold', async () => {
+      const { s, held } = await sameLoginOnA();
+      writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(held, datadogLogins(2)));
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(existsSync(s.folder)).toBe(false);
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...mcpLogins(7), ...datadogLogins(2) });
+      expect(tokenOf(profileLogin(s, 'A'))).toBe(tokenOf(held));
+    });
+
+    it('are parked server by server too when the folder takes its newer Claude login home', async () => {
+      const { s } = await sameLoginOnA();
+      writeFileSync(
+        path.join(s.folder, '.credentials.json'),
+        withMcp(login('A', 2), datadogLogins(2)),
+      );
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...mcpLogins(7), ...datadogLogins(2) });
+    });
+
+    it('are none to park in an empty set, which leaves the saved login as it is', async () => {
+      const { s, held } = await sameLoginOnA();
+      writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(held, {}));
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(existsSync(s.folder)).toBe(false);
+      expect(profileLogin(s, 'A')).toBe(withMcp(held, mcpLogins(7)));
+    });
+
+    it('are none to park in an empty set when the folder takes its newer Claude login home', async () => {
+      const { s } = await sameLoginOnA();
+      writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 2), {}));
+
+      expect(await editorCommand(s.context, 'off')).toBe(0);
+
+      expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
     });
 
     it('start the folder made for the editor next, from the saved login', async () => {

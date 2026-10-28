@@ -25,8 +25,8 @@ import {
 import { readKeychainItem } from '../accounts/keychain-view.js';
 import {
   holdsMcpLogins,
+  holdsMcpLoginsOf,
   parkMcpLogins,
-  sameMcpLogins,
   type McpMode,
 } from '../accounts/mcp-logins.js';
 import { loginExpiresAt, readExpiresAt } from '../usage/token-expiry.js';
@@ -623,7 +623,7 @@ function parkEditorMcpLogins(account: Account, text: string, c: PathCtx): void {
     const file = credentialPath(account.dir);
     const saved = readSavedLoginOr(file, REREAD_PLACEHOLDER);
     const parked = parkMcpLogins(saved, text);
-    if (!sameMcpLogins(parked, text))
+    if (parked === saved && !holdsMcpLoginsOf(saved, text))
       throw new Error(`the editor's MCP logins could not be kept in ${account.name}'s saved login`);
     if (parked === saved) return;
     writeCredential(file, parked);

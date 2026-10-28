@@ -272,6 +272,10 @@ describe('nudgeLoginReread', () => {
 const mcp = (n: number) => ({
   'notion|1': { accessToken: `mcp-access-fake-${n}`, refreshToken: `mcp-refresh-fake-${n}` },
 });
+/** Sign-ins to a second server, so a merge per server can be told from one that replaces the lot. */
+const datadog = (n: number) => ({
+  'datadog|2': { accessToken: `dd-access-fake-${n}`, refreshToken: `dd-refresh-fake-${n}` },
+});
 const loginText = (token: string, mcpOAuth?: unknown): string =>
   JSON.stringify({
     claudeAiOauth: { accessToken: `tok-${token}`, refreshToken: `ref-${token}`, expiresAt: 1 },
@@ -368,6 +372,22 @@ describe('installCredential and the MCP logins in the stores', () => {
     const fresh = pair(null, source);
     expect(installCredential(fresh.d, fresh.incoming)).toBe(true);
     expect(readFileSync(credentialPath(fresh.d), 'utf8')).toBe(source);
+  });
+
+  it("joins an ending store's MCP logins to the account's server by server, as it parks them", () => {
+    const { d, incoming } = pair(loginText('old', mcp(1)), loginText('new', datadog(2)));
+
+    expect(installCredential(d, incoming, { mcp: 'park' })).toBe(true);
+
+    expect(mcpIn(credentialPath(d))).toEqual({ ...mcp(1), ...datadog(2) });
+  });
+
+  it("parks nothing for an empty set, and leaves the account's MCP logins as they are", () => {
+    const { d, incoming } = pair(loginText('old', mcp(1)), loginText('new', {}));
+
+    expect(installCredential(d, incoming, { mcp: 'park' })).toBe(true);
+
+    expect(readFileSync(credentialPath(d), 'utf8')).toBe(loginText('new', mcp(1)));
   });
 
   it("leaves the account's MCP logins parked when the ending store holds none", () => {

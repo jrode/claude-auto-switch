@@ -22,11 +22,14 @@ session's, the editor's) keeps its own sign-ins through every move: changing
 account replaces its Claude login and nothing else, and so does a renewal
 carried into it. An account's saved login keeps its own too when a login is
 saved home into it from a folder that goes on running. A folder that ends parks
-its sign-ins in the account it ends on, replacing those parked there, and
-leaves them alone when it holds none. That is a terminal session at its end, and
-the editor's folder when it is retired, even when its Claude login is no newer
-than the saved one. A folder with no login yet, such as a new session's or a
-newly made editor folder, starts with whatever its account's saved login holds.
+its sign-ins in the account it ends on, server by server: a sign-in it holds
+replaces the one parked for that server, and one parked for a server it does not
+hold stays, so two folders that end on one account each leave theirs. Signing
+out of a server in one folder does not remove a sign-in another folder parked
+for it. That is a terminal session at its end, and the editor's folder when it
+is retired, even when its Claude login is no newer than the saved one. A folder
+with no login yet, such as a new session's or a newly made editor folder,
+starts with whatever its account's saved login holds.
 A login that carries several sign-ins is usually longer than one line of
 `security -i` takes, so ccx saves it in `security`'s arguments, as Claude Code
 does. For the moment `security` runs, other programs running as you can see

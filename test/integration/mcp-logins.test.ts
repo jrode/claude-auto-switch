@@ -53,6 +53,14 @@ const mcp = (n: number) => ({
     refreshToken: `mcp-refresh-fake-${n}`,
   },
 });
+/** Sign-ins to a second server, so a merge per server can be told from one that replaces the lot. */
+const datadog = (n: number) => ({
+  'datadog|2': {
+    serverName: 'datadog',
+    accessToken: `dd-access-fake-${n}`,
+    refreshToken: `dd-refresh-fake-${n}`,
+  },
+});
 const login = (name: string, mcpOAuth?: unknown): string =>
   JSON.stringify({
     account: name,
@@ -232,6 +240,28 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)("a terminal session's MCP log
       expect(await running).toBe(0);
 
       expect(mcpOf(s.saved('A'))).toEqual(mcp(5));
+    },
+  );
+  it(
+    'keeps the sign-ins another folder parked for other servers, when it ends with its own',
+    { timeout: 90_000 },
+    async () => {
+      const s = scene();
+      const running = runCommand(s.context, []);
+      await until(() => launches(readLog(s.runsLog)).length >= 1, 30_000);
+      // This session signed in to Notion. The editor's folder, on the same account, ended meanwhile and parked Datadog.
+      const file = path.join(sessionDirFor(process.pid, s.context.ctx), '.credentials.json');
+      const own = JSON.parse(s.session() ?? '{}') as Record<string, unknown>;
+      writeFileSync(file, JSON.stringify({ ...own, mcpOAuth: mcp(3) }));
+      writeFileSync(
+        path.join(s.home, 'profiles', 'A', '.credentials.json'),
+        login('A', datadog(5)),
+      );
+
+      writeFileSync(s.exitClaude, '');
+      expect(await running).toBe(0);
+
+      expect(mcpOf(s.saved('A'))).toEqual({ ...datadog(5), ...mcp(3) });
     },
   );
 });

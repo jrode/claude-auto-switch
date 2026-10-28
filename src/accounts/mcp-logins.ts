@@ -17,9 +17,11 @@ export const MCP_OAUTH_KEY = 'mcpOAuth';
  *   account's saved login written from a store that lives on.
  * - folder: keep-target for a folder a Claude runs on, except that a folder
  *   holding no login at all is new, and gets the source whole.
- * - park: the source's MCP logins replace the target's, because its store is
- *   ending. A source that holds none leaves the target's, since another store
- *   may have parked some there meanwhile.
+ * - park: the source's MCP logins join the target's server by server, because
+ *   its store is ending: a server the source holds replaces the target's
+ *   sign-in for it, and one it does not hold stays. A source that holds none,
+ *   or an empty set, parks nothing, since another store may have parked some
+ *   there meanwhile.
  */
 export type McpMode = 'keep-target' | 'folder' | 'park';
 
@@ -42,18 +44,40 @@ export function holdsNoLogin(text: string | null): boolean {
   return held !== null && Object.keys(held).length === 0;
 }
 
-/** Whether a text holds MCP logins: an `mcpOAuth` entry, even an empty one. */
-export function holdsMcpLogins(text: string): boolean {
-  const held = asObject(text);
-  return held !== null && Object.hasOwn(held, MCP_OAUTH_KEY);
+/** A map of sign-ins with a server in it, or null: an empty `mcpOAuth` holds nothing. */
+function signIns(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.keys(value).length > 0
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
-/** Whether two texts hold the same MCP logins, or none. False when either is not a JSON object. */
-export function sameMcpLogins(a: string, b: string): boolean {
-  const first = asObject(a);
-  const second = asObject(b);
-  if (first === null || second === null) return false;
-  return JSON.stringify(first[MCP_OAUTH_KEY]) === JSON.stringify(second[MCP_OAUTH_KEY]);
+const sameSignIn = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+
+/** Whether a text holds MCP logins: a sign-in to at least one server in `mcpOAuth`. */
+export function holdsMcpLogins(text: string): boolean {
+  return signIns(asObject(text)?.[MCP_OAUTH_KEY]) !== null;
+}
+
+/**
+ * Whether `copy` holds every sign-in `ending` holds, each with the same value.
+ * False when either is not a JSON object.
+ */
+export function holdsMcpLoginsOf(copy: string, ending: string): boolean {
+  const saved = asObject(copy);
+  const leaving = asObject(ending);
+  if (saved === null || leaving === null) return false;
+  const parking = signIns(leaving[MCP_OAUTH_KEY]);
+  if (parking === null) return true;
+  const kept = signIns(saved[MCP_OAUTH_KEY]);
+  return (
+    kept !== null &&
+    Object.entries(parking).every(
+      ([server, signIn]) => Object.hasOwn(kept, server) && sameSignIn(kept[server], signIn),
+    )
+  );
 }
 
 /**
@@ -70,7 +94,16 @@ export function mergeMcpLogins(
   if (mode === 'folder' && holdsNoLogin(target)) return source;
   const incoming = asObject(source);
   if (incoming === null) return source;
-  if (mode === 'park' && Object.hasOwn(incoming, MCP_OAUTH_KEY)) return source;
+  const parking = mode === 'park' ? signIns(incoming[MCP_OAUTH_KEY]) : null;
+  if (parking !== null) {
+    const held = target === null ? {} : asObject(target);
+    if (held === null) return source;
+    const kept = signIns(held[MCP_OAUTH_KEY]);
+    if (kept === null || Object.keys(kept).every((server) => Object.hasOwn(parking, server))) {
+      return source;
+    }
+    return JSON.stringify({ ...incoming, [MCP_OAUTH_KEY]: { ...kept, ...parking } });
+  }
   let own: unknown;
   if (target !== null) {
     const held = asObject(target);
@@ -86,14 +119,16 @@ export function mergeMcpLogins(
 
 /**
  * `copy`, an account's saved login, with the MCP logins of `ending`, the text of
- * a store that is going, and its Claude login as it is. `copy` itself when
- * `ending` holds none, or already agrees, or either is not a JSON object.
+ * a store that is going, joined to those it holds server by server, and its
+ * Claude login as it is. `copy` itself when `ending` holds none, an empty set
+ * included, or `copy` holds its sign-ins already, or either is not a JSON object.
  */
 export function parkMcpLogins(copy: string, ending: string): string {
   const leaving = asObject(ending);
   const saved = asObject(copy);
-  if (leaving === null || saved === null || !Object.hasOwn(leaving, MCP_OAUTH_KEY)) return copy;
-  const parked = leaving[MCP_OAUTH_KEY];
-  if (JSON.stringify(saved[MCP_OAUTH_KEY]) === JSON.stringify(parked)) return copy;
-  return JSON.stringify({ ...saved, [MCP_OAUTH_KEY]: parked });
+  if (leaving === null || saved === null) return copy;
+  const parking = signIns(leaving[MCP_OAUTH_KEY]);
+  if (parking === null || holdsMcpLoginsOf(copy, ending)) return copy;
+  const kept = signIns(saved[MCP_OAUTH_KEY]) ?? {};
+  return JSON.stringify({ ...saved, [MCP_OAUTH_KEY]: { ...kept, ...parking } });
 }
