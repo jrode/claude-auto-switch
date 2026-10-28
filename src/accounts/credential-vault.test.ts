@@ -21,7 +21,10 @@ import {
   nudgeLoginReread,
   REREAD_PLACEHOLDER,
   usableLoginText,
+  installCredentialSteps,
 } from './credential-vault.js';
+import type { KeychainIo } from './keychain-view.js';
+import { runBlocking } from '../util/steps.js';
 
 function dir(): string {
   return mkdtempSync(path.join(tmpdir(), 'cas-vault-'));
@@ -310,5 +313,109 @@ describe('whether a text is a login when it holds MCP logins', () => {
     expect(installCredential(d, incoming)).toBe(false);
 
     expect(readFileSync(credentialPath(d), 'utf8')).toBe(loginText('old', mcp(1)));
+  });
+});
+
+const mcpIn = (file: string): unknown =>
+  (JSON.parse(readFileSync(file, 'utf8')) as { mcpOAuth?: unknown }).mcpOAuth;
+
+describe('installCredential and the MCP logins in the stores', () => {
+  function pair(target: string | null, source: string): { d: string; incoming: string } {
+    const d = dir();
+    if (target !== null) writeFileSync(credentialPath(d), target, 'utf8');
+    const incoming = path.join(dir(), 'incoming.json');
+    writeFileSync(incoming, source, 'utf8');
+    return { d, incoming };
+  }
+
+  it("keeps the target's own MCP logins and copies none of the source's, as a live store's login is saved into an account", () => {
+    const { d, incoming } = pair(loginText('old', mcp(1)), loginText('new', mcp(2)));
+
+    expect(installCredential(d, incoming)).toBe(true);
+
+    expect(readFileSync(credentialPath(d), 'utf8')).toBe(loginText('new', mcp(1)));
+    // The cushion is the login as it was, MCP logins and all.
+    expect(readFileSync(previousCredentialPath(d), 'utf8')).toBe(loginText('old', mcp(1)));
+  });
+
+  it('gives a target with none no MCP logins either', () => {
+    const { d, incoming } = pair(loginText('old'), loginText('new', mcp(2)));
+
+    expect(installCredential(d, incoming)).toBe(true);
+
+    expect(readFileSync(credentialPath(d), 'utf8')).toBe(loginText('new'));
+  });
+
+  it('keeps the MCP logins of a target that holds no Claude login, such as one signed out', () => {
+    const signedOut = JSON.stringify({
+      claudeAiOauth: { accessToken: '', refreshToken: '' },
+      mcpOAuth: mcp(1),
+    });
+    const { d, incoming } = pair(signedOut, loginText('new', mcp(2)));
+
+    expect(installCredential(d, incoming)).toBe(true);
+
+    expect(readFileSync(credentialPath(d), 'utf8')).toBe(loginText('new', mcp(1)));
+  });
+
+  it('writes the source exactly as it is when neither holds any', () => {
+    const source = `${JSON.stringify(JSON.parse(loginText('new')), null, 2)}\n`;
+    const { d, incoming } = pair(loginText('old'), source);
+
+    expect(installCredential(d, incoming)).toBe(true);
+    expect(readFileSync(credentialPath(d), 'utf8')).toBe(source);
+
+    const fresh = pair(null, source);
+    expect(installCredential(fresh.d, fresh.incoming)).toBe(true);
+    expect(readFileSync(credentialPath(fresh.d), 'utf8')).toBe(source);
+  });
+
+  it('merges with the login the target holds when it is written, not as it was when first looked at', () => {
+    const d = dir();
+    const held = loginText('old', mcp(1));
+    const refreshed = loginText('old', mcp(2));
+    const items = new Map<string, string>([[d, held]]);
+    const io: KeychainIo = {
+      read: (item) => {
+        // The target's Claude saves a refreshed MCP sign-in once ccx has kept its cushion.
+        if (existsSync(previousCredentialPath(d)) && items.get(item) === held)
+          items.set(item, refreshed);
+        return items.get(item) ?? null;
+      },
+      write: (item, text) => {
+        items.set(item, text);
+      },
+      remove: (item) => {
+        items.delete(item);
+      },
+    };
+    const incoming = path.join(dir(), 'new.json');
+    writeFileSync(incoming, loginText('new', mcp(9)), 'utf8');
+
+    expect(runBlocking(installCredentialSteps(d, incoming, io, { mcp: 'folder' }))).toBe(true);
+
+    expect(items.get(d)).toBe(loginText('new', mcp(2)));
+  });
+
+  it("writes the whole source over the account's, MCP logins and all, as a store that is ending parks them", () => {
+    const { d, incoming } = pair(loginText('old', mcp(1)), loginText('new', mcp(2)));
+
+    expect(installCredential(d, incoming, { mcp: 'park' })).toBe(true);
+
+    expect(readFileSync(credentialPath(d), 'utf8')).toBe(loginText('new', mcp(2)));
+  });
+
+  it('starts a folder that holds no login from the source whole, and keeps the own MCP logins of one that has a login', () => {
+    const fresh = pair(null, loginText('new', mcp(2)));
+    expect(installCredential(fresh.d, fresh.incoming, { mcp: 'folder' })).toBe(true);
+    expect(mcpIn(credentialPath(fresh.d))).toEqual(mcp(2));
+
+    const placeholder = pair(REREAD_PLACEHOLDER, loginText('new', mcp(2)));
+    expect(installCredential(placeholder.d, placeholder.incoming, { mcp: 'folder' })).toBe(true);
+    expect(mcpIn(credentialPath(placeholder.d))).toEqual(mcp(2));
+
+    const live = pair(loginText('old', mcp(1)), loginText('new', mcp(2)));
+    expect(installCredential(live.d, live.incoming, { mcp: 'folder' })).toBe(true);
+    expect(mcpIn(credentialPath(live.d))).toEqual(mcp(1));
   });
 });

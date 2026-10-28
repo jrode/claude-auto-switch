@@ -9,9 +9,10 @@ import {
   readCredential,
   readCredentialSteps,
   removeCredential,
+  writeCredentialSteps,
 } from './credential-storage.js';
 import { keychainBlocking, type KeychainIo } from './keychain-view.js';
-import { MCP_OAUTH_KEY } from './mcp-logins.js';
+import { MCP_OAUTH_KEY, mergeMcpLogins, type McpMode } from './mcp-logins.js';
 export { CREDENTIALS_FILE } from './credential-storage.js';
 
 /**
@@ -266,18 +267,37 @@ export function* nudgeLoginRereadSteps(
   }
 }
 
+export interface InstallHow {
+  /** What becomes of the source's MCP logins (mcp-logins.ts); keep-target when not given. */
+  mcp?: McpMode;
+  /** Told the text the install replaced, as read just before the write: null when the target held none. */
+  replaced?: (previous: string | null) => void;
+}
+
 /**
  * Install `sourceFile` as `dir`'s credential, keeping the existing one as the
  * previous generation. Refuses to install an unusable (empty/corrupt) source,
  * because overwriting a good login with garbage is the worst outcome.
+ * The target keeps its own MCP logins unless `how.mcp` says otherwise.
  * Returns false when nothing was installed.
  */
-export function installCredential(dir: string, sourceFile: string): boolean {
-  return runBlocking(installCredentialSteps(dir, sourceFile, keychainBlocking));
+export function installCredential(dir: string, sourceFile: string, how: InstallHow = {}): boolean {
+  return runBlocking(installCredentialSteps(dir, sourceFile, keychainBlocking, how));
 }
 
-export function* installCredentialSteps(dir: string, sourceFile: string, io: KeychainIo): Steps<boolean> {
-  if (!(yield* isUsableCredentialSteps(sourceFile, io))) return false;
+export function* installCredentialSteps(
+  dir: string,
+  sourceFile: string,
+  io: KeychainIo,
+  how: InstallHow = {},
+): Steps<boolean> {
+  let source: string;
+  try {
+    source = yield* readCredentialSteps(sourceFile, io);
+  } catch {
+    return false;
+  }
+  if (!usableLoginText(source)) return false;
   const target = credentialPath(dir);
   if (yield* isUsableCredentialSteps(target, io)) {
     try {
@@ -286,7 +306,14 @@ export function* installCredentialSteps(dir: string, sourceFile: string, io: Key
       /* the backup is a cushion, not a precondition */
     }
   }
-  yield* copyCredentialSteps(sourceFile, target, io);
+  yield* writeCredentialSteps(
+    target,
+    (current) => {
+      how.replaced?.(current);
+      return mergeMcpLogins(source, current, how.mcp);
+    },
+    io,
+  );
   return true;
 }
 

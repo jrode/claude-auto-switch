@@ -1702,6 +1702,45 @@ describe('the MCP logins in the editor folder', () => {
     expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
   });
 
+  it("leave an account's saved login its own when a renewal the editor made is saved home", async () => {
+    const s = await scene();
+    await editorOn(s);
+    // The saved login carries older MCP logins, parked by a store that has ended.
+    writeFileSync(
+      path.join(s.dirOf('A'), '.credentials.json'),
+      withMcp(login('A', 1), mcpLogins(7)),
+    );
+    writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 2)));
+
+    const took = await takeUpEditorRenewal(s.context.ctx, {
+      ...(s.context.lookupOwner ? { lookupOwner: s.context.lookupOwner } : {}),
+    });
+
+    expect(took).toBe('taken');
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+    expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+    // The folder, which lives on, keeps its own.
+    expect(mcpOf(folderLogin(s))).toEqual(MCP);
+  });
+
+  it("leave an account's saved login its own when the editor moves off it with a renewal", async () => {
+    const s = await scene();
+    await editorOn(s);
+    writeFileSync(
+      path.join(s.dirOf('A'), '.credentials.json'),
+      withMcp(login('A', 1), mcpLogins(7)),
+    );
+    writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 2)));
+    // Whose it is cannot be asked, so the move saves it home by who the folder says it is.
+    s.context.lookupOwner = () => Promise.resolve(null);
+
+    await use(s, 'B', () => tokenOf(folderLogin(s)) === 'a-B-1');
+
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+    expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+    expect(mcpOf(folderLogin(s))).toEqual(MCP);
+  });
+
   it('stay in the folder when a renewal waiting in the carry queue is made', async () => {
     const s = await scene();
     await editorOn(s);
