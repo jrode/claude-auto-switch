@@ -1,0 +1,138 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { loginTextFingerprint } from '../accounts/credential-vault.js';
+import type { KeychainIo } from '../accounts/keychain-view.js';
+import { runBlocking } from '../util/steps.js';
+import { replaceFolderLoginSteps, writeFolderLogin, type FolderLogin } from './folder-login.js';
+
+/** The Keychain is a map here, never the real one. */
+const keychain = vi.hoisted(() => new Map<string, string>());
+vi.mock('../accounts/keychain.js', () => {
+  const read = vi.fn((dir: string) => keychain.get(dir) ?? null);
+  const write = vi.fn((dir: string, text: string) => {
+    keychain.set(dir, text);
+  });
+  const remove = vi.fn((dir: string) => {
+    keychain.delete(dir);
+  });
+  return {
+    keychainService: (dir: string) => `Claude Code-credentials-${dir}`,
+    readKeychainCredential: read,
+    writeKeychainCredential: write,
+    deleteKeychainCredential: remove,
+    readKeychainCredentialAsync: async (dir: string) => read(dir),
+    writeKeychainCredentialAsync: async (dir: string, text: string) => write(dir, text),
+    deleteKeychainCredentialAsync: async (dir: string) => remove(dir),
+  };
+});
+
+const mcp = (n: number) => ({
+  'notion|1': { accessToken: `mcp-access-fake-${n}`, refreshToken: `mcp-refresh-fake-${n}` },
+});
+const claudeLogin = (n: number, extra: Record<string, unknown> = {}): string =>
+  JSON.stringify({
+    claudeAiOauth: {
+      accessToken: `a-${n}`,
+      refreshToken: `r-${n}`,
+      expiresAt: 1_800_000_000_000 + n,
+    },
+    ...extra,
+  });
+const mcpOf = (text: string | null | undefined): unknown =>
+  (JSON.parse(text ?? 'null') as { mcpOAuth?: unknown } | null)?.mcpOAuth;
+const tokenOf = (text: string | null | undefined): unknown =>
+  (JSON.parse(text ?? 'null') as { claudeAiOauth?: { accessToken?: string } } | null)?.claudeAiOauth
+    ?.accessToken;
+
+function folder(spellings: string[] = []): FolderLogin {
+  const dir = mkdtempSync(path.join(tmpdir(), 'cas-folder-login-'));
+  mkdirSync(dir, { recursive: true });
+  return { dir, spellings: spellings.length > 0 ? spellings : [dir] };
+}
+const fileOf = (login: FolderLogin): string => path.join(login.dir, '.credentials.json');
+const readFile = (login: FolderLogin): string => readFileSync(fileOf(login), 'utf8');
+
+beforeEach(() => {
+  keychain.clear();
+});
+
+describe("writing a login where each Claude on the editor's folder reads it", () => {
+  it('keeps each place its own MCP logins: the item of each spelling, and the file', () => {
+    const login = folder();
+    const other = `${login.dir}${path.sep}`;
+    const three: FolderLogin = {
+      dir: login.dir,
+      spellings: [login.dir, other, `${login.dir}-third`],
+    };
+    keychain.set(three.spellings[0]!, claudeLogin(1, { mcpOAuth: mcp(1) }));
+    keychain.set(three.spellings[1]!, claudeLogin(1, { mcpOAuth: mcp(2) }));
+    // The third spelling has no item, so the Claude given it reads the file.
+    writeFileSync(fileOf(three), claudeLogin(1, { mcpOAuth: mcp(3) }));
+
+    writeFolderLogin(three, claudeLogin(2, { mcpOAuth: mcp(9) }));
+
+    expect(keychain.get(three.spellings[0]!)).toBe(claudeLogin(2, { mcpOAuth: mcp(1) }));
+    expect(keychain.get(three.spellings[1]!)).toBe(claudeLogin(2, { mcpOAuth: mcp(2) }));
+    expect(readFile(three)).toBe(claudeLogin(2, { mcpOAuth: mcp(3) }));
+  });
+
+  it('gives a place that holds nothing yet the login whole, MCP logins parked in it included', () => {
+    const login = folder();
+
+    writeFolderLogin(login, claudeLogin(2, { mcpOAuth: mcp(9) }));
+
+    expect(mcpOf(readFile(login))).toEqual(mcp(9));
+  });
+
+  it('copies none of the source into places that hold a login of their own without any', () => {
+    const login = folder();
+    keychain.set(login.dir, claudeLogin(1));
+    writeFileSync(fileOf(login), claudeLogin(1));
+    const spellings: FolderLogin = { dir: login.dir, spellings: [login.dir, `${login.dir}-other`] };
+
+    writeFolderLogin(spellings, claudeLogin(2, { mcpOAuth: mcp(9) }));
+
+    expect(mcpOf(keychain.get(login.dir))).toBeUndefined();
+    expect(mcpOf(readFile(login))).toBeUndefined();
+  });
+});
+
+describe('putting a renewal in the folder that holds the login it retired', () => {
+  it('merges with the login the place holds when it is written, not as it was when it was looked at', () => {
+    const login = folder();
+    const held = claudeLogin(1, { mcpOAuth: mcp(1) });
+    // The folder's Claude refreshes a sign-in meanwhile: once the first look has been made.
+    const refreshed = claudeLogin(1, { mcpOAuth: mcp(2) });
+    keychain.set(login.dir, held);
+    let looks = 0;
+    const io: KeychainIo = {
+      read: (dir) => {
+        const text = keychain.get(dir) ?? null;
+        looks += 1;
+        if (looks === 1) keychain.set(dir, refreshed);
+        return text;
+      },
+      write: (dir, text) => {
+        keychain.set(dir, text);
+      },
+      remove: (dir) => {
+        keychain.delete(dir);
+      },
+    };
+
+    const replaced = runBlocking(
+      replaceFolderLoginSteps(
+        login,
+        loginTextFingerprint(held)!,
+        claudeLogin(2, { mcpOAuth: mcp(9) }),
+        io,
+      ),
+    );
+
+    expect(replaced).toBe(true);
+    expect(tokenOf(keychain.get(login.dir))).toBe('a-2');
+    expect(mcpOf(keychain.get(login.dir))).toEqual(mcp(2));
+  });
+});

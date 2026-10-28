@@ -27,11 +27,12 @@ import { editorLaunch } from '../commands/editor-launch.js';
 import { setActive } from '../state/active.js';
 import { loadConfig } from '../config/config.js';
 import { installEditorEnvVar, readEditorEnvVar, uninstallEditorEnvVar } from './install.js';
-import { readEditorRecord } from './folder-login.js';
+import { queueEditorCarry, readEditorRecord, retryEditorCarries } from './folder-login.js';
 import { readTarget, setTarget } from '../daemon/junction.js';
 import { refreshCredentialIfExpired } from '../usage/oauth-refresh.js';
 import { renewIdleLogin } from '../usage/usage-store.js';
 import { listAccounts } from '../accounts/registry.js';
+import { loginTextFingerprint } from '../accounts/credential-vault.js';
 import { readKeychainCredential } from '../accounts/keychain.js';
 import type { CliContext } from '../context.js';
 import {
@@ -92,14 +93,15 @@ const tokenOf = (text: string | null | undefined): string | null => {
   }
 };
 /** Sign-ins to other services (`claude mcp login`), which Claude keeps in the same text as the account's login. */
-const MCP = {
+const mcpLogins = (n: number) => ({
   'notion|1': {
     serverName: 'notion',
-    accessToken: 'mcp-access-fake-1',
-    refreshToken: 'mcp-refresh-fake-1',
-    expiresAt: 1_900_000_000_000,
+    accessToken: `mcp-access-fake-${n}`,
+    refreshToken: `mcp-refresh-fake-${n}`,
+    expiresAt: 1_900_000_000_000 + n,
   },
-};
+});
+const MCP = mcpLogins(1);
 const withMcp = (text: string, mcpOAuth: unknown = MCP): string =>
   JSON.stringify({ ...(JSON.parse(text) as object), mcpOAuth });
 const mcpOf = (text: string | null | undefined): unknown => {
@@ -1548,6 +1550,16 @@ describe("a renewal the editor's Claude made, saved home from a running session"
 });
 
 describe('the MCP logins in the editor folder', () => {
+  const tokenResponse = (name: string, gen: number): Response =>
+    new Response(
+      JSON.stringify({
+        access_token: `a-${name}-${gen}`,
+        refresh_token: `r-${name}-${gen}`,
+        expires_in: 8 * 3600,
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+
   it('stay in the folder when it moves to the next account', async () => {
     const s = await scene();
     await editorOn(s);
@@ -1557,6 +1569,153 @@ describe('the MCP logins in the editor folder', () => {
     await use(s, 'B', () => tokenOf(folderLogin(s)) === 'a-B-1');
 
     expect(tokenOf(folderLogin(s))).toBe('a-B-1');
+    expect(mcpOf(folderLogin(s))).toEqual(MCP);
+  });
+
+  it("are the folder's own, not those the next account's saved login carries from a store that has ended", async () => {
+    const s = await scene();
+    await editorOn(s);
+    writeFileSync(
+      path.join(s.dirOf('B'), '.credentials.json'),
+      withMcp(login('B', 1), mcpLogins(7)),
+    );
+    writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 1)));
+
+    await use(s, 'B', () => tokenOf(folderLogin(s)) === 'a-B-1');
+
+    expect(mcpOf(folderLogin(s))).toEqual(MCP);
+    // And the account's saved login is not written to.
+    expect(mcpOf(profileLogin(s, 'B'))).toEqual(mcpLogins(7));
+  });
+
+  it('are none, in a folder that has none, whatever the next account was saved with', async () => {
+    const s = await scene();
+    await editorOn(s);
+    writeFileSync(
+      path.join(s.dirOf('B'), '.credentials.json'),
+      withMcp(login('B', 1), mcpLogins(7)),
+    );
+
+    await use(s, 'B', () => tokenOf(folderLogin(s)) === 'a-B-1');
+
+    expect(mcpOf(folderLogin(s))).toBeUndefined();
+  });
+
+  it('stay in the Keychain item its Claude saved the login in', async () => {
+    const s = await scene();
+    await editorOn(s);
+    keychain.set(s.folder, withMcp(login('A', 1)));
+    rmSync(path.join(s.folder, '.credentials.json'));
+
+    await use(s, 'B', () => tokenOf(keychain.get(s.folder)) === 'a-B-1');
+
+    expect(mcpOf(keychain.get(s.folder))).toEqual(MCP);
+    // Nothing of it in the file, which holds only what makes Claude read the item again.
+    expect(mcpOf(folderLogin(s))).toBeUndefined();
+  });
+
+  it('are each kept by the item of each way the editors spell the folder', async () => {
+    const s = await scene();
+    await editorOn(s);
+    const spelled = `${s.folder}${path.sep}`;
+    expect(installEditorEnvVar('cursor', 'CLAUDE_CONFIG_DIR', spelled, s.context.ctx).ok).toBe(
+      true,
+    );
+    expect(installEditorEnvVar('vscode', 'CLAUDE_CONFIG_DIR', s.folder, s.context.ctx).ok).toBe(
+      true,
+    );
+    // Two Claudes on the folder, each with an item of its own and a sign-in of its own.
+    keychain.set(spelled, withMcp(login('A', 1), mcpLogins(1)));
+    keychain.set(s.folder, withMcp(login('A', 1), mcpLogins(2)));
+    rmSync(path.join(s.folder, '.credentials.json'));
+
+    await use(
+      s,
+      'B',
+      () =>
+        tokenOf(keychain.get(spelled)) === 'a-B-1' && tokenOf(keychain.get(s.folder)) === 'a-B-1',
+    );
+
+    expect(mcpOf(keychain.get(spelled))).toEqual(mcpLogins(1));
+    expect(mcpOf(keychain.get(s.folder))).toEqual(mcpLogins(2));
+  });
+
+  it("leave the next account's login exactly as saved when neither holds any", async () => {
+    const s = await scene();
+    await editorOn(s);
+    const saved = `${JSON.stringify(JSON.parse(login('B', 1)), null, 2)}\n`;
+    writeFileSync(path.join(s.dirOf('B'), '.credentials.json'), saved);
+
+    await use(s, 'B', () => tokenOf(folderLogin(s)) === 'a-B-1');
+
+    expect(folderLogin(s)).toBe(saved);
+  });
+
+  it("start with those parked in the account's saved login, in the folder made for the editor", async () => {
+    const s = await scene();
+    writeFileSync(
+      path.join(s.dirOf('A'), '.credentials.json'),
+      withMcp(login('A', 1), mcpLogins(3)),
+    );
+
+    await editorOn(s);
+
+    expect(mcpOf(folderLogin(s))).toEqual(mcpLogins(3));
+  });
+
+  it('stay in the folder when a renewal made elsewhere is carried into it', async () => {
+    const s = await scene();
+    await editorOn(s);
+    writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 1)));
+    // Another ccx renewed A's login; the account's saved login carries older MCP logins.
+    writeFileSync(
+      path.join(s.dirOf('A'), '.credentials.json'),
+      withMcp(login('A', 2), mcpLogins(7)),
+    );
+
+    await refreshEditor(s.context);
+
+    expect(tokenOf(folderLogin(s))).toBe('a-A-2');
+    expect(mcpOf(folderLogin(s))).toEqual(MCP);
+  });
+
+  it('stay in the folder when ccx renews the login it holds', async () => {
+    const s = await scene();
+    const due = (): number => Date.now() + 60_000;
+    writeFileSync(
+      path.join(s.dirOf('A'), '.credentials.json'),
+      withMcp(login('A', 1, due()), mcpLogins(7)),
+    );
+    await editorOn(s);
+    writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 1, due())));
+
+    const outcome = await refreshCredentialIfExpired(s.dirOf('A'), {
+      ctx: s.context.ctx,
+      fetchImpl: () => Promise.resolve(tokenResponse('A', 2)),
+    });
+
+    expect(outcome.status).toBe('refreshed');
+    expect(tokenOf(folderLogin(s))).toBe('a-A-2');
+    expect(mcpOf(folderLogin(s))).toEqual(MCP);
+    // The saved login keeps its own through its renewal.
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+    expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+  });
+
+  it('stay in the folder when a renewal waiting in the carry queue is made', async () => {
+    const s = await scene();
+    await editorOn(s);
+    const held = withMcp(login('A', 1));
+    writeFileSync(path.join(s.folder, '.credentials.json'), held);
+    writeFileSync(
+      path.join(s.dirOf('A'), '.credentials.json'),
+      withMcp(login('A', 2), mcpLogins(7)),
+    );
+    queueEditorCarry(s.context.ctx, loginTextFingerprint(held)!, s.dirOf('A'));
+
+    expect(await retryEditorCarries(s.context.ctx)).toBe(true);
+
+    expect(tokenOf(folderLogin(s))).toBe('a-A-2');
     expect(mcpOf(folderLogin(s))).toEqual(MCP);
   });
 });

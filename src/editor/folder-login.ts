@@ -14,6 +14,7 @@ import {
   nudgeLoginReread,
   usableLoginText,
 } from '../accounts/credential-vault.js';
+import { mergeMcpLogins } from '../accounts/mcp-logins.js';
 import { CREDENTIALS_LOCK_DIR, lockDirSteps } from '../claude/locks.js';
 import { call, runBlocking, runOnTimers, type Steps } from '../util/steps.js';
 import { writeFileAtomic } from '../util/atomic-write.js';
@@ -188,7 +189,8 @@ export function folderKeychainHolds(login: FolderLogin): boolean {
 /**
  * Write `text` where each Claude on the folder reads it: into the Keychain item
  * of every spelling that has one, and into the file whenever a spelling has
- * none, since a Claude given that spelling reads the file.
+ * none, since a Claude given that spelling reads the file. Each of those keeps
+ * its own MCP logins (mergeMcpLogins), read again just before it is written.
  */
 export function writeFolderLogin(login: FolderLogin, text: string): void {
   runBlocking(writeFolderLoginSteps(login, text, keychainBlocking));
@@ -197,10 +199,20 @@ export function writeFolderLogin(login: FolderLogin, text: string): void {
 function* writeFolderLoginSteps(login: FolderLogin, text: string, io: KeychainIo): Steps<void> {
   let everyOneHasAnItem = login.spellings.length > 0;
   for (const spelling of login.spellings) {
-    if ((yield* call(() => io.read(spelling))) !== null) yield* call(() => io.write(spelling, text));
+    const held = yield* call(() => io.read(spelling));
+    if (held !== null) yield* call(() => io.write(spelling, mergeMcpLogins(text, held, 'folder')));
     else everyOneHasAnItem = false;
   }
-  if (!everyOneHasAnItem) writeSecretFile(fileOf(login), text);
+  if (!everyOneHasAnItem)
+    writeSecretFile(fileOf(login), mergeMcpLogins(text, readFileOrNull(fileOf(login)), 'folder'));
+}
+
+function readFileOrNull(file: string): string | null {
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
 }
 
 /** Remove the login from every place a Claude on the folder could read it. */
