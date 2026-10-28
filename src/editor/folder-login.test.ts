@@ -52,6 +52,16 @@ function folder(spellings: string[] = []): FolderLogin {
   return { dir, spellings: spellings.length > 0 ? spellings : [dir] };
 }
 const fileOf = (login: FolderLogin): string => path.join(login.dir, '.credentials.json');
+/** The Keychain as a map the steps reach, never the real one. */
+const directly: KeychainIo = {
+  read: (dir) => keychain.get(dir) ?? null,
+  write: (dir, text) => {
+    keychain.set(dir, text);
+  },
+  remove: (dir) => {
+    keychain.delete(dir);
+  },
+};
 const readFile = (login: FolderLogin): string => readFileSync(fileOf(login), 'utf8');
 
 beforeEach(() => {
@@ -96,6 +106,34 @@ describe("writing a login where each Claude on the editor's folder reads it", ()
 
     expect(mcpOf(keychain.get(login.dir))).toBeUndefined();
     expect(mcpOf(readFile(login))).toBeUndefined();
+  });
+});
+
+describe('writing a login that neither the source nor the places hold MCP logins in', () => {
+  const pretty = `${JSON.stringify(JSON.parse(claudeLogin(2)), null, 2)}\n`;
+
+  it('writes it byte for byte, into an item and into the file alike', () => {
+    const login = folder();
+    const other: FolderLogin = { dir: login.dir, spellings: [login.dir, `${login.dir}-other`] };
+    keychain.set(login.dir, claudeLogin(1));
+
+    writeFolderLogin(other, pretty);
+
+    expect(keychain.get(login.dir)).toBe(pretty);
+    expect(readFile(login)).toBe(pretty);
+  });
+
+  it('writes a renewal byte for byte too', () => {
+    const login = folder();
+    const held = claudeLogin(1);
+    writeFileSync(fileOf(login), held);
+
+    const replaced = runBlocking(
+      replaceFolderLoginSteps(login, loginTextFingerprint(held)!, pretty, directly),
+    );
+
+    expect(replaced).toBe(true);
+    expect(readFile(login)).toBe(pretty);
   });
 });
 
