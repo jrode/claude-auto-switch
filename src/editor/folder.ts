@@ -20,6 +20,7 @@ import {
 import { readKeychainItem } from '../accounts/keychain-view.js';
 import { loginExpiresAt, readExpiresAt } from '../usage/token-expiry.js';
 import { loginIsKnownDead } from '../usage/dead-login-store.js';
+import { loginWasRejected } from '../accounts/account-login.js';
 import { sha256Fingerprint } from '../util/fingerprint.js';
 import { decideSaveBack } from '../accounts/save-back.js';
 import { decidePull } from '../accounts/credential-sync.js';
@@ -149,10 +150,27 @@ export function editorStanding(context: CliContext): { name: string; loggedIn: b
   const name = readEditorRecord(editorFolderPath(c))?.account ?? null;
   if (name === null) return null;
   const text = readOrNull(editorFolderLogin(c));
+  const account = getAccount(name, c);
   return {
     name,
-    loggedIn: text !== null && usableLoginText(text) && !loginIsKnownDead(sha256Fingerprint(text), c),
+    loggedIn:
+      text !== null &&
+      usableLoginText(text) &&
+      !loginIsKnownDead(sha256Fingerprint(text), c) &&
+      !(account && heldLoginRefused(text, account, c)),
   };
+}
+
+/**
+ * Whether the folder holds the login `account`'s saved copy has, and that copy
+ * was refused. The refusal is filed under the copy's whole text, which the
+ * folder's differs from by the MCP logins its Claude holds.
+ */
+function heldLoginRefused(text: string, account: Account, c: PathCtx): boolean {
+  const held = loginTextFingerprint(text);
+  return (
+    held !== null && held === credentialFingerprint(account.dir) && loginWasRejected(account.dir, c)
+  );
 }
 
 /**

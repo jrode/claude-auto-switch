@@ -26,17 +26,20 @@ import { editorCommand } from '../commands/editor.js';
 import { editorLaunch } from '../commands/editor-launch.js';
 import { setActive } from '../state/active.js';
 import { loadConfig } from '../config/config.js';
+import { sha256Fingerprint } from '../util/fingerprint.js';
 import { installEditorEnvVar, readEditorEnvVar, uninstallEditorEnvVar } from './install.js';
 import { queueEditorCarry, readEditorRecord, retryEditorCarries } from './folder-login.js';
 import { readTarget, setTarget } from '../daemon/junction.js';
 import { refreshCredentialIfExpired } from '../usage/oauth-refresh.js';
 import { renewIdleLogin } from '../usage/usage-store.js';
 import { listAccounts } from '../accounts/registry.js';
-import { loginTextFingerprint } from '../accounts/credential-vault.js';
+import { credentialFileFingerprint, loginTextFingerprint } from '../accounts/credential-vault.js';
+import { rememberDeadLogin } from '../usage/dead-login-store.js';
 import { readKeychainCredential } from '../accounts/keychain.js';
 import type { CliContext } from '../context.js';
 import {
   editorChatsOpen,
+  editorStanding,
   refreshEditor,
   retireEditor,
   setUpEditor,
@@ -1546,6 +1549,36 @@ describe("a renewal the editor's Claude made, saved home from a running session"
     expect(took).toBe('taken');
     expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
     expect(tokenOf(profileLogin(s, 'C'))).toBe('a-A-1');
+  });
+});
+
+describe('whether the account the editor is on is signed in, as ccx doctor says', () => {
+  it("is not, when that account's saved login was refused, though the folder's text differs from it by its MCP logins", async () => {
+    const s = await scene();
+    await editorOn(s);
+    writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(folderLogin(s)!, MCP));
+    expect(editorStanding(s.context)).toEqual({ name: 'A', loggedIn: true });
+
+    rememberDeadLogin(credentialFileFingerprint(s.dirOf('A')), 'invalid_grant', s.context.ctx);
+
+    expect(editorStanding(s.context)).toEqual({ name: 'A', loggedIn: false });
+  });
+
+  it('is, when the folder holds a login its Claude renewed since the saved one was refused', async () => {
+    const s = await scene();
+    await editorOn(s);
+    rememberDeadLogin(credentialFileFingerprint(s.dirOf('A')), 'invalid_grant', s.context.ctx);
+    writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 2), MCP));
+
+    expect(editorStanding(s.context)).toEqual({ name: 'A', loggedIn: true });
+  });
+
+  it("is not, when the folder's own login was refused", async () => {
+    const s = await scene();
+    await editorOn(s);
+    rememberDeadLogin(sha256Fingerprint(folderLogin(s)!), 'invalid_grant', s.context.ctx);
+
+    expect(editorStanding(s.context)).toEqual({ name: 'A', loggedIn: false });
   });
 });
 
