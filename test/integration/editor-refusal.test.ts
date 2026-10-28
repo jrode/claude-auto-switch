@@ -1043,7 +1043,8 @@ describe.each<Mode>(['wrapper', 'direct'])(
         const folder = editorFolder(home);
         // The folder, with its retirement held off for as long as something counts as an editor chat open in it.
         await setUpEditor(context);
-        const chatEnded = noteEditorChat(context.ctx, process.pid, folder);
+        // A running chat started before the check; retireEditor skips one started at or after it.
+        const chatEnded = noteEditorChat(context.ctx, process.pid, folder, Date.now() - 1_000);
         expect(retireEditor(context)).toBe('held');
         chatEnded();
         const pending = path.join(home, 'editor-retire.json');

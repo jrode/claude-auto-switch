@@ -1366,7 +1366,8 @@ describe('a Claude ccx-claude runs on the editor folder', () => {
     await editorOn(s);
     const claude = stayingProcess();
     try {
-      const ended = noteEditorChat(s.context.ctx, claude.pid, s.folder);
+      // A running chat started before the check; retireEditor skips one started at or after it.
+      const ended = noteEditorChat(s.context.ctx, claude.pid, s.folder, Date.now() - 1_000);
 
       expect(retireEditor(s.context)).toBe('held');
       expect(isRealFolder(s.folder)).toBe(true);
@@ -1384,7 +1385,8 @@ describe('a Claude ccx-claude runs on the editor folder', () => {
     await editorOn(s);
     const claude = stayingProcess();
     try {
-      noteEditorChat(s.context.ctx, claude.pid, s.folder);
+      // A running chat started before the check; retireEditor skips one started at or after it.
+      noteEditorChat(s.context.ctx, claude.pid, s.folder, Date.now() - 1_000);
 
       expect(editorChatsOpen(s.context.ctx, s.folder)).toBe(true);
       expect(retireEditor(s.context)).toBe('held');
