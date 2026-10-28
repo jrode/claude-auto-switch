@@ -11,6 +11,7 @@ import {
   removeCredential,
 } from './credential-storage.js';
 import { keychainBlocking, type KeychainIo } from './keychain-view.js';
+import { MCP_OAUTH_KEY } from './mcp-logins.js';
 export { CREDENTIALS_FILE } from './credential-storage.js';
 
 /**
@@ -103,6 +104,8 @@ export function previousCredentialPath(dir: string): string {
  *
  * Unrecognised shapes are accepted when they carry any non-empty value, so a
  * future change to Claude's credential format cannot make ccx refuse everything.
+ * The person's MCP sign-ins (`mcpOAuth`) are not a login to Claude, so a text
+ * that holds only those is not one.
  */
 export function isUsableCredential(file: string): boolean {
   return runBlocking(isUsableCredentialSteps(file, keychainBlocking));
@@ -125,7 +128,10 @@ export function usableLoginText(text: string): boolean {
       return typeof oauth.accessToken === 'string' && oauth.accessToken.length > 0;
     }
     if (typeof parsed.primaryApiKey === 'string' && parsed.primaryApiKey.length > 0) return true;
-    return hasNonEmptyValue(parsed);
+    // Sign-ins to MCP servers are not a login to Claude.
+    return hasNonEmptyValue(
+      Object.fromEntries(Object.entries(parsed).filter(([key]) => key !== MCP_OAUTH_KEY)),
+    );
   } catch {
     return false;
   }

@@ -20,6 +20,7 @@ import {
   keepForRollback,
   nudgeLoginReread,
   REREAD_PLACEHOLDER,
+  usableLoginText,
 } from './credential-vault.js';
 
 function dir(): string {
@@ -261,5 +262,53 @@ describe('nudgeLoginReread', () => {
         },
       }),
     ).toBe(false);
+  });
+});
+
+/** A login with sign-ins to MCP servers beside it, as Claude keeps them in one text. */
+const mcp = (n: number) => ({
+  'notion|1': { accessToken: `mcp-access-fake-${n}`, refreshToken: `mcp-refresh-fake-${n}` },
+});
+const loginText = (token: string, mcpOAuth?: unknown): string =>
+  JSON.stringify({
+    claudeAiOauth: { accessToken: `tok-${token}`, refreshToken: `ref-${token}`, expiresAt: 1 },
+    ...(mcpOAuth === undefined ? {} : { mcpOAuth }),
+  });
+
+describe('whether a text is a login when it holds MCP logins', () => {
+  it('is not one when MCP logins are all it holds', () => {
+    expect(usableLoginText(JSON.stringify({ mcpOAuth: mcp(1) }))).toBe(false);
+    expect(usableLoginText(JSON.stringify({ mcpOAuth: {} }))).toBe(false);
+    const d = dir();
+    const onlyMcp = path.join(d, 'only-mcp.json');
+    writeFileSync(onlyMcp, JSON.stringify({ mcpOAuth: mcp(1) }), 'utf8');
+    expect(isUsableCredential(onlyMcp)).toBe(false);
+  });
+
+  it('is one when it holds a login of any known or unfamiliar kind beside them', () => {
+    expect(usableLoginText(loginText('a', mcp(1)))).toBe(true);
+    expect(
+      usableLoginText(JSON.stringify({ primaryApiKey: 'sk-ant-abc123', mcpOAuth: mcp(1) })),
+    ).toBe(true);
+    expect(
+      usableLoginText(JSON.stringify({ somethingNew: { token: 'abc' }, mcpOAuth: mcp(1) })),
+    ).toBe(true);
+  });
+
+  it('is not one when the Claude login in it is signed out, whatever MCP logins it holds', () => {
+    expect(
+      usableLoginText(JSON.stringify({ claudeAiOauth: { accessToken: '' }, mcpOAuth: mcp(1) })),
+    ).toBe(false);
+  });
+
+  it("is never installed as an account's login, nor written over one", () => {
+    const d = dir();
+    writeFileSync(credentialPath(d), loginText('old', mcp(1)), 'utf8');
+    const incoming = path.join(dir(), 'only-mcp.json');
+    writeFileSync(incoming, JSON.stringify({ mcpOAuth: mcp(2) }), 'utf8');
+
+    expect(installCredential(d, incoming)).toBe(false);
+
+    expect(readFileSync(credentialPath(d), 'utf8')).toBe(loginText('old', mcp(1)));
   });
 });
