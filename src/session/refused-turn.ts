@@ -106,6 +106,29 @@ export interface RefusalProof {
 }
 
 /**
+ * Why a refusal recorded at `at` may be the old login's, in words, or null when
+ * it cannot be: the login under a Claude started at `launchedAt` was replaced
+ * at `loginChangedAt` (0 when it never was), and `promptAt` is when a prompt
+ * was last typed. A login put in before Claude started is one it read fresh.
+ * One put in while it ran may still be the one a request went out on, unless
+ * the turn began after Claude can have kept the old one.
+ */
+export function oldLoginWhy(
+  at: number,
+  promptAt: number,
+  loginChangedAt: number,
+  launchedAt: number,
+): string | null {
+  if (loginChangedAt <= launchedAt) return null;
+  if (at < loginChangedAt) return 'the refusal was recorded before the login under Claude changed';
+  const turnOnNewLogin = promptAt >= loginChangedAt + LOGIN_KEPT_MS;
+  if (at < loginChangedAt + OLD_LOGIN_MS && !turnOnNewLogin) {
+    return 'the refusal came within 40 s of the login changing under Claude, so it may be the old login';
+  }
+  return null;
+}
+
+/**
  * Judge `recorded` at `now` against the login under this Claude, last
  * replaced at `loginChangedAt` (0 when it never was).
  */
@@ -130,16 +153,8 @@ export async function refusalProof(
   if (at < now - REFUSAL_MAX_AGE_MS) return not('the refusal is more than 2 minutes old');
   if (refusal.resetsAt !== undefined && refusal.resetsAt <= now) return not('the limit it names has reset since');
   if (at < promptAt) return not('a prompt was typed after the refusal');
-  // A login put in before Claude started is one it read fresh. One put in
-  // while it ran may still be the one a request went out on, unless the turn
-  // began after Claude can have kept the old one.
-  if (loginChangedAt > launchedAt) {
-    if (at < loginChangedAt) return not('the refusal was recorded before the login under Claude changed');
-    const turnOnNewLogin = promptAt >= loginChangedAt + LOGIN_KEPT_MS;
-    if (at < loginChangedAt + OLD_LOGIN_MS && !turnOnNewLogin) {
-      return not('the refusal came within 40 s of the login changing under Claude, so it may be the old login');
-    }
-  }
+  const old = oldLoginWhy(at, promptAt, loginChangedAt, launchedAt);
+  if (old !== null) return not(old);
   const other = recorded.otherWriter?.() ?? null;
   if (other !== null) return not(`${other} is on this conversation too, so the refusal may be its`);
   // Last, since it may wait.

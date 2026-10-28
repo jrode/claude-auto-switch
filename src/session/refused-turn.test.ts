@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   judgeRefusal,
   limitNamed,
+  oldLoginWhy,
   refusalProof,
   type RecordedRefusal,
   type RefusalProof,
@@ -183,6 +184,28 @@ describe('what a refused turn in the record proves on its own', () => {
     );
     await judge(counting);
     expect(asked).toBe(0);
+  });
+});
+
+describe('whether a refusal may be the login that was under Claude before', () => {
+  const movedAt = LAUNCHED + 60_000;
+
+  it('may, from before the login changed until 40 s after it, as long as the turn began before Claude could have let go of the old login', () => {
+    expect(oldLoginWhy(movedAt - 1, 0, movedAt, LAUNCHED)).toBe(
+      'the refusal was recorded before the login under Claude changed',
+    );
+    expect(oldLoginWhy(movedAt + 39_999, 0, movedAt, LAUNCHED)).toBe(
+      'the refusal came within 40 s of the login changing under Claude, so it may be the old login',
+    );
+    expect(oldLoginWhy(movedAt + 40_000, 0, movedAt, LAUNCHED)).toBeNull();
+    // A turn begun 30 s after the move went out on the new login.
+    expect(oldLoginWhy(movedAt + 36_000, movedAt + 30_000, movedAt, LAUNCHED)).toBeNull();
+    expect(oldLoginWhy(movedAt + 36_000, movedAt + 29_999, movedAt, LAUNCHED)).not.toBeNull();
+  });
+
+  it('may not, for a login put in before Claude started, or one never changed', () => {
+    expect(oldLoginWhy(LAUNCHED + 5_000, 0, LAUNCHED - 10, LAUNCHED)).toBeNull();
+    expect(oldLoginWhy(LAUNCHED + 5_000, 0, 0, LAUNCHED)).toBeNull();
   });
 });
 

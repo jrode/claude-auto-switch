@@ -77,18 +77,36 @@ elsewhere; anything else stays as yours is while the session's goes to
   ccx looks at only once it ends).
 
 **Editor chats through `ccx-claude`.** When the Claude Code extension starts
-Claude through `ccx-claude` (its `claudeCode.claudeProcessWrapper` setting), one
+Claude through `ccx-claude` (its `claudeCode.claudeProcessWrapper` setting), or
+Conductor does ([its `claude_code_executable_path`](setup.md#conductor)), one
 Claude serves a whole chat and its output goes to the editor, not through ccx.
-ccx follows that Claude's records instead: the conversation it is in (a `/clear`
-included) and its refused turns, judged by the same rules as in a terminal. A
-confirmed limit is recorded once for as long as it lasts, and the editor's next
-chat starts on the next account; the chat that met it stays on its account until
-it is closed. When a chat closes, a check still under way gets 4 s to be written
+Either way Claude runs on the editor's own folder (below), brought up on the
+active account as it starts, so the chat has your settings, `CLAUDE.md`, skills
+and history. `ccx-claude` gives its Claude the folder as the editor's setting
+spells it, so every Claude on it shares one Keychain item. The start makes one
+try at each step and never waits on a lock: what it could not do then, a refresh
+or the move to the active account, is left to a refusal's retry or to ccx's next
+event, and Claude runs on the folder whenever it exists and holds a working
+login. When there is no folder, or it holds no working login, the chat runs on
+the account's own folder, which holds only a login, and the event log says why.
+ccx follows Claude's records while it runs: the conversation it is in (a `/clear`
+included) and its refused turns, judged by the same rules as in a terminal, and
+against the account the folder holds when the refusal is judged, since other ccx
+processes move the folder too. A confirmed limit is recorded once for as long as
+it lasts, and ccx moves the folder to the next account in place, so the open
+chat's next message goes out there. The turn that was refused stays refused. A
+limit confirmed after another ccx moved the folder off that account is recorded
+all the same, and nothing is moved. A refusal that comes within 40 s of a move
+may be the login the folder left, and is passed over. When a move waits on
+Claude's locks, a refusal for the limit already recorded tries it again, no more
+than once every 20 s. A Claude run this way counts as an editor chat open in the
+folder it runs on, and in no other, until `ccx-claude` ends, so that folder stays
+while it runs. When a chat closes, a check still under way gets 4 s to be written
 down. The extension has Claude write its debug log to standard error: ccx passes
 all of it to the editor, never reads it as a limit, and keeps only the last
 65,536 characters of the rest. `ccx on` and `ccx editor on` work differently:
-the editor runs on a folder of its own (below), and no ccx process runs beside
-its Claude.
+they point the editor at the same folder with a setting, and no ccx process runs
+beside its Claude.
 
 **The editor's own folder.** `ccx on` and `ccx editor on` set the editor's
 `CLAUDE_CONFIG_DIR` to `~/.claude-auto-switch/editor-active`, a folder built
@@ -102,12 +120,13 @@ ends, so at every switch, `ccx on`, `ccx editor on`, `ccx doctor` and session
 start ccx syncs it with your files both ways: what the editor changed goes into
 your `settings.json`, `~/.claude.json` and memory, what you changed comes in,
 and where both changed one setting yours wins and the editor's copy goes to
-`rescued/`. A limit met inside an editor chat is not noticed by itself yet; the
-editor moves when ccx switches.
+`rescued/`. A limit met inside an editor chat that was not started through
+`ccx-claude` is not noticed by itself yet; the editor moves when ccx switches.
 
 `ccx editor off` hands back what the folder holds, saves its login home and
-removes it. While an editor chat started through it is open, or something in it
-cannot be handed back, it stays, and ccx retires it at a later event. A folder
+removes it. While an editor chat started through it is open, a Claude
+`ccx-claude` runs on it, or something in it cannot be handed back, it stays, and
+ccx retires it at a later event. A folder
 at that path that ccx did not make is taken over once no editor chat is open in
 it, its chats and files kept, and `ccx editor on` says when it could not set
 the editor up.
