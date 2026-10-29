@@ -47,7 +47,12 @@ export function* parkMcpLoginsSteps(
       if (holdsMcpLoginsOf(saved, ending)) return false;
       throw new Error('its saved login is not one that can hold them');
     }
-    yield* writeCredentialSteps(file, (current) => parkMcpLogins(current ?? saved, ending), io);
+    // A store emptied since it was read is empty, not what it held then.
+    yield* writeCredentialSteps(
+      file,
+      (current) => parkMcpLogins(current ?? REREAD_PLACEHOLDER, ending),
+      io,
+    );
     return true;
   } finally {
     lock.release();

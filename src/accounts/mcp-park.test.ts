@@ -152,6 +152,20 @@ describe("an ending folder's MCP sign-ins, parked in an account's saved login on
     expect(mcpOf(items.get(dir) ?? null)).toEqual({ ...notion(3), ...datadog(7) });
   });
 
+  it('does not write back a login that was removed between its two reads', () => {
+    const dir = account(null);
+    const removedMeanwhile = text({ claudeAiOauth: claude(5), mcpOAuth: notion(1) });
+    // The account's login is in the Keychain when first read, and gone by the time it is written.
+    let reads = 0;
+    const emptied: KeychainIo = { ...io, read: () => (++reads === 1 ? removedMeanwhile : null) };
+
+    expect(runBlocking(parkMcpLoginsSteps(dir, text({ mcpOAuth: datadog(2) }), emptied))).toBe(
+      true,
+    );
+
+    expect(JSON.parse(savedIn(dir))).toEqual({ mcpOAuth: datadog(2) });
+  });
+
   it('throws, writing nothing, when the saved login is being changed by someone else', () => {
     const saved = text({ claudeAiOauth: claude(5), mcpOAuth: notion(1) });
     const dir = account(saved);
