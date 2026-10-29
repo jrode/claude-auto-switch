@@ -355,12 +355,14 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)("a terminal session's MCP log
             oauthAccount: { emailAddress: 'someone@example.com', accountUuid: 'uuid-someone' },
           }),
         );
-        writeFileSync(creds, login('A', mcp(3)));
+        // The login in the session is the other account's, not A's.
+        writeFileSync(creds, login('someone', mcp(3)));
 
         writeFileSync(s.exitClaude, '');
         expect(await running).toBe(0);
 
         expect(mcpOf(s.saved('A'))).toEqual(mcp(3));
+        // A whole save would have written the session's login over A's.
         expect(tokenOf(s.saved('A'))).toBe('a-A-1');
       },
     );
