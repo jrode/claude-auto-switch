@@ -267,6 +267,43 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)("a terminal session's MCP log
       expect(mcpOf(s.saved('A'))).toEqual({ ...datadog(5), ...mcp(3) });
     },
   );
+  it(
+    'keeps the sign-in another session refreshed and parked, when it ends holding the one it started from',
+    { timeout: 90_000 },
+    async () => {
+      const s = scene();
+      const at = (expiresAt: number, by: string) => ({
+        'notion|1': {
+          serverName: 'notion',
+          accessToken: `mcp-access-fake-${by}`,
+          refreshToken: `mcp-refresh-fake-${by}`,
+          expiresAt,
+        },
+      });
+      const T0 = Date.now() + 8 * HOURS;
+      // Two terminals on A both start from the sign-in parked there.
+      writeFileSync(
+        path.join(s.home, 'profiles', 'A', '.credentials.json'),
+        login('A', at(T0, 'S0')),
+      );
+      const running = runCommand(s.context, []);
+      await until(() => launches(readLog(s.runsLog)).length >= 1, 30_000);
+      expect(mcpOf(s.session())).toEqual(at(T0, 'S0'));
+      // The other terminal refreshed it and ended, parking the refresh. This one never touched it.
+      const T1 = T0 + 3_600_000;
+      writeFileSync(
+        path.join(s.home, 'profiles', 'A', '.credentials.json'),
+        login('A', at(T1, 'S1')),
+      );
+
+      writeFileSync(s.exitClaude, '');
+      expect(await running).toBe(0);
+
+      expect(mcpOf(s.saved('A'))).toEqual(at(T1, 'S1'));
+      expect(tokenOf(s.saved('A'))).toBe('a-A-1');
+    },
+  );
+
   describe('when the Claude login in the session is not one to save home', () => {
     /**
      * A session on A that has refreshed Notion's sign-in, which lives only in its folder

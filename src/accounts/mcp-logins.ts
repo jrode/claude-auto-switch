@@ -18,10 +18,12 @@ export const MCP_OAUTH_KEY = 'mcpOAuth';
  * - folder: keep-target for a folder a Claude runs on, except that a folder
  *   holding no login at all is new, and gets the source whole.
  * - park: the source's MCP logins join the target's server by server, because
- *   its store is ending: a server the source holds replaces the target's
- *   sign-in for it, and one it does not hold stays. A source that holds none,
- *   or an empty set, parks nothing, since another store may have parked some
- *   there meanwhile.
+ *   its store is ending: for a server both hold, the sign-in that expires
+ *   later stays (a copy of one sign-in is routine, and the later is the one
+ *   refreshed last) and the source's stands when that is not known, and a
+ *   server the source does not hold stays. A source that holds none, or an
+ *   empty set, parks nothing, since another store may have parked some there
+ *   meanwhile.
  */
 export type McpMode = 'keep-target' | 'folder' | 'park';
 
@@ -56,14 +58,44 @@ function signIns(value: unknown): Record<string, unknown> | null {
 
 const sameSignIn = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 
+/** When a sign-in expires, as epoch ms, or null when it says nothing a comparison can use. */
+function expiryOf(signIn: unknown): number | null {
+  if (typeof signIn !== 'object' || signIn === null) return null;
+  const at = (signIn as { expiresAt?: unknown }).expiresAt;
+  return typeof at === 'number' && Number.isFinite(at) ? at : null;
+}
+
+/**
+ * Whether sign-in `a` is a later refresh of a server than `b`: both expire at a
+ * known time and a's is later. Anything else, an equal or unknown expiry, is
+ * not an answer, and the caller's own rule for a tie decides.
+ */
+function newer(a: unknown, b: unknown): boolean {
+  const first = expiryOf(a);
+  const second = expiryOf(b);
+  return first !== null && second !== null && first > second;
+}
+
+/** `kept` joined by `parking`, server by server: a sign-in `kept` holds that is newer stays, and `parking` stands on a tie. */
+function join(
+  kept: Record<string, unknown>,
+  parking: Record<string, unknown>,
+): Record<string, unknown> {
+  const joined = { ...kept };
+  for (const [server, signIn] of Object.entries(parking)) {
+    if (!Object.hasOwn(joined, server) || !newer(joined[server], signIn)) joined[server] = signIn;
+  }
+  return joined;
+}
+
 /** Whether a text holds MCP logins: a sign-in to at least one server in `mcpOAuth`. */
 export function holdsMcpLogins(text: string): boolean {
   return signIns(asObject(text)?.[MCP_OAUTH_KEY]) !== null;
 }
 
 /**
- * Whether `copy` holds every sign-in `ending` holds, each with the same value.
- * False when either is not a JSON object.
+ * Whether `copy` holds, for every server `ending` holds, that sign-in or one
+ * that expires later. False when either is not a JSON object.
  */
 export function holdsMcpLoginsOf(copy: string, ending: string): boolean {
   const saved = asObject(copy);
@@ -75,15 +107,17 @@ export function holdsMcpLoginsOf(copy: string, ending: string): boolean {
   return (
     kept !== null &&
     Object.entries(parking).every(
-      ([server, signIn]) => Object.hasOwn(kept, server) && sameSignIn(kept[server], signIn),
+      ([server, signIn]) =>
+        Object.hasOwn(kept, server) &&
+        (sameSignIn(kept[server], signIn) || newer(kept[server], signIn)),
     )
   );
 }
 
 /**
  * The sign-ins the `texts` of several stores of one folder hold between them,
- * server by server, the first store that holds a server winning for it. Null
- * when none holds any.
+ * server by server: the one that expires latest, and the first store's when
+ * that is not known. Null when none holds any.
  */
 export function gatherMcpLogins(texts: string[]): Record<string, unknown> | null {
   const gathered: Record<string, unknown> = {};
@@ -91,7 +125,9 @@ export function gatherMcpLogins(texts: string[]): Record<string, unknown> | null
     const held = signIns(asObject(text)?.[MCP_OAUTH_KEY]);
     if (held === null) continue;
     for (const [server, signIn] of Object.entries(held)) {
-      if (!Object.hasOwn(gathered, server)) gathered[server] = signIn;
+      if (!Object.hasOwn(gathered, server) || newer(signIn, gathered[server])) {
+        gathered[server] = signIn;
+      }
     }
   }
   return Object.keys(gathered).length > 0 ? gathered : null;
@@ -129,10 +165,12 @@ export function mergeMcpLogins(
     const held = target === null ? {} : asObject(target);
     if (held === null) return source;
     const kept = signIns(held[MCP_OAUTH_KEY]);
-    if (kept === null || Object.keys(kept).every((server) => Object.hasOwn(parking, server))) {
-      return source;
-    }
-    return JSON.stringify({ ...incoming, [MCP_OAUTH_KEY]: { ...kept, ...parking } });
+    if (kept === null) return source;
+    const joined = join(kept, parking);
+    const asItIs =
+      Object.keys(joined).length === Object.keys(parking).length &&
+      Object.entries(parking).every(([server, signIn]) => joined[server] === signIn);
+    return asItIs ? source : JSON.stringify({ ...incoming, [MCP_OAUTH_KEY]: joined });
   }
   let own: unknown;
   if (target !== null) {
@@ -149,9 +187,11 @@ export function mergeMcpLogins(
 
 /**
  * `copy`, an account's saved login, with the MCP logins of `ending`, the text of
- * a store that is going, joined to those it holds server by server, and its
- * Claude login as it is. `copy` itself when `ending` holds none, an empty set
- * included, or `copy` holds its sign-ins already, or either is not a JSON object.
+ * a store that is going, joined to those it holds server by server (for a
+ * server both hold, the sign-in that expires later stays, and the ending
+ * store's when that is not known), and its Claude login as it is. `copy`
+ * itself when `ending` holds none, an empty set included, or `copy` holds its
+ * sign-ins or later ones already, or either is not a JSON object.
  */
 export function parkMcpLogins(copy: string, ending: string): string {
   const leaving = asObject(ending);
@@ -160,5 +200,5 @@ export function parkMcpLogins(copy: string, ending: string): string {
   const parking = signIns(leaving[MCP_OAUTH_KEY]);
   if (parking === null || holdsMcpLoginsOf(copy, ending)) return copy;
   const kept = signIns(saved[MCP_OAUTH_KEY]) ?? {};
-  return JSON.stringify({ ...saved, [MCP_OAUTH_KEY]: { ...kept, ...parking } });
+  return JSON.stringify({ ...saved, [MCP_OAUTH_KEY]: join(kept, parking) });
 }

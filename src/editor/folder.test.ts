@@ -105,6 +105,17 @@ const mcpLogins = (n: number) => ({
   },
 });
 const MCP = mcpLogins(1);
+/** What a store that ended earlier parked in an account's saved login: it expires before the folder's own. */
+const PARKED = mcpLogins(0);
+/** A Notion sign-in expiring at `expiresAt`, a later expiry being a later refresh, tokens named by `by`. */
+const notionExpiring = (expiresAt: number, by: string) => ({
+  'notion|1': {
+    serverName: 'notion',
+    accessToken: `mcp-access-fake-${by}`,
+    refreshToken: `mcp-refresh-fake-${by}`,
+    expiresAt,
+  },
+});
 /** Sign-ins to a second server, so a merge per server can be told from one that replaces the lot. */
 const datadogLogins = (n: number) => ({
   'datadog|2': {
@@ -1620,26 +1631,20 @@ describe('the MCP logins in the editor folder', () => {
   it("are the folder's own, not those the next account's saved login carries from a store that has ended", async () => {
     const s = await scene();
     await editorOn(s);
-    writeFileSync(
-      path.join(s.dirOf('B'), '.credentials.json'),
-      withMcp(login('B', 1), mcpLogins(7)),
-    );
+    writeFileSync(path.join(s.dirOf('B'), '.credentials.json'), withMcp(login('B', 1), PARKED));
     writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 1)));
 
     await use(s, 'B', () => tokenOf(folderLogin(s)) === 'a-B-1');
 
     expect(mcpOf(folderLogin(s))).toEqual(MCP);
     // And the account's saved login is not written to.
-    expect(mcpOf(profileLogin(s, 'B'))).toEqual(mcpLogins(7));
+    expect(mcpOf(profileLogin(s, 'B'))).toEqual(PARKED);
   });
 
   it('are none, in a folder that has none, whatever the next account was saved with', async () => {
     const s = await scene();
     await editorOn(s);
-    writeFileSync(
-      path.join(s.dirOf('B'), '.credentials.json'),
-      withMcp(login('B', 1), mcpLogins(7)),
-    );
+    writeFileSync(path.join(s.dirOf('B'), '.credentials.json'), withMcp(login('B', 1), PARKED));
 
     await use(s, 'B', () => tokenOf(folderLogin(s)) === 'a-B-1');
 
@@ -1713,10 +1718,7 @@ describe('the MCP logins in the editor folder', () => {
     await editorOn(s);
     writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 1)));
     // Another ccx renewed A's login; the account's saved login carries older MCP logins.
-    writeFileSync(
-      path.join(s.dirOf('A'), '.credentials.json'),
-      withMcp(login('A', 2), mcpLogins(7)),
-    );
+    writeFileSync(path.join(s.dirOf('A'), '.credentials.json'), withMcp(login('A', 2), PARKED));
 
     await refreshEditor(s.context);
 
@@ -1729,7 +1731,7 @@ describe('the MCP logins in the editor folder', () => {
     const due = (): number => Date.now() + 60_000;
     writeFileSync(
       path.join(s.dirOf('A'), '.credentials.json'),
-      withMcp(login('A', 1, due()), mcpLogins(7)),
+      withMcp(login('A', 1, due()), PARKED),
     );
     await editorOn(s);
     writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 1, due())));
@@ -1744,17 +1746,14 @@ describe('the MCP logins in the editor folder', () => {
     expect(mcpOf(folderLogin(s))).toEqual(MCP);
     // The saved login keeps its own through its renewal.
     expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
-    expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+    expect(mcpOf(profileLogin(s, 'A'))).toEqual(PARKED);
   });
 
   it("leave an account's saved login its own when a renewal the editor made is saved home", async () => {
     const s = await scene();
     await editorOn(s);
     // The saved login carries older MCP logins, parked by a store that has ended.
-    writeFileSync(
-      path.join(s.dirOf('A'), '.credentials.json'),
-      withMcp(login('A', 1), mcpLogins(7)),
-    );
+    writeFileSync(path.join(s.dirOf('A'), '.credentials.json'), withMcp(login('A', 1), PARKED));
     writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 2)));
 
     const took = await takeUpEditorRenewal(s.context.ctx, {
@@ -1763,7 +1762,7 @@ describe('the MCP logins in the editor folder', () => {
 
     expect(took).toBe('taken');
     expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
-    expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+    expect(mcpOf(profileLogin(s, 'A'))).toEqual(PARKED);
     // The folder, which lives on, keeps its own.
     expect(mcpOf(folderLogin(s))).toEqual(MCP);
   });
@@ -1771,10 +1770,7 @@ describe('the MCP logins in the editor folder', () => {
   it("leave an account's saved login its own when the editor moves off it with a renewal", async () => {
     const s = await scene();
     await editorOn(s);
-    writeFileSync(
-      path.join(s.dirOf('A'), '.credentials.json'),
-      withMcp(login('A', 1), mcpLogins(7)),
-    );
+    writeFileSync(path.join(s.dirOf('A'), '.credentials.json'), withMcp(login('A', 1), PARKED));
     writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(login('A', 2)));
     // Whose it is cannot be asked, so the move saves it home by who the folder says it is.
     s.context.lookupOwner = () => Promise.resolve(null);
@@ -1782,7 +1778,7 @@ describe('the MCP logins in the editor folder', () => {
     await use(s, 'B', () => tokenOf(folderLogin(s)) === 'a-B-1');
 
     expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
-    expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+    expect(mcpOf(profileLogin(s, 'A'))).toEqual(PARKED);
     expect(mcpOf(folderLogin(s))).toEqual(MCP);
   });
 
@@ -1792,7 +1788,7 @@ describe('the MCP logins in the editor folder', () => {
       const s = await scene();
       await editorOn(s);
       const held = folderLogin(s)!;
-      writeFileSync(path.join(s.dirOf('A'), '.credentials.json'), withMcp(held, mcpLogins(7)));
+      writeFileSync(path.join(s.dirOf('A'), '.credentials.json'), withMcp(held, PARKED));
       writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(held, MCP));
       return { s, held };
     }
@@ -1813,7 +1809,7 @@ describe('the MCP logins in the editor folder', () => {
       expect(await editorCommand(s.context, 'off')).toBe(0);
 
       expect(existsSync(s.folder)).toBe(false);
-      expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...mcpLogins(7), ...datadogLogins(2) });
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...PARKED, ...datadogLogins(2) });
       expect(tokenOf(profileLogin(s, 'A'))).toBe(tokenOf(held));
     });
 
@@ -1827,7 +1823,7 @@ describe('the MCP logins in the editor folder', () => {
       expect(await editorCommand(s.context, 'off')).toBe(0);
 
       expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
-      expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...mcpLogins(7), ...datadogLogins(2) });
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...PARKED, ...datadogLogins(2) });
     });
 
     it('are none to park in an empty set, which leaves the saved login as it is', async () => {
@@ -1837,7 +1833,7 @@ describe('the MCP logins in the editor folder', () => {
       expect(await editorCommand(s.context, 'off')).toBe(0);
 
       expect(existsSync(s.folder)).toBe(false);
-      expect(profileLogin(s, 'A')).toBe(withMcp(held, mcpLogins(7)));
+      expect(profileLogin(s, 'A')).toBe(withMcp(held, PARKED));
     });
 
     it('are none to park in an empty set when the folder takes its newer Claude login home', async () => {
@@ -1847,7 +1843,7 @@ describe('the MCP logins in the editor folder', () => {
       expect(await editorCommand(s.context, 'off')).toBe(0);
 
       expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
-      expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual(PARKED);
     });
 
     describe('held in more than one place', () => {
@@ -1884,25 +1880,80 @@ describe('the MCP logins in the editor folder', () => {
         expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...mcpLogins(1), ...datadogLogins(2) });
       });
 
-      it('are those of the first item for a server that more than one item holds', async () => {
+      it.each([
+        ['the older first', 0],
+        ['the newer first', 1],
+      ])(
+        'are the newest for a server that more than one item holds, with %s',
+        async (_order, newerIs) => {
+          const { s, held, first, second } = await twoSpellings();
+          const older = notionExpiring(1_900_000_000_000, 'older');
+          const newer = notionExpiring(1_900_003_600_000, 'newer');
+          keychain.set(
+            first,
+            withMcp(held, newerIs === 1 ? { ...newer, ...datadogLogins(2) } : older),
+          );
+          keychain.set(
+            second,
+            withMcp(held, newerIs === 1 ? older : { ...newer, ...datadogLogins(2) }),
+          );
+
+          expect(retireEditor(s.context, [first, second])).toBe('retired');
+
+          expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...newer, ...datadogLogins(2) });
+        },
+      );
+
+      it('are those of the first item for a server whose sign-ins expire together', async () => {
         const { s, held, first, second } = await twoSpellings();
-        keychain.set(first, withMcp(held, mcpLogins(1)));
-        keychain.set(second, withMcp(held, { ...mcpLogins(2), ...datadogLogins(2) }));
+        keychain.set(first, withMcp(held, notionExpiring(1_900_000_000_000, 'first')));
+        keychain.set(
+          second,
+          withMcp(held, { ...notionExpiring(1_900_000_000_000, 'second'), ...datadogLogins(2) }),
+        );
 
         expect(retireEditor(s.context, [first, second])).toBe('retired');
 
-        expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...mcpLogins(1), ...datadogLogins(2) });
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual({
+          ...notionExpiring(1_900_000_000_000, 'first'),
+          ...datadogLogins(2),
+        });
       });
 
-      it("are parked from the folder's file as well as from its item", async () => {
+      it('are those of the first item for a server when either sign-in has no expiry', async () => {
+        const { s, held, first, second } = await twoSpellings();
+        const undated = {
+          'notion|1': { serverName: 'notion', accessToken: 'mcp-access-fake-undated' },
+        };
+        keychain.set(first, withMcp(held, undated));
+        keychain.set(second, withMcp(held, notionExpiring(1_900_000_000_000, 'dated')));
+
+        expect(retireEditor(s.context, [first, second])).toBe('retired');
+
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual(undated);
+      });
+
+      it("are not read from the folder's file while every spelling holds an item", async () => {
         const { s, held } = await sameLoginOnA();
-        // The file holds Notion, as the folder was made with it, and a Claude on the Keychain item holds Datadog.
+        // The file is left from when the folder was made with Notion. A Claude on the item holds Datadog.
         keychain.set(s.folder, withMcp(held, datadogLogins(2)));
 
         expect(await editorCommand(s.context, 'off')).toBe(0);
 
         expect(existsSync(s.folder)).toBe(false);
-        expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...datadogLogins(2), ...mcpLogins(1) });
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...PARKED, ...datadogLogins(2) });
+      });
+
+      it("are read from the folder's file when a spelling has no item, as its Claude reads it", async () => {
+        const { s, held, first } = await twoSpellings();
+        keychain.set(first, withMcp(held, mcpLogins(1)));
+        // The other spelling has no item, so a Claude given it reads the file.
+        writeFileSync(path.join(s.folder, '.credentials.json'), withMcp(held, datadogLogins(2)));
+
+        expect(await offForBoth(s)).toBe(0);
+
+        expect(existsSync(s.folder)).toBe(false);
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual({ ...mcpLogins(1), ...datadogLogins(2) });
       });
 
       it('are parked from every item too when the folder takes a newer Claude login home', async () => {
@@ -1926,7 +1977,7 @@ describe('the MCP logins in the editor folder', () => {
 
         expect(isRealFolder(s.folder)).toBe(true);
         expect(keychain.has(first)).toBe(true);
-        expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual(PARKED);
       });
     });
 
@@ -1955,7 +2006,7 @@ describe('the MCP logins in the editor folder', () => {
 
       expect(await editorCommand(s.context, 'off')).toBe(0);
 
-      expect(profileLogin(s, 'A')).toBe(withMcp(held, mcpLogins(7)));
+      expect(profileLogin(s, 'A')).toBe(withMcp(held, PARKED));
     });
 
     it('are parked all the same when the folder is signed in as someone else, and the account keeps its Claude login', async () => {
@@ -2008,7 +2059,7 @@ describe('the MCP logins in the editor folder', () => {
 
       expect(await editorCommand(s.context, 'off')).toBe(0);
 
-      expect(profileLogin(s, 'A')).toBe(withMcp(held, mcpLogins(7)));
+      expect(profileLogin(s, 'A')).toBe(withMcp(held, PARKED));
     });
 
     it('are left to the saved login that holds them when the folder, whose login is newer, holds none', async () => {
@@ -2018,7 +2069,7 @@ describe('the MCP logins in the editor folder', () => {
       expect(await editorCommand(s.context, 'off')).toBe(0);
 
       expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
-      expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+      expect(mcpOf(profileLogin(s, 'A'))).toEqual(PARKED);
     });
 
     it('are kept in a saved login of their own when the account has none, and it still reads as signed out', async () => {
@@ -2049,7 +2100,7 @@ describe('the MCP logins in the editor folder', () => {
         expect(await editorCommand(s.context, 'off')).toBe(1);
 
         expect(mcpOf(folderLogin(s))).toEqual(MCP);
-        expect(mcpOf(profileLogin(s, 'A'))).toEqual(mcpLogins(7));
+        expect(mcpOf(profileLogin(s, 'A'))).toEqual(PARKED);
 
         rmSync(lock, { recursive: true });
         expect(await editorCommand(s.context, 'off')).toBe(0);
@@ -2065,10 +2116,7 @@ describe('the MCP logins in the editor folder', () => {
     await editorOn(s);
     const held = withMcp(login('A', 1));
     writeFileSync(path.join(s.folder, '.credentials.json'), held);
-    writeFileSync(
-      path.join(s.dirOf('A'), '.credentials.json'),
-      withMcp(login('A', 2), mcpLogins(7)),
-    );
+    writeFileSync(path.join(s.dirOf('A'), '.credentials.json'), withMcp(login('A', 2), PARKED));
     queueEditorCarry(s.context.ctx, loginTextFingerprint(held)!, s.dirOf('A'));
 
     expect(await retryEditorCarries(s.context.ctx)).toBe(true);

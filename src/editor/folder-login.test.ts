@@ -182,14 +182,23 @@ describe('putting a renewal in the folder that holds the login it retired', () =
 });
 
 describe("reading every place a Claude on the editor's folder keeps its login", () => {
-  it('gives the item of each spelling in order, then the file', () => {
+  it('gives the item of each spelling in order, and not the file while every spelling has one', () => {
     const login = folder();
     const other: FolderLogin = { dir: login.dir, spellings: [login.dir, `${login.dir}-other`] };
     keychain.set(other.spellings[1]!, claudeLogin(2));
     keychain.set(other.spellings[0]!, claudeLogin(1));
     writeFileSync(fileOf(other), claudeLogin(3));
 
-    expect(readFolderStores(other)).toEqual([claudeLogin(1), claudeLogin(2), claudeLogin(3)]);
+    expect(readFolderStores(other)).toEqual([claudeLogin(1), claudeLogin(2)]);
+  });
+
+  it('gives the file after the items when a spelling has none, since a Claude given that spelling reads it', () => {
+    const login = folder();
+    const other: FolderLogin = { dir: login.dir, spellings: [login.dir, `${login.dir}-other`] };
+    keychain.set(other.spellings[0]!, claudeLogin(1));
+    writeFileSync(fileOf(other), claudeLogin(3));
+
+    expect(readFolderStores(other)).toEqual([claudeLogin(1), claudeLogin(3)]);
   });
 
   it('gives only the places that hold something', () => {

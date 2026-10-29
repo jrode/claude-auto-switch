@@ -107,6 +107,27 @@ describe("an ending folder's MCP sign-ins, parked in an account's saved login on
     expect(savedIn(dir)).toBe(saved);
   });
 
+  it("keeps a sign-in parked for a server when it expires later than the ending folder's", () => {
+    const refreshed = { 'notion|1': { ...notion(2)['notion|1'], expiresAt: 1_900_003_600_000 } };
+    const untouched = { 'notion|1': { ...notion(1)['notion|1'], expiresAt: 1_900_000_000_000 } };
+    const saved = text({ claudeAiOauth: claude(5), mcpOAuth: refreshed });
+    const dir = account(saved);
+
+    expect(park(dir, text({ mcpOAuth: untouched }))).toBe(false);
+
+    expect(savedIn(dir)).toBe(saved);
+  });
+
+  it("replaces a sign-in parked for a server when it expires earlier than the ending folder's", () => {
+    const refreshed = { 'notion|1': { ...notion(2)['notion|1'], expiresAt: 1_900_003_600_000 } };
+    const untouched = { 'notion|1': { ...notion(1)['notion|1'], expiresAt: 1_900_000_000_000 } };
+    const dir = account(text({ claudeAiOauth: claude(5), mcpOAuth: untouched }));
+
+    expect(park(dir, text({ mcpOAuth: refreshed }))).toBe(true);
+
+    expect(mcpOf(savedIn(dir))).toEqual(refreshed);
+  });
+
   it('merges with the saved login as it is when it is written, not as it was first read', () => {
     const dir = account(null);
     const first = text({ claudeAiOauth: claude(5), mcpOAuth: notion(1) });
